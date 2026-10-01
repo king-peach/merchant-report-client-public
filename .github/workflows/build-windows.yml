@@ -1,0 +1,166 @@
+name: Build Windows EXE
+run-name: Windows 打包${{ inputs.note && format(' · {0}', inputs.note) || '' }}
+
+# 只手动触发(2026-09-30 用户口径): 每次 push 都出 Windows 包既费额度、又常因计费/环境卡住,
+# 需要发 Windows 版时到 Actions 页面点 "Run workflow"(或 gh workflow run)。
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "本次打包备注(可选, 只用于 run 名字)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write        # 需要推 build 分支
+
+env:
+  PY_EMBED_VER: "3.12.7"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 装配 python-embed + 依赖
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "src-tauri/resources/python"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $url = "https://www.python.org/ftp/python/$env:PY_EMBED_VER/python-$env:PY_EMBED_VER-embed-amd64.zip"
+          Write-Host "下载 $url"
+          Invoke-WebRequest -Uri $url -OutFile embed.zip
+          Expand-Archive embed.zip -DestinationPath $dir -Force
+          Remove-Item embed.zip
+
+          # embed 的 ._pth 会锁死 sys.path(忽略 PYTHONPATH, 不含 site-packages 与内核目录)
+          # → 显式写入: stdlib zip / 自身目录 / site-packages / 内核目录(相对 ._pth 所在目录) + 启用 site
+          $pth = Get-ChildItem $dir -Filter "*._pth" | Select-Object -First 1
+          $zip = (Get-ChildItem $dir -Filter "python3*.zip" | Select-Object -First 1).Name
+          @(
+            $zip
+            "."
+            "Lib\site-packages"
+            "..\kernel"
+            "import site"
+          ) | Set-Content -Path $pth.FullName -Encoding ASCII
+          Write-Host "=== $($pth.Name) ==="
+          Get-Content $pth.FullName
+
+      - name: 安装依赖到 embed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "src-tauri/resources/python/Lib/site-packages"
+          # 用 runner 自带完整 Python 装到 embed 的 site-packages(embed 自身不带 pip)
+          python -m pip install --upgrade pip
+          python -m pip install --target $target playwright openpyxl certifi
+          Write-Host "=== site-packages 体积 ==="
+          "{0:N1} MB" -f ((Get-ChildItem $target -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: 验证首次运行下载浏览器(国内镜像, 不进安装包)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $py = (Resolve-Path "src-tauri/resources/python/python.exe").Path
+          # 安装包不打 Chromium(251MB 会超 GitHub 100MB 单文件限制) → 首次运行从镜像下载。
+          # 这一步在 CI 里真跑一次, 确认镜像通路可用(下到临时目录, 不污染安装包)。
+          $tmp = Join-Path $env:RUNNER_TEMP "ms-playwright-check"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          $env:PLAYWRIGHT_BROWSERS_PATH = $tmp
+          $env:PLAYWRIGHT_DOWNLOAD_HOST = "https://cdn.npmmirror.com/binaries/playwright"
+          & $py -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { throw "从镜像下载 Chromium 失败(客户机首次运行会走同一条路)" }
+          $exe = Get-ChildItem $tmp -Recurse -Filter "chrome.exe" | Select-Object -First 1
+          if (-not $exe) { throw "镜像下载后找不到 chrome.exe" }
+          "{0:N1} MB" -f ((Get-ChildItem $tmp -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
+          Write-Host "镜像下载通路 OK: $($exe.FullName)"
+          Remove-Item -Recurse -Force $tmp   # 不占 runner 空间/不进安装包
+
+      - name: 冒烟验证(打包解释器 + 依赖 + 内核)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $py = "src-tauri/resources/python/python.exe"
+          $kernel = "src-tauri/resources/kernel"
+
+          # 1) 标准库/SSL/依赖都能导入(Windows exe 无系统 CA → certifi 必须能装进来)
+          & $py -c "import ssl, certifi, openpyxl, playwright; print('deps ok:', openpyxl.__version__); print('ca:', certifi.where())"
+          if ($LASTEXITCODE -ne 0) { throw "依赖导入失败" }
+
+          # 2) 内核模块可导入(验证 ._pth 里的内核路径 + 相对导入链)
+          Push-Location $kernel
+          & "..\..\resources\python\python.exe" -c "import merchant_report.orchestrator as o; print('kernel ok, steps =', o.STEPS)"
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { throw "内核导入失败(检查 ._pth 与 kernel 资源布局)" }
+
+          # 3) 浏览器引导策略: 安装包不自带 Chromium(超 GitHub 限制), 首次运行走国内镜像下载;
+          #    候选顺序按本机记忆排(VPS 上自带 Chromium 起不来 → 记住系统 Chrome, 不再白等超时)
+          Push-Location $kernel
+          & "..\..\resources\python\python.exe" -c "from merchant_report import bootstrap as b, browser_pref as p; assert 'npmmirror' in b.DEFAULT_MIRROR, 'mirror wrong'; import merchant_report.platforms.taobao as t, inspect; s = inspect.getsource(t.launch_browser); assert 'MRC_BROWSER_CHANNEL' in s, 'browser pref not wired'; assert 'msedge' in s and 'chrome' in s, 'candidates missing'; assert 'auto_slider = False' in open('merchant_report/platforms/taobao.py', encoding='utf-8').read(), 'slider policy wrong'; print('browser bootstrap ok:', b.DEFAULT_MIRROR)"
+          $code2 = $LASTEXITCODE
+          Pop-Location
+          if ($code2 -ne 0) { throw "浏览器引导/顺序/滑块策略检查失败" }
+
+      - name: 前端构建
+        run: npm ci
+
+      - name: Tauri 打包 (NSIS)
+        run: npx --yes @tauri-apps/cli@latest build --bundles nsis
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe"
+          if (-not $exe) { throw "没有产出 NSIS 安装包" }
+          foreach ($f in $exe) { "{0}  {1:N1} MB" -f $f.Name, ($f.Length / 1MB) }
+          Write-Host "安装包: $($exe[0].FullName)"
+
+      - name: 发布到 build 分支
+        shell: bash
+        run: |
+          set -e
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$OUT"
+          # 原始名(含中文)保留 + 一个 ASCII 稳定名(下载链接好写)
+          cp src-tauri/target/release/bundle/nsis/*.exe "$OUT/"
+          cp src-tauri/target/release/bundle/nsis/*.exe "$OUT/merchant-report-setup.exe"
+          cd "$OUT"
+          {
+            echo "商家报表助手 — Windows 安装包"
+            echo "构建时间: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "提交: ${GITHUB_SHA}"
+            echo "分支: ${GITHUB_REF_NAME}"
+            echo ""
+            echo "安装: 双击 merchant-report-setup.exe (或中文名同名文件),"
+            echo "      Win10/11 首次运行如提示 SmartScreen → 更多信息 → 仍要运行(未签名)。"
+            echo "运行条件: 系统需有 Microsoft Edge(Win10/11 自带; 自动化浏览器会复用它)。"
+          } > BUILD_INFO.txt
+          ls -la
+          git init -q -b build
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "build: Windows NSIS ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:7})"
+          # 强制推送单提交分支: 分支上永远只有最新一版安装包, 不累积历史
+          git push -q --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" build
+          echo "已发布到 build 分支"

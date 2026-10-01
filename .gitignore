@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Node / Vite
+node_modules/
+dist/
+
+# Tauri / Rust 构建产物
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# 运行期产物(登录态/诊断包/下载缓存在用户目录, 不会进仓库; 这里兜底)
+*.log
+diagnostics/
+
+# 本地私有配置(凭据相关, 永不入库)
+config.yaml
+config.local.yaml
+.env

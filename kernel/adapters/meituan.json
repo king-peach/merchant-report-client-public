@@ -1,0 +1,39 @@
+{
+ "pack_version": 1,
+ "min_kernel": "0.1.0",
+ "comment": "美团外卖后台锚点包。改版时改这里并提升 pack_version; 支持 url 在线热更新。",
+ "selectors": {
+  "login": {
+   "home": "https://e.waimai.meituan.com/",
+   "logged_in_marker": "报表下载",
+   "passport_marker": "passport"
+  },
+  "report_page": {
+   "url": "https://waimaieapp.meituan.com/igate/bizdata/report/download",
+   "ready_marker": "下载数据",
+   "ready_marker_alt": "span.custom-checkbox-label",
+   "history_url": "https://waimaieapp.meituan.com/gw/bizdata/report/download/history?pageSize=20&pageNum=1"
+  },
+  "date": {
+   "input_regex": "\\d{4}-\\d{1,2}-\\d{1,2}",
+   "panel_min_y": 330,
+   "day_exclude_class_regex": "prev|next|other|disabled|outside",
+   "month_regex": "(20\\d{2})\\s*年\\s*(\\d{1,2})\\s*月"
+  },
+  "business_tabs": {
+   "all": "全部",
+   "bao": "拼好饭",
+   "external": "外卖"
+  },
+  "select_all_label": "全选",
+  "download_button_text": "下载数据",
+  "file": {
+   "all_csv_min_cols": 60,
+   "bao_csv_cols": 31,
+   "status_done": "2"
+  }
+ },
+ "mappings": {
+  "note": "列映射仍在 meituan_mapping.py(CSV 格式比 DOM 稳得多); 只有 CSV 格式本身变更才动这里"
+ }
+}
