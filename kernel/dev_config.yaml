@@ -1,0 +1,16 @@
+# 开发/测试配置 (壳正式版由客户端设置页生成到 %APPDATA%)
+defaults:
+  fill_mode: top
+  download_dir: /Users/demo/Downloads/商家报表整理
+llm:
+  enabled: false
+platforms:
+  taobao:
+    enabled: true
+    home: https://melody.shop.ele.me/
+stores:
+  - name: 示例商家·鲜萃双柠茶(梅溪湖店)
+    id: "5555555555"
+    template: /tmp/模板_kernel_test.xlsx
+    lat: 28.187
+    lon: 112.921

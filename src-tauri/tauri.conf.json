@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "商家报表助手",
+  "version": "0.1.0",
+  "identifier": "com.merchantreport.client",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "商家报表助手",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 1080,
+        "minHeight": 700,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false,
+      "tooltip": "商家报表助手"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "dmg", "app"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "resources": [
+      "resources/kernel"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "languages": ["SimpChinese"],
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {}
+}
