@@ -1,0 +1,8 @@
+商家报表助手 — Windows 安装包
+构建时间: 2026-10-10 18:12 UTC
+提交: 0d5098da81cee2c02bbcc877f625e7fee86a06a6
+分支: main
+
+安装: 双击 merchant-report-setup.exe (或中文名同名文件),
+      Win10/11 首次运行如提示 SmartScreen → 更多信息 → 仍要运行(未签名)。
+运行条件: 系统需有 Microsoft Edge(Win10/11 自带; 自动化浏览器会复用它)。
