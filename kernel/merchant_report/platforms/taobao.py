@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess   # 必留: _cleanup_stale_browser 用(曾漏 → 整段清理被 except 静默吞失效)
 import time
 from pathlib import Path
 
@@ -66,16 +67,67 @@ def parse_vas_ledger(rows, date):
 LAUNCH_TIMEOUT_MS = 90000
 
 
-def _cleanup_stale_browser(profile_dir):
-    """结束仍占用本 profile 的残留浏览器(上一轮任务未完全退出)。
+def _other_live_task_pids():
+    """本机**其它**活着的任务进程 pid(不含自己); 探测不可用 → None。
+
+    双开防护(2026-10-11 真机事故): 两个窗口同时跑任务时, 任何一方启动浏览器前的
+    "残留清理"若把对方正在用的浏览器强杀掉, 两边就会循环互关、任务全断。
+    所以动手前先探活: 有任何一个其它任务, 或探测不可用(不确定), 就不杀。
+    判据: 命令行含 'merchant_report.task_main'(py_runner 启动内核的唯一入口)。
+    返回: pid 列表(可能为空) / None = 探测失败。"""
+    me = os.getpid()
+    try:
+        if os.name == "nt":
+            # $PID = 这条 PowerShell 自己: 它的命令行里也含下面的查询串, 不排除会把自己算进去
+            ps = ("Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and "
+                  "$_.CommandLine -like '*merchant_report.task_main*' } "
+                  "| Select-Object -ExpandProperty ProcessId")
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                                 capture_output=True, text=True, timeout=25).stdout
+        else:
+            out = subprocess.run(["pgrep", "-f", "merchant_report.task_main"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit() and int(x) != me]
+    except Exception:
+        return None
+
+
+def _cleanup_stale_browser(profile_dir, sink=None):
+    """结束仍占用本 profile 的**残留**浏览器(上一轮任务未完全退出)。
     否则新启动的浏览器会把参数转发给旧实例, Playwright 拿不到控制权。
-    只结束命令行里带本 profile 路径的进程, 不动用户自己开的浏览器窗口。"""
+
+    双开防护(2026-10-11): 先探活其它任务进程 —— 有任何一个(或探测失败=不确定),
+    **一个进程都不杀**(那些浏览器可能正是对方在用的), 只记一条提示;
+    确认没有别的任务, 才按"残留"结束。
+    只结束命令行里带本 profile 路径的进程, 不动用户自己开的浏览器窗口。
+    返回 True=已清理(含无需清理); False=跳过(双开 / 探测不可用)。
+    (注: 本函数曾因模块漏 `import subprocess` 被 except 静默吞掉、长期空转;
+    修复 import 的同时必须带上上面这道探测闸 —— 否则双开时就是互相关闭。)"""
+    others = _other_live_task_pids()
+    if others is None:
+        # 探测不可用 → 无法确认有没有别的实例在跑: 宁可不清理, 也不误杀(安全侧)
+        if sink is not None:
+            try:
+                sink.log("⚠️ 无法确认是否有其它任务在运行(进程探测不可用), "
+                         "本次跳过残留浏览器清理", level="warn")
+            except Exception:
+                pass
+        return False
+    if others:
+        if sink is not None:
+            try:
+                sink.log("⚠️ 检测到另一个「商家报表助手」任务正在运行(进程 %s) — 本次跳过"
+                         "残留浏览器清理(避免两个窗口互相关闭)。若浏览器无法启动: "
+                         "请关闭多余的窗口后重试。" % ",".join(map(str, others)), level="warn")
+            except Exception:
+                pass
+        return False
     prof = str(profile_dir)
     try:
         if os.name == "nt":
             esc = prof.replace("'", "''")
             ps = ("Get-CimInstance Win32_Process "
-                  f"| Where-Object {{ $_.CommandLine -like '*{esc}*' }} "
+                  f"| Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{esc}*' }} "
                   "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
             subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                            capture_output=True, text=True, timeout=25)
@@ -89,8 +141,9 @@ def _cleanup_stale_browser(profile_dir):
                     pass
             if out:
                 time.sleep(3)   # 等浏览器完全退出释放 profile 锁
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _launch_persistent(pw, profile_dir, args, exclude, channel=None, timeout_ms=LAUNCH_TIMEOUT_MS):
@@ -122,14 +175,15 @@ FALLBACK_MARKS = ("executable doesn't exist", "failed to launch", "channel", "no
                   "cannot find", "没有", "timeout", "timed out", "target closed")
 
 
-def launch_browser(pw, profile_dir, prefer=None):
+def launch_browser(pw, profile_dir, prefer=None, sink=None):
     """Playwright 启动 Chromium 系浏览器(持久 profile + 剔除自动化痕迹参数)。
     候选顺序 = **本机记忆**优先(见 browser_pref): 
       - 上次成功的候选排最前(用户 VPS 上自带 Chromium 起不来、系统 Chrome 正常 → 直接记住 Chrome)
       - 自带 Chromium 若被判过不可用则排到最后, 避免每次白等 90 秒超时
     也支持环境变量 MRC_BROWSER_CHANNEL=chrome|msedge 强制指定。
-    macOS 上实测自带 Chromium 可用(滑块能过), 默认顺序不变。"""
-    _cleanup_stale_browser(profile_dir)
+    macOS 上实测自带 Chromium 可用(滑块能过), 默认顺序不变。
+    sink: 可选事件出口 —— 清理被跳过(双开/探测不可用)时把提示给用户看到(见 _cleanup_stale_browser)。"""
+    _cleanup_stale_browser(profile_dir, sink=sink)
     args = [
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",

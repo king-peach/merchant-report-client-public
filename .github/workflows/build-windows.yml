@@ -113,11 +113,13 @@ jobs:
 
           # 3) 浏览器引导策略: 安装包不自带 Chromium(超 GitHub 限制), 首次运行走国内镜像下载;
           #    候选顺序按本机记忆排(VPS 上自带 Chromium 起不来 → 记住系统 Chrome, 不再白等超时)
+          #    防回归(2026-10-11 双开互杀事故): subprocess import / 探活闸 / 单实例插件 三样不许丢,
+          #    丢了都是"静默失效"(互相关闭、清理空转), 出包前必须拦住
           Push-Location $kernel
-          & "..\..\resources\python\python.exe" -c "from merchant_report import bootstrap as b, browser_pref as p; assert 'npmmirror' in b.DEFAULT_MIRROR, 'mirror wrong'; import merchant_report.platforms.taobao as t, inspect; s = inspect.getsource(t.launch_browser); assert 'MRC_BROWSER_CHANNEL' in s, 'browser pref not wired'; assert 'msedge' in s and 'chrome' in s, 'candidates missing'; assert 'auto_slider = False' in open('merchant_report/platforms/taobao.py', encoding='utf-8').read(), 'slider policy wrong'; print('browser bootstrap ok:', b.DEFAULT_MIRROR)"
+          & "..\..\resources\python\python.exe" -c "from merchant_report import bootstrap as b, browser_pref as p; assert 'npmmirror' in b.DEFAULT_MIRROR, 'mirror wrong'; import merchant_report.platforms.taobao as t, inspect; s = inspect.getsource(t.launch_browser); assert 'MRC_BROWSER_CHANNEL' in s, 'browser pref not wired'; assert 'msedge' in s and 'chrome' in s, 'candidates missing'; assert 'auto_slider = False' in open('merchant_report/platforms/taobao.py', encoding='utf-8').read(), 'slider policy wrong'; assert 'import subprocess' in open('merchant_report/platforms/taobao.py', encoding='utf-8').read(), 'subprocess import lost(清理会静默空转)'; assert '_other_live_task_pids' in inspect.getsource(t._cleanup_stale_browser), 'dual-open guard missing(双开会互相关闭)'; assert 'tauri_plugin_single_instance' in open('../../src/main.rs', encoding='utf-8').read(), 'single-instance plugin not registered'; print('browser bootstrap ok:', b.DEFAULT_MIRROR)"
           $code2 = $LASTEXITCODE
           Pop-Location
-          if ($code2 -ne 0) { throw "浏览器引导/顺序/滑块策略检查失败" }
+          if ($code2 -ne 0) { throw "浏览器引导/顺序/滑块/双开防护检查失败" }
 
       - name: 前端构建
         run: npm ci

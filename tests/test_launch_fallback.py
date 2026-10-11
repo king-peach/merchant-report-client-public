@@ -19,7 +19,7 @@ from pathlib import Path as _PP
 _BP = _PP(_tf.mkdtemp()) / "browser_pref.json"
 BP._path = lambda: _BP
 
-TB._cleanup_stale_browser = lambda p: None      # 不碰进程表
+TB._cleanup_stale_browser = lambda *a, **k: None   # 不碰进程表(sink=None 兼容)
 
 
 class FakeChromium:

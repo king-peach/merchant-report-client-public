@@ -10,6 +10,15 @@ use tauri::{
 
 fn main() {
     tauri::Builder::default()
+        // 单实例锁(2026-10-11 双开互杀根治): 重复打开时不再开第二份窗口,
+        // 直接唤起已有主窗口。插件按注册顺序执行, 此插件必须最先注册。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())

@@ -444,7 +444,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 a._discover_shop_id()
                 return a, True
 
-            actx = launch_browser(pw, profile_path)
+            actx = launch_browser(pw, profile_path, sink=sink)
             ad, ok = build_adapter(actx)
             ad_holder["ad"] = ad
             if not ok:
@@ -463,7 +463,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 except Exception:
                     pass
                 try:
-                    actx = launch_browser(pw, profile_path)
+                    actx = launch_browser(pw, profile_path, sink=sink)
                 except Exception as e:
                     sink.log(f"⚠️ 浏览器重开失败: {str(e)[:100]}", level="warn")
                     return False

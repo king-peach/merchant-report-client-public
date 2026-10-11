@@ -20,7 +20,7 @@ if _TMP.exists():
     _TMP.unlink()
 
 import merchant_report.platforms.taobao as TB
-TB._cleanup_stale_browser = lambda p: None
+TB._cleanup_stale_browser = lambda *a, **k: None   # 不碰进程表(sink=None 兼容)
 
 
 class FakeChromium:

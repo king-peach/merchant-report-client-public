@@ -139,7 +139,7 @@ def run(answers, raise_mode=False, fail_first=0, error_text=None):
         FakeAdapter.error_text = error_text
     psa.sync_playwright = lambda: FakePW()
     O.sync_playwright = FakePW() if hasattr(O, "sync_playwright") else None
-    def _launch(pw, prof):
+    def _launch(pw, prof, **kw):
         FakeAdapter.launched += 1
         return FakeCtx()
 
