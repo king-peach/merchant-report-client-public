@@ -119,8 +119,8 @@ def test_missing_bom_row_and_zero_rates():
 def test_real_report_files_if_present():
     """用今天真机报表核对: 岚霞路 全部−爆品团 与文件里的数字对得上。"""
     d = pathlib.Path.home() / "Downloads/商家报表整理"
-    a = sorted(d.glob("门店下载_20260929*233528620.xlsx"))
-    b = sorted(d.glob("门店下载_20260929*233534806.xlsx"))
+    a = sorted(d.glob("门店下载_20260929*000000001.xlsx"))
+    b = sorted(d.glob("门店下载_20260929*000000002.xlsx"))
     if not (a and b):
         print("… 真机报表不在, 跳过")
         return

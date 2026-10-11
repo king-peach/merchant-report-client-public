@@ -788,60 +788,123 @@ class MeituanAdapter:
             return pick[0]
         return None
 
+    # 真报表的内容特征(两条下载路径落盘前都校验; 认不出宁可不写):
+    #   ① 美团导出 CSV —— gb18030 编码、首字段「日期」;  ② 兼容 xlsx(zip 魔数 PK)
+    _REPORT_HEAD_MARKS = (b"PK", "日期".encode("gb18030"),
+                          "日期".encode("utf-8"), "日期".encode("utf-8-sig"))
+
+    @classmethod
+    def _looks_like_report(cls, head):
+        head = bytes(head or b"")
+        return any(head.startswith(m) for m in cls._REPORT_HEAD_MARKS)
+
     def _fetch_file(self, entry, path):
         """下载历史里的链接 → 落盘。
 
-        ⚠️ 2026-10-01 真机诊断包(diag_下载报表_20261001-230733.json): 报
-        `取文件失败 HTTP 403: distribute-platform-pub.sankuai.com/epassport/download…`
-        → 报表没落到目录 → 整个任务失败("目录内无 2026-09-30 全部业务报表")。
-        CDN 的签名下载链接对**直连请求**(APIRequestContext)判定 403 —— 它要的是浏览器现场
-        发起的请求(cookie/Referer/UA 齐全)。所以改成:
-          ① **浏览器原生下载**(锚点点击 + expect_download) —— 最稳, 走 Chromium 自己的请求;
-          ② 接口直取降级为兜底, 并补上 Referer(缺它 CDN 常判 403)。
-        两条路都以"落盘的是不是真 xlsx(zip 魔数 PK)"为准, 绝不把错误页当报表存下。
+        ⚠️ 2026-10-11 修「美团外卖跳转到其他页面」(用户报: 测试账号没问题, 另一商家账号 /
+        Windows 环境会把页面跳到 distribute-platform-pub.sankuai.com 或 epassport 登录页)。
+        机制(实验钉死): 对 CDN 签名链接做锚点点击, 在**下载会话未授权**的机器上会退化为
+        **整页导航**(Chromium 跟着 302 跳到登录页 / ERR_INVALID_RESPONSE) —— 旧版在工作页里
+        点, 页面被导航走, 再白等 180s 才兜底。现在:
+          ① **接口直取优先**(ctx.request + Referer; 纯 HTTP, 不碰任何页面) —— 正常环境零跳转;
+          ② 不成再走**浏览器原生下载, 但搬到一次性标签页**: 就算被重定向/导航, 只牺牲临时页,
+             工作页(self.page)永不受影响; 检测到"整页导航"立即判失败(不再干等);
+          ③ 两条路落盘前都做内容校验, 绝不把错误页/登录页当报表存下。
         """
         url = str(entry.get("url") or "")
         if not url:
             return False
-        # ① 浏览器原生下载(需要活着的 page; 页面未就绪就直接走 ②)
-        page = self.page
+        # ① 接口直取优先(纯 HTTP, 零页面动作)
+        if self._fetch_via_request(url, path):
+            return True
+        # ② 兜底: 浏览器原生下载 —— 只在**一次性标签页**里点(工作页永不参与)
+        return self._fetch_via_tmp_page(url, path)
+
+    def _fetch_via_request(self, url, path):
+        """接口直取(ctx.request + Referer)。返回 True=已落盘。纯 HTTP, 不碰任何页面。"""
         try:
-            if page is None:
-                raise RuntimeError("页面未就绪")
-            with page.expect_download(timeout=180000) as _dl:
-                page.evaluate("""(u) => {
-                    const a = document.createElement('a');
-                    a.href = u; a.download = ''; a.rel = 'noopener';
-                    document.body.appendChild(a); a.click();
-                    setTimeout(() => a.remove(), 0); }""", url)
-            _dl.value.save_as(path)
-            if os.path.exists(path) and os.path.getsize(path) > 0:
-                with open(path, "rb") as fh:
-                    magic = fh.read(2)
-                if magic == b"PK":
-                    self.sink.log(f"💾 已保存 {os.path.basename(path)} "
-                                  f"({os.path.getsize(path) / 1024:.0f}KB · 浏览器下载)")
-                    return True
-                self.sink.log(f"ℹ️ 浏览器下载到的不是 xlsx(魔数 {magic!r}) → 改试接口直取",
-                              level="warn")
-        except Exception as e:
-            self.sink.log(f"ℹ️ 浏览器下载未成功({str(e)[:50]}) → 改试接口直取", level="warn")
-        # ② 兜底: APIRequestContext 直取(补 Referer)
-        try:
-            r = self.ctx.request.get(url, timeout=180000,
-                                     headers={"Referer": (page.url if page else "") or
-                                                          "https://waimaieapp.meituan.com/"})
+            ref = ""
+            try:
+                if self.page is not None and not self.page.is_closed():
+                    ref = self.page.url or ""
+            except Exception:
+                ref = ""
+            r = self.ctx.request.get(url, timeout=90000,
+                                     headers={"Referer": ref or "https://waimaieapp.meituan.com/"})
             body = r.body()
-            if not r.ok or body[:1] == b"<":
-                self.sink.log(f"⚠️ 取文件失败 HTTP {r.status}: {url[:60]}", level="warn")
+            if not r.ok:
+                self.sink.log(f"ℹ️ 接口直取未成(HTTP {r.status}) → 改试浏览器下载(一次性页)",
+                              level="warn")
+                return False
+            if not self._looks_like_report(body[:16]):
+                self.sink.log(f"ℹ️ 接口直取响应不是报表(前16字节 {body[:16]!r}) → 改试浏览器下载",
+                              level="warn")
                 return False
             with open(path, "wb") as fh:
                 fh.write(body)
             self.sink.log(f"💾 已保存 {os.path.basename(path)} ({len(body) / 1024:.0f}KB)")
             return True
         except Exception as e:
-            self.sink.log(f"⚠️ 取文件异常: {str(e)[:70]}", level="warn")
+            self.sink.log(f"ℹ️ 接口直取异常({str(e)[:60]}) → 改试浏览器下载(一次性页)", level="warn")
             return False
+
+    def _fetch_via_tmp_page(self, url, path, timeout_s=90):
+        """浏览器原生下载(锚点点击), 全程隔离在一次性标签页里。
+
+        会话未授权时该点击会变成"整页导航"(302 → 登录页/错误页) —— 隔离后只牺牲临时页;
+        检测到导航立即判失败(留 3s 宽容窗口, 等"跳转链尾还能落回下载"的少数情况)。
+        """
+        tmp = None
+        seen = {"dl": None}
+        nav_to = ""
+        try:
+            tmp = self.ctx.new_page()
+            tmp.on("download", lambda d: seen.__setitem__("dl", d))
+            tmp.evaluate("""(u) => {
+                const a = document.createElement('a');
+                a.href = u; a.download = ''; a.rel = 'noopener';
+                (document.body || document.documentElement).appendChild(a); a.click();
+                setTimeout(() => a.remove(), 0); }""", url)
+            end = time.time() + timeout_s
+            while time.time() < end and seen["dl"] is None:
+                tmp.wait_for_timeout(500)
+                try:
+                    nav_to = tmp.url or ""
+                except Exception:
+                    nav_to = ""
+                if nav_to and not nav_to.startswith("about:"):
+                    tmp.wait_for_timeout(3000)
+                    break
+            d = seen["dl"]
+            if d is None:
+                if nav_to and not nav_to.startswith("about:"):
+                    self.sink.log(f"⚠️ 下载链接未作为下载处理, 被整页导航到: {nav_to[:90]}"
+                                  f"(会话未授权?) —— 已隔离在临时页, 工作页未受影响", level="warn")
+                else:
+                    self.sink.log(f"⚠️ 浏览器下载超时({timeout_s}s 内无下载事件)", level="warn")
+                return False
+            d.save_as(path)
+            with open(path, "rb") as fh:
+                head = fh.read(16)
+            if self._looks_like_report(head):
+                self.sink.log(f"💾 已保存 {os.path.basename(path)} "
+                              f"({os.path.getsize(path) / 1024:.0f}KB · 浏览器下载)")
+                return True
+            self.sink.log(f"ℹ️ 浏览器下载到的不是报表(前16字节 {head!r}), 已丢弃", level="warn")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return False
+        except Exception as e:
+            self.sink.log(f"ℹ️ 浏览器下载未成功({str(e)[:60]})", level="warn")
+            return False
+        finally:
+            try:
+                if tmp is not None and not tmp.is_closed():
+                    tmp.close()
+            except Exception:
+                pass
 
     # ---------- 抓取(解析已下载 CSV; 失败返回 {} 由编排层硬失败) ----------
     def capture_stats(self, date_from=None, date_to=None, directory=None) -> dict:

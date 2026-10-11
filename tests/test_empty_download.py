@@ -56,9 +56,9 @@ def main():
     print("【1】broken_report_files 能识别空文件 / 坏文件")
     with tempfile.TemporaryDirectory() as d:
         date = "2026-09-22"
-        empty = os.path.join(d, f"门店下载_20260922至20260922_全部门店_111_20260923161225981.xlsx")
+        empty = os.path.join(d, f"门店下载_20260922至20260922_全部门店_111_20260923000000003.xlsx")
         open(empty, "wb").close()                                     # 0 字节(真机复现)
-        junk = os.path.join(d, f"门店下载_20260922至20260922_全部门店_111_20260923161233278.xlsx")
+        junk = os.path.join(d, f"门店下载_20260922至20260922_全部门店_111_20260923000000004.xlsx")
         with open(junk, "wb") as f:
             f.write(b"not a zip at all" * 200)                        # 非 zip
         ok = os.path.join(d, f"门店下载_20260922至20260922_全部门店_111_20260923000000000.xlsx")
@@ -69,8 +69,8 @@ def main():
 
         broken = broken_report_files(d, date)
         names = [n for n, _ in broken]
-        check("0 字节文件被识别", any("161225981" in n for n in names), str(names))
-        check("非 zip 文件被识别", any("161233278" in n for n in names), str(names))
+        check("0 字节文件被识别", any("000000003" in n for n in names), str(names))
+        check("非 zip 文件被识别", any("000000004" in n for n in names), str(names))
         check("原因里带字节数", any("字节" in w for _, w in broken), str(broken))
         check("没有 data 表的文件也算无效", any("000000000" in n for n in names), str(names))
         check("目录里 3 个文件全部被识别", len(names) == 3, str(names))
