@@ -37,6 +37,7 @@ GJ_MAPPING = [
     ("HZ", "自营外卖", "订单量"),
 ]
 
+import json as _json  # noqa: E402
 import re as _re  # noqa: E402
 
 # 最近一次 DOM 直读的解析取证(诊断包原样带走: 解析类失败不必再靠截图猜)
@@ -213,6 +214,188 @@ def scrape_overview_text(txt):
     LAST_PROBE.clear()
     LAST_PROBE.update(meta)
     return out, meta
+
+
+# ---------- 接口直取(2026-10-11): business-summary-page 响应 → 结构化 ----------
+# 真机取证(高桥店 10-10, 与 DOM 版逐项 15/15 一致, 见 tests/test_gj_api_parse.py):
+#   渠道值 = data.BusinessOverviewPrintBusinessCompose.items[]
+#            incomeAmt(分)/100 → 营业收入; businessAmt(分)/100 → 营业额; orderCnt → 订单量
+#   总量   = compose.sum[0](营业额/订单量) + data.BusinessEfficiency.payAmt(营业收入)
+#   敏感   = data.SensOperation.{dishDetail,orderDetail}[].sensitiveTimes / skuAmt|orderAmt
+# 失败(结构不符/非业务响应) → (None, {"api_error":..}) → 调用方回退 DOM(宁可不写不写错)。
+
+
+def _cy(v):
+    """金额: 分 → 元(两位小数)。None 安全。"""
+    n = num(v)
+    return None if n is None else round(n / 100.0, 2)
+
+
+def _loads(v):
+    """JSON 双编码解包: 字符串 → dict; dict 原样; 其它 → None。"""
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            r = _json.loads(v)
+            return r if isinstance(r, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _api_block(data, name):
+    """data.<name>.data 内层 JSON(结构: {code, msg, data:"<json>"}); 不合法 → None。"""
+    v = data.get(name)
+    if not isinstance(v, dict) or v.get("code") not in (0, "0"):
+        return None
+    return _loads(v.get("data"))
+
+
+def _sens_from_summary(data):
+    """SensOperation 块 → {"times":.., "amt":..} 或 None(块缺失/无值)。"""
+    s = _api_block(data, "SensOperation")
+    if not isinstance(s, dict):
+        return None
+    times = amt = 0.0
+    hit = False
+    for key in ("dishDetail", "orderDetail"):
+        for e in (s.get(key) or []):
+            if not isinstance(e, dict):
+                continue
+            t = e.get("sensitiveTimes")
+            if t is not None:
+                try:
+                    times += float(t)
+                    hit = True
+                except (TypeError, ValueError):
+                    pass
+            a = e.get("skuAmt")
+            if a is None:
+                a = e.get("orderAmt")
+            if a is not None:
+                try:
+                    amt += float(a)
+                except (TypeError, ValueError):
+                    pass
+    if not hit:
+        return None
+    return {"times": times, "amt": round(amt / 100.0, 2)}
+
+
+def parse_summary_json(obj):
+    """营业概览接口(business-summary-page)响应 → (parsed, meta), 与 scrape_overview_text 同构。
+
+    obj: dict 或原始 JSON 字符串。
+    失败 → (None, {"api_error": 原因}), 调用方回退 DOM; 成功时 meta 额外含:
+    source="api" 与 sensitive_from_api(或 None, 供直写 IA/IB)。
+    """
+    if isinstance(obj, str):
+        try:
+            obj = _json.loads(obj)
+        except Exception:
+            return None, {"api_error": "响应不是 JSON"}
+    if not isinstance(obj, dict):
+        return None, {"api_error": "响应不是 JSON 对象"}
+    if obj.get("code") not in (0, "0"):
+        return None, {"api_error": f"接口 code={obj.get('code')}"}
+    data = obj.get("data")
+    if not isinstance(data, dict):
+        return None, {"api_error": "响应缺少 data"}
+    comp = _api_block(data, "BusinessOverviewPrintBusinessCompose")
+    if not isinstance(comp, dict) or not isinstance(comp.get("items"), list):
+        return None, {"api_error": "缺少渠道构成块(compose)"}
+    eff = _api_block(data, "BusinessEfficiency") or {}
+    sums = comp.get("sum") or []
+    s0 = sums[0] if sums and isinstance(sums[0], dict) else {}
+
+    metrics = (("营业收入", "incomeAmt"), ("营业额", "businessAmt"), ("订单量", "orderCnt"))
+    channels = {k: {} for k, _f in metrics}
+    unknowns = {k: {} for k, _f in metrics}
+    unknown_all = {}
+    for it in comp["items"]:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("orderTypeName") or "").strip()
+        if not name:
+            continue
+        for k, f in metrics:
+            v = num(it.get(f)) if f == "orderCnt" else _cy(it.get(f))
+            if v is None:
+                continue
+            if name in CHANNEL_SET:
+                channels[k][name] = v
+            else:
+                unknowns[k][name] = v
+                unknown_all[name] = v
+
+    totals = {"营业收入": _cy(eff.get("payAmt")),
+              "营业额": _cy(s0.get("businessAmt")),
+              "订单量": num(s0.get("orderCnt"))}
+    if any(totals[k] is None for k in ("营业收入", "营业额", "订单量")):
+        return None, {"api_error": "总量字段缺失(payAmt/sum)"}
+
+    out = {}
+    for cat in CHANNELS:
+        d = {}
+        for k, _f in metrics:
+            if cat in channels[k]:
+                d[k] = channels[k][cat]
+        if d:
+            out[cat] = d
+
+    bad, probe_c = [], {}
+    for k, _f in metrics:
+        ok, off = _reconcile(totals[k], channels[k], unknowns[k])
+        if ok is False:
+            bad.append(k)
+        probe_c[k] = {"total": totals[k], "known": channels[k], "unknown": unknowns[k],
+                      "consistent": ok, "offset": round(off, 4) if off is not None else None,
+                      "candidates": 1}
+
+    zero_data = (not out) and all(totals[k] == 0 for k in ("营业收入", "营业额", "订单量"))
+    if zero_data:
+        for _col, cat, field in GJ_MAPPING:
+            out.setdefault(cat, {}).setdefault(field, 0)
+
+    meta = {"totals": totals, "crosscheck_failed": bad, "zero_data": zero_data,
+            "unknown_channels": unknown_all, "no_data_hint": False,
+            "probe": {"metrics": probe_c, "channels": list(CHANNELS)},
+            "source": "api", "sensitive_from_api": _sens_from_summary(data)}
+    return out, meta
+
+
+def readings_equal(a, ma, b, mb):
+    """双读对比: 两路读数(渠道逐项值 + 总量 + zero 标志)一致? (数值容差 0.5 分)。"""
+    if set(a) != set(b):
+        return False
+    for cat in a:
+        da, db = a.get(cat) or {}, b.get(cat) or {}
+        if set(da) != set(db):
+            return False
+        for k, v in da.items():
+            w = db[k]
+            if v is None or w is None:
+                if v != w:
+                    return False
+                continue
+            try:
+                if abs(float(v) - float(w)) > 0.005:
+                    return False
+            except (TypeError, ValueError):
+                return False
+    for k in ("营业收入", "营业额", "订单量"):
+        v, w = (ma.get("totals") or {}).get(k), (mb.get("totals") or {}).get(k)
+        if v is None or w is None:
+            if v != w:
+                return False
+            continue
+        try:
+            if abs(float(v) - float(w)) > 0.005:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return bool(ma.get("zero_data")) == bool(mb.get("zero_data"))
 
 
 def parse_biz_xlsx(path):

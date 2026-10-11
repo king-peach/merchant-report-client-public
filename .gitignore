@@ -17,3 +17,6 @@ diagnostics/
 config.yaml
 config.local.yaml
 .env
+
+# Hermes 本地运行残留(勿入库)
+.hermes/

@@ -127,6 +127,17 @@ def _sens_from_bodies(bodies):
     return None
 
 
+def _gj_date_ms(df):
+    """'2026/10/10'(或 2026-10-10) → 当日 00:00(北京)毫秒戳, 与营业概览查询请求体 startDate
+    同口径(真机校验: 2026-10-10 → 1791561600000)。解析失败 → None。"""
+    import calendar
+    try:
+        p = [int(x) for x in re.split(r"[/\-]", str(df).strip())]
+        return (calendar.timegm((p[0], p[1], p[2], 0, 0, 0)) - 8 * 3600) * 1000
+    except Exception:
+        return None
+
+
 class MeituanGjAdapter:
     platform = "meituan_gj"
 
@@ -1210,20 +1221,94 @@ class MeituanGjAdapter:
                 except Exception:
                     pass
 
+    def _gj_summary_listen(self, page):
+        """挂 business-summary-page 响应监听 → (box, handler); box[i]={"startDate","resp"}。
+
+        ⚠️ 回调只在 Playwright 调用(如 wait_for_timeout)期间被派发 —— 用 time.sleep 等会漏事件。
+        """
+        box = []
+
+        def _on_resp(r):
+            try:
+                if "business-summary-page" not in r.url:
+                    return
+                rec = {}
+                try:
+                    body = r.request.post_data or ""
+                except Exception:
+                    body = ""
+                m = re.search(r'startDate[\\"]*\s*:\s*(\d+)', body)
+                rec["startDate"] = m.group(1) if m else "?"
+                try:
+                    rec["resp"] = r.text()
+                except Exception:
+                    return
+                box.append(rec)
+            except Exception:
+                pass
+
+        page.on("response", _on_resp)
+        return box, _on_resp
+
+    def _gj_pick_summary(self, page, box, df):
+        """从监听盒挑「本店本日」响应文本(box=None/日期不可解析 → None); 最多等 ~6s。"""
+        if box is None:
+            return None
+        want = _gj_date_ms(df)
+        if want is None:
+            return None
+        want = str(want)
+        for _ in range(20):
+            cand = [x for x in box if x.get("resp") and x.get("startDate") == want]
+            if cand:
+                return cand[-1]["resp"]
+            try:
+                page.wait_for_timeout(300)
+            except Exception:
+                break
+        return None
+
     def _scrape_one(self, page, store_name, df, dt):
-        """单店: 进后台→营业概览→设日期→读页面数字。返回 parse_biz_xlsx 同构 dict 或 None。
+        """单店: 进后台→营业概览→设日期→读数。返回 parse_biz_xlsx 同构 dict 或 None。
+        读数双通道: 接口响应(优先) + 页面文本(兜底/对照, 观察期不一致以页面为准)。
         失败原因写入 self._last_err(供卡点面板展示)。"""
         from . import gj_mapping
         self._last_err = ""
+        box, _on_summary = None, None
         try:
             self._open_biz_overview(page)
+            try:
+                box, _on_summary = self._gj_summary_listen(page)
+            except Exception:
+                box = None
             self._set_gj_dates(page, df, dt)
             # 等数字渲染出来(等条件, 不再固定等 3s)
             self._wait_until(lambda: ("营业收入" in self._text_of(page)
                                       or "营业额" in self._text_of(page)),
                              timeout_s=12, what="营业概览读数")
             txt = self._text_of(page)
-            parsed, meta = gj_mapping.scrape_overview_text(txt)
+            dom_parsed, dom_meta = gj_mapping.scrape_overview_text(txt)
+
+            # ── 接口通道(双读对照): 一致→用接口值; 不一致→以页面为准+告警; 页面没读到→接口值顶上 ──
+            parsed, meta = dom_parsed, dom_meta
+            rec = self._gj_pick_summary(page, box, df)
+            if rec is None:
+                self.sink.log(f"ℹ️ {store_name}: 接口取数未命中, 回退页面解析")
+            else:
+                api_parsed, api_meta = gj_mapping.parse_summary_json(rec)
+                if api_parsed is None:
+                    self.sink.log(f"ℹ️ {store_name}: 接口取数未命中"
+                                  f"({str(api_meta.get('api_error'))[:60]}), 回退页面解析")
+                elif dom_parsed:
+                    if gj_mapping.readings_equal(api_parsed, api_meta, dom_parsed, dom_meta):
+                        parsed, meta = api_parsed, api_meta
+                        self.sink.log(f"⚡ {store_name}: 接口取数命中(与页面双读一致)")
+                    else:
+                        self.sink.log(f"⚠️ {store_name}: 接口与页面读数不一致 → 以页面为准(接口待观察)",
+                                      level="warn")
+                else:
+                    parsed, meta = api_parsed, api_meta
+                    self.sink.log(f"⚡ {store_name}: 页面读数未就绪 → 采用接口值(观察期)", level="warn")
             if not parsed:
                 if meta.get("zero_data"):
                     # 2026-10-01 用户口径: 平台渲染出了标签、数值全 0 = **真实数据**(当天确实无营业),
@@ -1256,6 +1341,12 @@ class MeituanGjAdapter:
             if meta.get("zero_data"):
                 self.sink.log(f"⏭ {store_name}: 当日全零(无营业数据) → 敏感操作跳过(IA/IB 留空, 平台侧无数据)")
                 return parsed
+            _api_sens = meta.get("sensitive_from_api")
+            if _api_sens:
+                parsed["_sensitive"] = _api_sens
+                self.sink.log(f"✍️ {store_name}: 敏感操作(接口) {_api_sens['times']:g} 次 / "
+                              f"{_api_sens['amt']:g} 元(写 IA/IB)")
+                return parsed
             try:
                 _sens = self._capture_sensitive(page)
             except Exception as e:
@@ -1271,6 +1362,12 @@ class MeituanGjAdapter:
             self._last_err = f"页面操作异常: {str(e)[:120]}"
             self.sink.log(f"⚠️ {store_name} 抓取失败: {self._last_err}", level="warn")
             return None
+        finally:
+            if _on_summary is not None:
+                try:
+                    page.remove_listener("response", _on_summary)
+                except Exception:
+                    pass
 
     def capture_stats(self, date_from=None, date_to=None) -> dict:
         """DOM 直读结果已在 download_reports 采集(self.scraped); 组装给编排层。"""
