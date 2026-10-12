@@ -13,7 +13,8 @@ from .fill import (SHEET, broken_report_files, cross_checks, dates_span_text, de
                    fill_template, find_report_files, load_report_rows,
                    load_report_rows_by_store, report_file_candidates, unusable_report_hint)
 from . import weather as weather_mod
-from .platforms.taobao import TaobaoAdapter, launch_browser
+from .platforms.taobao import (TaobaoAdapter, browser_death_forensics, launch_browser,
+                               wait_browser_ready, watch_browser)
 from .platforms.meituan import MeituanAdapter
 from .platforms.jd import JDAdapter
 from .platforms.meituan_gj import MeituanGjAdapter
@@ -675,6 +676,12 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 return a, True
 
             actx = launch_browser(pw, profile_path, sink=sink)
+            try:
+                _live = actx.browser
+                if _live is not None:
+                    watch_browser(_live, sink)   # 断开即记日志: 定位"什么时候死的"
+            except Exception:
+                pass
             ad, ok = build_adapter(actx)
             ad_holder["ad"] = ad
             if not ok:
@@ -685,17 +692,42 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
 
             def relaunch_browser(reason=""):
                 """确定性恢复: 浏览器被关闭/配置目录被占用 → 重开 context(profile 保留登录态) + 重建适配器。
-                不丢登录态, 因此不需要用户重新登录。"""
+                不丢登录态, 因此不需要用户重新登录。
+
+                2026-10-12 加固(客户机"重开连死"实证): ①关旧后先等 0.8s;
+                ②重开后**验证浏览器真的活着**, 没活就关掉再试一次 —— 此前"launch 没抛异常"
+                就当成功, 把死浏览器交给后续步骤, 报出一串 'Target closed' 的假象。"""
                 nonlocal actx, ad
                 sink.log(f"🔄 自动化浏览器不可用（{reason}），正在重开并复用登录态…")
                 try:
                     actx.close()
                 except Exception:
                     pass
-                try:
-                    actx = launch_browser(pw, profile_path, sink=sink)
-                except Exception as e:
-                    sink.log(f"⚠️ 浏览器重开失败: {str(e)[:100]}", level="warn")
+                time.sleep(0.8)          # 让旧浏览器完全退出(Windows 收尾慢)
+                launched = False
+                for attempt in (1, 2):
+                    try:
+                        actx = launch_browser(pw, profile_path, sink=sink)
+                    except Exception as e:
+                        sink.log(f"⚠️ 浏览器重开失败(第{attempt}次): {str(e)[:120]}", level="warn")
+                        time.sleep(2)
+                        continue
+                    try:
+                        _live = actx.browser
+                        if _live is not None:
+                            watch_browser(_live, sink)
+                    except Exception:
+                        pass
+                    if wait_browser_ready(actx):
+                        launched = True
+                        break
+                    sink.log(f"⚠️ 重开的浏览器没有活起来(第{attempt}次), 关闭后重试", level="warn")
+                    try:
+                        actx.close()
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                if not launched:
                     return False
                 a2, ok2 = build_adapter(actx)
                 ad = a2
@@ -752,6 +784,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             stats = timed("capture", "网页抓取", do_capture)
             user_skipped = False
             relaunched = 0
+            _diag_written = False     # 首次浏览器死亡时写一份现场取证(每任务一次)
             for heal in range(max_heal):
                 failed = "download" if not reports else ("capture" if not stats else None)
                 if not failed:
@@ -764,6 +797,17 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 # 确定性自动恢复: 浏览器被关掉/配置目录被占用 → 直接重开并重试(登录态复用), 不打扰用户
                 if cause.get("auto_recover") and relaunched < 2:
                     relaunched += 1
+                    # 现场取证(每任务只写一次): 进程表+崩溃事件 → 文件; 用于区分
+                    # "被外部结束"还是"自身崩溃", 客户机连续死亡排查的关键证据(2026-10-12)
+                    if not _diag_written:
+                        _diag_written = True
+                        try:
+                            _diag = browser_death_forensics(profile_path, ddir, err_text)
+                            if _diag:
+                                sink.log(f"🧪 浏览器死亡现场已记录: {_diag}"
+                                         f"（若反复出现，请把该文件连同界面日志发给支持）")
+                        except Exception:
+                            pass
                     did_recover = relaunch_browser(cause.get("title", ""))
                 act = "retried" if did_recover else selfheal_retry(
                     failed, err_text,

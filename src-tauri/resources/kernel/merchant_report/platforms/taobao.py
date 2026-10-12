@@ -92,6 +92,78 @@ def _other_live_task_pids():
         return None
 
 
+def _win_process_table():
+    """Windows 全量进程表 [(pid, ppid, cmdline)]; 非 Windows / 探测失败 → None。"""
+    if os.name != "nt":
+        return None
+    ps = ("Get-CimInstance Win32_Process | "
+          "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                             capture_output=True, text=True, timeout=40).stdout.strip()
+        if not out:
+            return []
+        data = json.loads(out)
+        if isinstance(data, dict):
+            data = [data]
+        return [(int(d.get("ProcessId") or 0), int(d.get("ParentProcessId") or 0),
+                 str(d.get("CommandLine") or "")) for d in data]
+    except Exception:
+        return None
+
+
+def select_profile_kill_pids(procs, profile):
+    """从进程表选出「命令行含 profile 的进程 + 它们的全部后代」pid 列表(纯函数)。
+
+    为什么要带后代: Chromium 是多进程(renderer/gpu/crashpad), 子进程命令行里可能不带
+    profile 路径 → 只杀顶层会把孤儿留给下一轮, 新一轮启动就会被残留占着。
+    2026-10-12 客户机"重开连死"事件: 与"杀完不等退出"叠加才放大成连续死亡。"""
+    prof = str(profile).lower()
+    kill = {p for p, _pp, cmd in procs if prof in str(cmd).lower()}
+    changed = True
+    while changed:
+        changed = False
+        for p, pp, _cmd in procs:
+            if p not in kill and pp in kill:
+                kill.add(p)
+                changed = True
+    return sorted(kill)
+
+
+def _profile_process_pids(profile):
+    """当前仍指向该 profile 的进程 pid; 探测失败 → None。"""
+    if os.name == "nt":
+        table = _win_process_table()
+        if table is None:
+            return None
+        return [p for p, _pp, cmd in table if str(profile).lower() in str(cmd).lower()]
+    try:
+        out = subprocess.run(["pgrep", "-f", str(profile)], capture_output=True, text=True,
+                             timeout=5).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return None
+
+
+def wait_profile_free(profile, timeout_s=12.0, poll_s=1.0, probe=None):
+    """轮询直到没有进程占用 profile 路径。返回 (released, remaining); remaining=-1=探测不可用。
+
+    2026-10-12 客户机实证的坑: Windows 分支此前 Stop-Process 后**不等退出**就立刻启动
+    新浏览器 —— 被杀的旧进程还没释放 profile, 新 Chromium 起来就死(Playwright 报
+    Target closed), "自动重开"于是连开连死。杀完必须等到真正释放再启动。"""
+    probe = probe or _profile_process_pids
+    end = time.time() + timeout_s
+    while True:
+        pids = probe(profile)
+        if pids is None:
+            return False, -1
+        if not pids:
+            return True, 0
+        if time.time() >= end:
+            return False, len(pids)
+        time.sleep(poll_s)
+
+
 def _cleanup_stale_browser(profile_dir, sink=None):
     """结束仍占用本 profile 的**残留**浏览器(上一轮任务未完全退出)。
     否则新启动的浏览器会把参数转发给旧实例, Playwright 拿不到控制权。
@@ -124,13 +196,26 @@ def _cleanup_stale_browser(profile_dir, sink=None):
         return False
     prof = str(profile_dir)
     try:
+        killed = 0
         if os.name == "nt":
-            esc = prof.replace("'", "''")
-            ps = ("Get-CimInstance Win32_Process "
-                  f"| Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{esc}*' }} "
-                  "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, timeout=25)
+            table = _win_process_table()
+            if table is not None:
+                pids = [p for p in select_profile_kill_pids(table, prof) if p != os.getpid()]
+                if pids:
+                    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                    f"Stop-Process -Id {','.join(map(str, pids))} -Force "
+                                    "-ErrorAction SilentlyContinue"],
+                                   capture_output=True, text=True, timeout=25)
+                    killed = len(pids)
+            else:
+                # 进程表探测失败 → 退回"按命令行直接杀"兜底; 杀完同样要等释放(见下)
+                esc = prof.replace("'", "''")
+                ps = ("Get-CimInstance Win32_Process "
+                      f"| Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{esc}*' }} "
+                      "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+                subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                               capture_output=True, text=True, timeout=25)
+                killed = -1
         else:
             out = subprocess.run(["pgrep", "-f", prof], capture_output=True, text=True,
                                  timeout=5).stdout.split()
@@ -139,8 +224,21 @@ def _cleanup_stale_browser(profile_dir, sink=None):
                     os.kill(int(pid), 15)
                 except Exception:
                     pass
-            if out:
-                time.sleep(3)   # 等浏览器完全退出释放 profile 锁
+            killed = len(out)
+        # ⚠️ 关键修复(2026-10-12 客户机"重开也被立刻关"): 杀完必须**等到进程真正退出、
+        # 释放 profile** 才返回 —— 此前 Windows 分支杀完立即启动新浏览器, 旧进程还在释放中
+        # → 新 Chromium 秒退, 把一次死亡放大成"连续关闭"。POSIX 原来也只盲睡 3s, 统一改成轮询。
+        released, remaining = wait_profile_free(prof, timeout_s=12)
+        if sink is not None:
+            try:
+                if killed:
+                    extra = "" if released else f"（仍有 {remaining} 个未退出, 已尽量等待）"
+                    n = f" {killed} 个" if killed > 0 else ""
+                    sink.log(f"🧹 已清理残留浏览器进程{n}{extra}")
+                elif not released and remaining and remaining > 0:
+                    sink.log(f"⚠️ 仍有 {remaining} 个进程占用浏览器配置目录(未能安全清理), 已等待", level="warn")
+            except Exception:
+                pass
         return True
     except Exception:
         return False
@@ -168,6 +266,112 @@ def verify_browser(exe="", timeout_ms=45000):
                 return False, str(e)[:220]
     except Exception as e:
         return False, str(e)[:150]
+
+
+def wait_browser_ready(ctx, timeout_s=8.0, poll_s=0.5):
+    """重开后验证浏览器**真的活着**(能拿到页面并 evaluate)。返回 True/False。
+
+    2026-10-12 客户机实证: "重开成功"≠"浏览器活着"。起不来的新浏览器直接交给后续步骤,
+    会表现为 'Target page, context or browser has been closed' 连环报错 —— 看起来像
+    "反复被关", 实际是我们自己重开的死浏览器。所以重开必须带验证, 没活就关掉再试。"""
+    end = time.time() + timeout_s
+    while time.time() < end:
+        try:
+            pages = ctx.pages
+            if not pages:
+                pages = [ctx.new_page()]
+            pages[0].evaluate("() => 1")
+            return True
+        except Exception:
+            time.sleep(poll_s)
+    return False
+
+
+def watch_browser(browser, sink):
+    """给浏览器挂 disconnected 监听: 一断开立刻在日志留一行(定位"什么时候死的")。"""
+    try:
+        def _on_disc(*_a):
+            try:
+                sink.log("⚠️ 浏览器连接已断开(browser disconnected)", level="warn")
+            except Exception:
+                pass
+        browser.on("disconnected", _on_disc)
+        return True
+    except Exception:
+        return False
+
+
+def format_browser_diag(when, err_text, profile, procs, events, platform_name):
+    """组装浏览器死亡取证文本(纯函数, 单测直接喂合成数据)。"""
+    lines = [f"[浏览器死亡现场] {when} ({platform_name})",
+             f"错误: {str(err_text)[:600]}",
+             f"profile: {profile}",
+             "",
+             "---- 相关进程(chrome/msedge/chromium; pid / 父pid / 启动时间 / 命令行) ----"]
+    rows = [r for r in (procs or [])
+            if any(k in str(r[3]).lower() for k in ("chrome", "msedge", "chromium"))]
+    if rows:
+        for pid, ppid, start, cmd in rows[:30]:
+            lines.append(f"pid={pid} ppid={ppid} start={start} cmd={str(cmd)[:220]}")
+    else:
+        lines.append("(无相关进程存活)")
+    lines += ["", "---- Application 错误事件(近30分钟, 消息含 chrome/msedge) ----"]
+    lines += list(events[:15]) if events else ["(无, 或事件日志不可读)"]
+    lines += ["", "说明: 有 Application Error 条目=浏览器自身崩溃(看 faulting module); "
+                  "无条目但进程消失=被外部结束(安全软件/系统/手动)。本文件由客户端自动生成。"]
+    return "\n".join(lines)
+
+
+def browser_death_forensics(profile_dir, out_dir, err_text=""):
+    """浏览器被关的现场取证 → 写文本文件, 返回路径(失败 → "")。
+
+    区分两类死因: ①进程自身崩溃 → 事件日志有 Application Error(带故障模块);
+    ②被外部结束(安全软件/手动/系统) → 无崩溃条目但进程消失。另附全量相关进程命令行,
+    可看出是否有残留/多实例。其他平台退化为记录 profile 进程清单(macOS 排查也用得上)。"""
+    when = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    procs, events = [], []
+    if os.name == "nt":
+        try:
+            ps = ("Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,"
+                  "CreationDate,CommandLine | ConvertTo-Json -Compress")
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                                 capture_output=True, text=True, timeout=40).stdout.strip()
+            data = json.loads(out) if out else []
+            if isinstance(data, dict):
+                data = [data]
+            procs = [(int(d.get("ProcessId") or 0), int(d.get("ParentProcessId") or 0),
+                      str(d.get("CreationDate") or ""), str(d.get("CommandLine") or ""))
+                     for d in data]
+        except Exception:
+            procs = []
+        try:
+            ps_ev = ("$ws = Get-WinEvent -FilterHashtable @{LogName='Application'; "
+                     "StartTime=(Get-Date).AddMinutes(-30)} -MaxEvents 400 -ErrorAction SilentlyContinue | "
+                     "Where-Object { $_.Message -match 'chrome|chromium|msedge' } | Select-Object -First 12; "
+                     "foreach ($e in $ws) { Write-Output ($e.TimeCreated.ToString('MM-dd HH:mm:ss') + "
+                     "' [id=' + $e.Id + '] ' + $e.Message) }")
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_ev],
+                                 capture_output=True, text=True, timeout=30).stdout.strip()
+            if out:
+                events = out.splitlines()
+        except Exception:
+            pass
+    else:
+        try:
+            out = subprocess.run(["pgrep", "-lf", str(profile_dir)], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+            procs = [(0, 0, "", ln) for ln in out.splitlines()] if out else []
+        except Exception:
+            pass
+    try:
+        path = Path(out_dir) / (f"browser_diag_"
+                                f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        path.write_text(format_browser_diag(when, err_text, str(profile_dir), procs, events,
+                                            "Windows" if os.name == "nt" else "posix"),
+                        encoding="utf-8")
+        return str(path)
+    except Exception:
+        return ""
 
 
 # 可继续尝试下一个候选的错误关键字: 不只是"找不到浏览器", 启动超时同样要换候选
