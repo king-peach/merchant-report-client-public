@@ -70,7 +70,9 @@ jobs:
           $target = "src-tauri/resources/python/Lib/site-packages"
           # 用 runner 自带完整 Python 装到 embed 的 site-packages(embed 自身不带 pip)
           python -m pip install --upgrade pip
-          python -m pip install --target $target playwright openpyxl certifi
+          # playwright 锁版本(2026-10-12): 未锁版会随 pip 静默漂移, 浏览器组件(chromium)随之下载不同版本,
+          # 出包不可复现; 锁 1.63.0 = 当前全链路验证过的版本(chromium v1243)。升级务必先真机回归。
+          python -m pip install --target $target "playwright==1.63.0" openpyxl certifi
           Write-Host "=== site-packages 体积 ==="
           "{0:N1} MB" -f ((Get-ChildItem $target -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
 

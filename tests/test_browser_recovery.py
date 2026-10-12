@@ -93,7 +93,12 @@ def test_format_diag_filter():
             (2, 0, "10:00", r"C:\x\notepad.exe")]
     txt = T.format_browser_diag("now", "err", "prof", rows, ["evt-line"], "Windows")
     assert "chrome.exe" in txt and "notepad.exe" not in txt and "evt-line" in txt
-    print("✅ 取证格式: 只收 chrome/msedge 家族, 事件行照录")
+    # 空列表=查询成功但无记录; None=查询失败/未查询 → 两种判词必须分得开(2026-10-12 判读教训)
+    t2 = T.format_browser_diag("now", "err", "prof", rows, [], "Windows")
+    assert "无崩溃事件记录" in t2, t2
+    t3 = T.format_browser_diag("now", "err", "prof", rows, None, "Windows")
+    assert "读取失败" in t3 and "无崩溃事件记录" not in t3, t3
+    print("✅ 取证格式: 只收 chrome/msedge 家族, 事件行照录; 无记录/读取失败两判词可区分")
 
 
 def test_parse_proc_table():
