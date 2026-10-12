@@ -895,13 +895,33 @@ class TaobaoAdapter:
             self.sink.log("💾 已挂载下载接管(Playwright download 事件)")
         except Exception as e:
             self.sink.log(f"⚠️ 下载接管挂载失败: {str(e)[:80]}", level="warn")
-        try:
-            cdp = self.ctx.new_cdp_session(self.page)
-            cdp.send("Browser.setDownloadBehavior",
-                     {"behavior": "allow", "downloadPath": ddir, "eventsEnabled": True})
-        except Exception as e:
-            # 不强求: 上面的事件接管已能落盘; 这里失败只提示, 不阻塞
-            self.sink.log(f"ℹ️ CDP 下载行为设置被浏览器拒绝(已由事件接管兜底): {str(e)[:80]}")
+        # 2026-10-12 移除 Browser.setDownloadBehavior(客户机"下载开始即死亡"排查):
+        # 其余三个平台(美团/JD/管家)全都不发这个 CDP 设置, 而美团在同台客户机上可跑通;
+        # 客户机日志显示该调用被接受(无"被拒绝"提示), 而浏览器死亡点恰在下载开始那一刻
+        # —— 于是去掉这条旁路, 与"能跑通的路径"对齐。落盘仍由上面的 download 事件接管 +
+        # _recover_stray_downloads 兜底, 不依赖 CDP 设置。
+        # 下载 URL 嗅探(仅排查记录, 不改流程): 记下"像报表文件/导出"的请求, 供下一轮把淘宝
+        # 也改成"接口直取"(同美团 _fetch_via_request: 纯 HTTP, 完全不碰浏览器下载机制)。
+        if not getattr(self, "_dl_sniff_on", False):
+            try:
+                self._dl_urls = []
+
+                def _req_hook(req):
+                    try:
+                        u = req.url or ""
+                        if len(self._dl_urls) >= 12:
+                            return
+                        if re.search(r"download|export|xlsx|\.csv", u, re.I) and u not in self._dl_urls:
+                            self._dl_urls.append(u)
+                            self.sink.log(f"🔗 疑似下载请求: {u[:160]}")
+                    except Exception:
+                        pass
+
+                self.ctx.on("request", _req_hook)
+                self._dl_sniff_on = True
+                self.sink.log("🛰 已挂载下载 URL 嗅探(仅排查记录, 不影响流程)")
+            except Exception as e:
+                self.sink.log(f"ℹ️ 下载 URL 嗅探挂载失败(忽略): {str(e)[:60]}", level="warn")
         # 记住本次请求区间: 下载事件 _save_download 用它给文件改规范名
         # (平台原名末段是**下载时间戳**不是报表日期, 分不清是哪天的报表)
         self._dl_range = (date_from or date_to or "", date_to or date_from or "")

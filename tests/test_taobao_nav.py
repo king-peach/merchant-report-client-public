@@ -286,7 +286,7 @@ assert hit == ["全部"], f"必须精确点「全部」, 实际点到: {hit}（�
 print(f"  ✓ 精确命中 {hit}（未误点「全部门店」）")
 
 
-print("=== 13. 下载落地改用 Playwright download 事件(不依赖被新版 Chrome 忽略的 CDP 设置) ===")
+print("=== 13. 下载落地: 事件接管 + URL 嗅探挂载(2026-10-12 起不再发 CDP 下载设置) ===")
 f = FakeFrame(url="https://x/download-center", text="下载数据")
 ad, sink = ad_with([f], store_id="1")
 ad._open_download_center = lambda sid, rounds=3: None
@@ -297,15 +297,16 @@ ad._goto_manager = lambda *a: None
 ad._wait_files = lambda *a, **k: ["ok.xlsx"]
 import os as _os4
 _os4.makedirs("/tmp/dc_test4", exist_ok=True)
-# CDP 调用被浏览器拒绝(模拟 Chrome 153) → 不该让任务失败
-ad.ctx.new_cdp_session = lambda pg: types.SimpleNamespace(
-    send=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("'Browser.setDownloadBehavior' wasn't found")))
+# 2026-10-12: 与"能跑通的美团路径"对齐 —— 不再发 Browser.setDownloadBehavior
+# (客户机实证"下载一开始浏览器就断连"; 四个平台里只有淘宝多做了这个 CDP 设置)。
 ad.download_reports("/tmp/dc_test4", date_from=None, date_to=None)
 assert "download" in ad.ctx.handlers, "必须挂载 download 事件接管"
+assert "request" in ad.ctx.handlers, "必须挂载下载 URL 嗅探(排查用)"
 logs = " ".join(m for _, m in sink.logs)
 assert "已挂载下载接管" in logs, logs
-assert "已由事件接管兜底" in logs, "CDP 被拒应降级提示而非失败"
-print("  ✓ download 事件已挂载; CDP 被拒不阻塞")
+assert "已挂载下载 URL 嗅探" in logs, logs
+assert "setDownloadBehavior" not in logs, "不该再出现 CDP 下载设置相关提示"
+print("  ✓ download 事件已挂载 + URL 嗅探在位; 不再依赖 CDP 设置")
 
 print("=== 14. 下载文件落盘: 重名自动加序号 ===")
 class FakeDownload:
