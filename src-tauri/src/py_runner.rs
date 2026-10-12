@@ -67,6 +67,42 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// 定位内核目录(打包资源 → dev 模式从当前目录向上找 kernel/merchant_report)。
+/// 从 run_task 里提出来, 供 read_store_platforms 复用(两处逻辑必须一致, 免得"跑任务能跑、
+/// 探测平台却找不到内核"这种错位)。
+fn resolve_kernel_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let res = app.path().resource_dir().map_err(|e| e.to_string())?;
+    // Tauri bundle 布局差异: resources 数组保留来源目录名 → Resources/resources/kernel;
+    // 旧布局/裸资源直放 Resources/kernel。两种都试。
+    let candidates = [res.join("kernel"), res.join("resources").join("kernel")];
+    let packaged = candidates
+        .iter()
+        .find(|p| p.join("merchant_report").exists())
+        .cloned();
+    let dir = packaged.unwrap_or_else(|| {
+        let mut dir = std::env::current_dir().unwrap_or_default();
+        let mut found = None;
+        for _ in 0..5 {
+            let cand = dir.join("kernel");
+            if cand.join("merchant_report").exists() {
+                found = Some(cand);
+                break;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        found.unwrap_or_default()
+    });
+    if !dir.join("merchant_report").exists() {
+        return Err(format!(
+            "kernel 目录无效: {} (打包资源缺失或 dev 目录不对)",
+            dir.display()
+        ));
+    }
+    Ok(dir)
+}
+
 /// 启动日报任务(商家/平台/模板由前端传入; 模板存在性双保险: Rust 先查, 内核再查)
 #[tauri::command]
 pub fn run_task(
@@ -99,43 +135,7 @@ pub fn run_task(
         ));
     }
     let python = resolve_python(&app)?;
-    // kernel 目录: 打包资源 → dev 模式从当前目录向上找 kernel/merchant_report
-    let kernel_dir = {
-        let res = app.path().resource_dir().map_err(|e| e.to_string())?;
-        // Tauri bundle 布局差异: resources 数组保留来源目录名 → Resources/resources/kernel;
-        // 旧布局/裸资源直放 Resources/kernel。两种都试。
-        let candidates = [res.join("kernel"), res.join("resources").join("kernel")];
-        let packaged = candidates
-            .iter()
-            .find(|p| p.join("merchant_report").exists())
-            .cloned();
-        packaged.unwrap_or_else(|| {
-            let mut dir = std::env::current_dir().unwrap_or_default();
-            let mut found = None;
-            for _ in 0..5 {
-                let cand = dir.join("kernel");
-                if cand.join("merchant_report").exists() {
-                    found = Some(cand);
-                    break;
-                }
-                if !dir.pop() {
-                    break;
-                }
-            }
-            found
-                .ok_or(
-                    "找不到 kernel 目录(dev 模式需从项目根启动; 打包模式下应在 App 资源内)"
-                        .to_string(),
-                )
-                .unwrap_or_default()
-        })
-    };
-    if !kernel_dir.join("merchant_report").exists() {
-        return Err(format!(
-            "kernel 目录无效: {} (打包资源缺失或 dev 目录不对)",
-            kernel_dir.display()
-        ));
-    }
+    let kernel_dir = resolve_kernel_dir(&app)?;
 
     let mut cmd = Command::new(&python);
     cmd.current_dir(&kernel_dir)
@@ -333,6 +333,44 @@ pub fn send_to_kernel(
 pub fn check_file(path: String) -> serde_json::Value {
     let p = std::path::PathBuf::from(&path);
     serde_json::json!({ "exists": p.is_file(), "size": p.metadata().map(|m| m.len()).unwrap_or(0) })
+}
+
+/// 探测《门店明细》里**有门店数据**的平台(顺序 淘宝→美团→管家→京东)。
+///
+/// 为什么放壳里做: xlsx 解析是 openpyxl 的活, 壳里不引 xlsx 库(不新增依赖);
+/// 复用 resolve_python / resolve_kernel_dir 与 run_task 完全一致的环境。
+/// 调用方(前端「一键跑所有平台」)在**失败/为空**时回退到旧的四平台队列, 所以这里
+/// 出错一律返回 Err(前端 catch → 回退), 不静默给空数组。
+#[tauri::command]
+pub fn read_store_platforms(app: AppHandle, store_details: String) -> Result<Vec<String>, String> {
+    if store_details.is_empty() {
+        return Err("未配置门店明细".to_string());
+    }
+    if !std::path::Path::new(&store_details).is_file() {
+        return Err(format!("门店明细文件不存在: {store_details}"));
+    }
+    let python = resolve_python(&app)?;
+    let kernel_dir = resolve_kernel_dir(&app)?;
+    let out = Command::new(&python)
+        .current_dir(&kernel_dir)
+        .arg("-m")
+        .arg("merchant_report.store_details")
+        .arg("--platforms")
+        .arg(&store_details)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .output()
+        .map_err(|e| format!("启动内核探测失败: {e}"))?;
+    if !out.status.success() {
+        // 读失败/表里没有任何平台分组 → 前端回退旧行为(不把空队列当成"没平台要跑")
+        return Err(format!(
+            "读取门店明细失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim().chars().take(200).collect::<String>()
+        ));
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.lines().last().unwrap_or("").trim();
+    serde_json::from_str::<Vec<String>>(line).map_err(|e| format!("探测输出不是 JSON 数组: {e} ({line})"))
 }
 
 /// 中止当前任务

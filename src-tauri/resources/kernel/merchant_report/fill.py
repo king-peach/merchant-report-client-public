@@ -781,6 +781,48 @@ def _find_row_by_date(ws, date, max_rows=60):
     return None
 
 
+def template_date_scan(template_path, date, main_sheets=None, max_rows=60):
+    """扫模板「门店 Sheet」的 A 列, 看 date 是否已经存在 → (可扫描门店表数, 含该日期的表数)。
+
+    需求 B(2026-10-12 用户口径): 跑流程前先确认模板里有没有这次要填的日期; 一张都没有 →
+    停下问用户(继续=填表时自动新建该行; 结束=干净中止, 不打开浏览器/不下载)。
+    本函数只负责"看", 决策在 orchestrator._template_date_gate。
+
+    门店表口径与 pick_base_sheet / _looks_like_store_map 一致: 排除前 2 张主表、
+    defaults.main_sheets、以及外观是「门店名映射表」的 sheet —— 否则映射表里恰好存在的日期
+    会让我们误判"模板里有这一天", 白白跳过一次该有的确认。
+    日期解析复用 _find_row_by_date(EPOCH 序列号 / datetime / 字符串 三吃)。
+    读不了模板 → (0, 0)(调用方跳过检查, 不打扰用户)。
+    """
+    try:
+        wb = openpyxl.load_workbook(template_path)
+    except Exception:
+        return 0, 0
+    try:
+        names = list(wb.sheetnames)
+        mains = {str(m) for m in (main_sheets or [])} | {SHEET}
+        skip = set(names[:2])                 # 前 2 张 = 主表(用户口径: 汇总落在第 3 个起)
+        n_sheets = n_hit = 0
+        for sn in names:
+            if sn in skip or sn in mains:
+                continue
+            try:
+                ws = wb[sn]
+                if _looks_like_store_map(ws):  # 映射表不是门店数据表, 不参与日期判断
+                    continue
+                n_sheets += 1
+                if _find_row_by_date(ws, date, max_rows=max_rows):
+                    n_hit += 1
+            except Exception:
+                continue
+        return n_sheets, n_hit
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
 def _reread_verify(path, writes):
     """回读校验: writes = [(sheet_name, row, write_set, formula_cols), ...] → {sheet: [坏列]}。
 

@@ -75,11 +75,144 @@ def _merge_maps(smap, extra):
     return {**(smap or {}), **(extra or {})}
 
 
-def _plan_store_sheets(sink, store, names, cfg, label="门店"):
+def _strict_maps(store, platform):
+    """需求 A2 严格模式的门店明细映射 → (by_name, by_id); 不满足严格模式 → (None, None)。
+
+    与 _detail_maps 的区别: 那个读不到就返回 {}(旧行为: 照旧按名称/关键词猜); 这个刻意用
+    None 区分"没配置"和"配了但读不出" —— 各支路据此决定是否进入**门店明细严格模式**。
+    严格模式条件(缺一不可): ① 配置了门店明细 ② 表能读 ③ **该平台在明细里有门店数据**。
+    ③ 是关键: 真实样例表只有 淘宝/美团/管家(没有京东) → 跑京东时保持旧行为, 不因为
+    "明细里没这个平台"就把京东全部门店当成"不在门店明细中"而跳过。
+    """
+    p = str(store.get("store_details") or "").strip()
+    if not p or not platform:
+        return None, None
+    try:
+        from . import store_details as _sd
+        d = (_sd.load_store_details(p) or {}).get(platform) or {}
+    except Exception:
+        return None, None
+    by_name, by_id = d.get("by_name") or {}, d.get("by_id") or {}
+    if not by_name and not by_id:
+        return None, None
+    return by_name, by_id
+
+
+def _strict_on(store, platform):
+    """该平台本次是否走门店明细严格模式(见 _strict_maps)。"""
+    return _strict_maps(store, platform)[0] is not None
+
+
+def _store_ids_from_rows(rows_by_date, dates, name_key="门店名称", id_key="门店编号"):
+    """逐店报表行 → {后台门店名: 门店编号} —— 门店明细的**编号锁定**要靠它。
+
+    各平台列名不同(淘宝=门店编号/美团=门店id或报表 B/C 列), 由调用方传键名; 取不到编号的
+    平台(京东)就不传 → 名称匹配兜底(用户口径 A3)。
+    """
+    out = {}
+    for d in dates:
+        rows = rows_by_date.get(d) or []
+        rows = rows if isinstance(rows, list) else [rows]
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            nm = str(r.get(name_key) or "").strip()
+            vid = str(r.get(id_key) or "").strip().split(".")[0]
+            if nm and vid:
+                out.setdefault(nm, vid)
+    return out
+
+
+def _details_scope(sink, store, platform, names, ids_by_name=None, label="门店"):
+    """需求 A2 严格模式: 把「后台门店名集合」按《门店明细》裁剪。
+
+    返回 dict(strict, names, by_name, by_id, skipped):
+      · strict=False(未配置明细/读不出/该平台明细里没数据) → names 原样, 各支路行为与旧版一致;
+      · strict=True → 只保留能经明细映射到的后台门店(编号优先、名称兜底, 与 plan_matches 同纪律),
+        其余**不写入也不报错**, 逐条日志"不在门店明细中 → 跳过"。
+    单独成函数是为了让 A2 的三条规则(范围/不建表/管家过滤)共用同一套判定, 也好单测。
+    """
+    from . import sheet_match
+    by_name, by_id = _strict_maps(store, platform)
+    if by_name is None:
+        return {"strict": False, "names": sorted(names), "by_name": {}, "by_id": {}, "skipped": []}
+    keep, skipped = [], []
+    for nm in sorted(names):
+        sid = str((ids_by_name or {}).get(nm) or "").strip().split(".")[0]
+        if by_id and sid and sid in by_id:
+            keep.append(nm)
+            continue
+        if sheet_match.lookup_store_map(by_name, nm):      # 双向包含, 与映射表同口径
+            keep.append(nm)
+            continue
+        skipped.append(nm)
+    if skipped:
+        for nm in skipped:
+            sink.log(f"  ⏭ {label}「{nm}」不在门店明细中 → 跳过（不写入也不报错）", level="warn")
+        sink.log(f"🧾 门店明细严格模式: 保留 {len(keep)} 家, 跳过不在明细中的 {len(skipped)} 家", level="warn")
+    return {"strict": True, "names": keep, "by_name": by_name, "by_id": by_id, "skipped": skipped}
+
+
+def _create_missing_for(store, platform):
+    """严格模式下**不自动新建 Sheet**(门店明细是权威: 明细里的店模板里没有对应 Sheet →
+    跳过 + 日志提示补模板/改明细; 而不是复刻样板表建一张新 Sheet)。"""
+    return not _strict_on(store, platform)
+
+
+def _apply_strict_plan(sink, plan, sc, label="门店"):
+    """严格模式: 把 plan 里"不在门店明细中"的后台门店从 matched/unmatched 移出。
+
+    为什么还要一层: 各支路的门店名单来源不同(管家=适配器已按明细过滤; 淘宝/京东=报表里的
+    后台门店名), 且 plan_matches 还会用**模板里的门店名映射表**兜底 —— 那张表可能混入门店
+    明细之外的后台名。这里统一兜底, 保证"只写门店明细里的店"(用户口径 A2-1)。
+    """
+    if not sc or not sc.get("strict") or not plan:
+        return []
+    allowed = set(sc.get("names") or [])
+    dropped = []
+    for key in ("matched", "unmatched"):
+        kept = []
+        for tup in plan.get(key) or []:
+            if tup and tup[0] in allowed:
+                kept.append(tup)
+            else:
+                dropped.append(tup[0] if tup else "")
+        plan[key] = kept
+    for nm in dropped:
+        sink.log(f"  ⏭ {label}「{nm}」不在门店明细中 → 跳过（不写入也不报错）", level="warn")
+    if dropped:
+        sink.log(f"🧾 门店明细严格模式: 从写入计划中再剔除 {len(dropped)} 家不在明细中的门店", level="warn")
+    plan.setdefault("strict_skipped", [])
+    plan["strict_skipped"].extend(dropped)
+    plan["strict"] = True
+    return dropped
+
+
+def _plan_scope(plan):
+    """从 plan 还原一个最小 sc(给 summary 用): 各支路在计划阶段已把跳过项记进 strict_skipped。"""
+    return {"strict": bool((plan or {}).get("strict")), "skipped": []}
+
+
+def _strict_summary(store_plan, sc, extra_names=()):
+    """严格模式跳过的门店 → summary 文案(用户口径 A2-1: "summary 体现数量")。无跳过 → None。"""
+    if not sc or not sc.get("strict"):
+        return None
+    names = list((store_plan or {}).get("strict_skipped") or [])
+    names += [n for n in (sc.get("skipped") or []) if n not in names]
+    names += [n for n in (extra_names or []) if n not in names]
+    if not names:
+        return None
+    return (f"{len(names)} 家不在门店明细中(已跳过): " + "、".join(names[:6])
+            + ("…" if len(names) > 6 else ""))
+
+
+def _plan_store_sheets(sink, store, names, cfg, label="门店", ids_by_name=None):
     """后台门店名 → 模板 Sheet 计划(含"匹配不到就新建 Sheet")。
 
     一店一 Sheet 的公共实现, 供各平台支路复用(淘宝/京东...), 别再抄一遍。
     返回 plan 或 None; plan["matched"] = [(后台门店名, Sheet 名, 原因), ...]。
+    未配置门店明细 → 行为与旧版完全一致; 配了(且该平台明细里有数据) → 门店明细**严格模式**:
+    只保留能映射到的后台门店, 不再自动新建 Sheet(见 _details_scope / _create_missing_for)。
     """
     if not names:
         return None
@@ -87,6 +220,11 @@ def _plan_store_sheets(sink, store, names, cfg, label="门店"):
         import openpyxl as _oxl
 
         from . import sheet_match
+        _platform = store.get("platform") or ""
+        _sc = _details_scope(sink, store, _platform, names, ids_by_name, label=label)
+        if not _sc["names"]:
+            sink.log(f"⚠️ 门店明细严格模式下没有可比对的{label}（明细里有数据的门店不在本次报表里）", level="warn")
+            return None
         _wb = _oxl.load_workbook(store["template"], read_only=True)
         try:
             _sheets = list(_wb.sheetnames)
@@ -95,17 +233,23 @@ def _plan_store_sheets(sink, store, names, cfg, label="门店"):
         _kw = ([store["keyword"]] if store.get("keyword") else []) + list(store.get("keywords") or [])
         _main = (cfg.get("defaults") or {}).get("main_sheets")
         # 「门店明细」(设置上传, 编号/名称锁定) ∪ 模板里的「门店名映射表」(后端门店名逐字) → 比关键词猜可靠
-        _smap = sheet_match.load_store_map(store["template"], store.get("platform") or "")
-        _extra, _idmap = _detail_maps(store, store.get("platform") or "")
+        _smap = sheet_match.load_store_map(store["template"], _platform)
+        _extra, _idmap = _detail_maps(store, _platform)
         if _extra or _idmap:
             sink.log(f"🧾 门店明细已加载: {len(_extra)} 条名称 / {len(_idmap)} 条编号"
                      f"（{'编号优先锁定' if _idmap else '名称锁定'}）")
         _merged = _merge_maps(_smap, _extra)
-        plan = (sheet_match.plan_matches(_sheets, sorted(names), _kw, main=_main, store_map=_merged)
-                if _main else sheet_match.plan_matches(_sheets, sorted(names), _kw, store_map=_merged))
+        plan = (sheet_match.plan_matches(_sheets, _sc["names"], _kw, main=_main, store_map=_merged,
+                                         id_map=_idmap, store_ids=ids_by_name or {})
+                if _main else sheet_match.plan_matches(_sheets, _sc["names"], _kw, store_map=_merged,
+                                                       id_map=_idmap, store_ids=ids_by_name or {}))
+        # 严格模式的跳过项记进 plan → summary 里能体现数量(用户口径 A2-1)
+        plan["strict"] = _sc["strict"]
+        plan["strict_skipped"] = list(_sc["skipped"])
         for _nm, _sn, _why in _autocreate_store_sheets(sink, store["template"], plan,
                                                        _sheet_rules(cfg),
-                                                       enabled=_autocreate_enabled(cfg)):
+                                                       enabled=_autocreate_enabled(cfg) and not _sc["strict"],
+                                                       detail_map=_extra, strict=_sc["strict"]):
             plan["matched"].append((_nm, _sn, _why))
         sink.log(f"🗂 模板{label}工作表: {'、'.join(plan['candidates']) or '(无)'}")
         for _nm, _sn, _why in plan["matched"]:
@@ -123,6 +267,47 @@ def _plan_store_sheets(sink, store, names, cfg, label="门店"):
 def _autocreate_enabled(cfg):
     """`defaults.auto_create_store_sheet` 关掉时, 匹配不到的门店 Sheet 不新建(回到只写已有 Sheet)。"""
     return (cfg.get("defaults") or {}).get("auto_create_store_sheet", True) is not False
+
+
+def _template_date_gate(sink, human, template, date, cfg):
+    """需求 B: 模板里一张门店表都没有 {date} → 停下问用户「继续跑流程 / 结束流程」。
+
+    位置: run_task 早期(模板可写性预检之后、登录/浏览器/下载之前) —— 不浪费采集时间。
+    返回 True=继续(含"部分存在不触发"/"无门店表跳过"/"无人值守兜底继续"), False=用户选结束。
+
+    为什么只在**一张都没有**时才问: 部分门店表有、部分没有是正常的(平台日报次日才出,
+    各店 Sheet 未必同步建行) —— 那种情况填表时 resolve_row 会自然补行, 不该打扰用户。
+    用户选「继续」也不需要另写新建逻辑: 填表阶段 resolve_row 本来就会建该日期的行。
+    """
+    try:
+        from .fill import template_date_scan
+    except Exception:
+        return True
+    try:
+        n_sheets, n_hit = template_date_scan(
+            template, date, main_sheets=(cfg.get("defaults") or {}).get("main_sheets"))
+    except Exception as e:
+        sink.log(f"⚠️ 模板日期检查失败(跳过, 不影响流程): {str(e)[:80]}", level="warn")
+        return True
+    if n_sheets == 0:
+        sink.log(f"📅 模板日期检查: {date} —— 模板里没有可扫描的门店 Sheet(全新模板), 跳过检查")
+        return True
+    if n_hit:
+        sink.log(f"📅 模板日期检查: {date} 存在于 {n_hit}/{n_sheets} 张门店表")
+        return True
+    sink.log(f"📅 模板日期检查: {date} 不存在于任何门店表（{n_sheets} 张）→ 已请求用户确认", level="warn")
+    msg = (f"模板里没有 {date}。继续跑流程 = 填表时会自动新建这个日期的行并填写；"
+           f"结束流程 = 本次不打开浏览器、不下载，直接停下。")
+    sink.need_human("confirm", msg, choices=["继续跑流程", "结束流程"], timeout_s=600)
+    resp = human.wait({"type": "need_human", "action": "confirm"}) or {}
+    choice = str(resp.get("choice") or "").strip()
+    if not choice:
+        # 无人值守兜底: 没有交互通道(CLI/超时) → 保持自动化旧行为(继续), 只 warn
+        sink.log("⚠️ 模板日期确认未收到响应（无人值守/超时）→ 按「继续跑流程」处理", level="warn")
+        return True
+    if "结束" in choice:
+        return False
+    return True
 
 
 def _start_weather_prefetch(store, dates, holder):
@@ -197,7 +382,7 @@ def _single_store_sheet(store, cfg, template):
 
 
 def _autocreate_store_sheets(sink, template, plan, rules, base_sheet=None, limit=60,
-                             dry_run=True, enabled=True):
+                             dry_run=True, enabled=True, detail_map=None, strict=False):
     """匹配不到 Sheet 的门店 → 按**地名关键字**决定要建哪张 Sheet → 并入 matched。
 
     用户口径: 没有对应 Sheet 就建一个(复刻前面的表头), 再写数据; Sheet 名只取地名关键字
@@ -206,12 +391,23 @@ def _autocreate_store_sheets(sink, template, plan, rules, base_sheet=None, limit
     `dry_run=True`(默认) **只决定 Sheet 名, 不在磁盘上建表** —— 真正建表交给
     `fill.fill_many(..., create_missing=True)` 在批量写入时一次做完。原因: 逐店
     ensure_sheet() 是「每店一次读+存」(京东 22 店实测白多花约 150s)。
+
+    需求 A2: `strict=True`(门店明细严格模式) 或 enabled=False 时**一律不新建** —— 明细里的
+    门店若模板里没有对应 Sheet, 保持"未写入"并给出可操作日志(补模板 Sheet 或改门店明细),
+    而不是复刻样板表建新表。detail_map 只用于日志里带上明细指向的 Sheet 名, 便于用户核对。
     """
     from . import sheet_match
     made = []
     used = {sheet_match.norm(s) for s in (plan.get("candidates") or [])}
     left = []
-    if not enabled:          # 关掉自动建表 → 匹配不到的门店保持"未写入"
+    if not enabled or strict:   # 关掉自动建表 / 门店明细严格模式 → 匹配不到的门店保持"未写入"
+        if strict:
+            for nm, why in (plan.get("unmatched") or []):
+                _want = (sheet_match.lookup_store_map(detail_map, nm) if detail_map else None)
+                sink.log(f"  ⏭ 门店明细严格模式: 「{nm}」模板里没有对应 Sheet"
+                         + (f"（门店明细指向「{_want}」）" if _want else "")
+                         + f" → 跳过，不新建 Sheet（请补模板 Sheet 或修改门店明细）｜原因: {why}",
+                         level="warn")
         return made
     for nm, why in list(plan.get("unmatched") or []):
         if len(made) >= limit:
@@ -241,6 +437,20 @@ def _autocreate_store_sheets(sink, template, plan, rules, base_sheet=None, limit
     return made
 
 
+def _browser_dead_exhausted_note(relaunched):
+    """浏览器被反复关闭、自愈重开仍失败时的收尾文案(不许把真实原因盖成"平台没生成报表")。
+
+    2026-10-12 用户真机: 自动化浏览器被连续关闭 3 次(疑似双开旧实例互杀/被手动关闭),
+    自动重开 2 次仍失败 → 自愈循环耗尽。旧的收尾报 E_NO_REPORT, 把用户引去怀疑平台/日期。
+    """
+    times = f"（已自动重开 {relaunched} 次仍失败）" if relaunched else ""
+    return (f"自动化浏览器被连续关闭{times}。常见原因与处理: "
+            f"①请不要手动关闭它弹出的浏览器窗口；"
+            f"②确认电脑上没有另一个本客户端在同时运行（含最小化到托盘的旧窗口，全部退出后再跑）；"
+            f"③安全软件（360/电脑管家等）可能拦截自动化浏览器，放行后重试。"
+            f"处理好后点「生成日报」重跑即可，登录状态不受影响。")
+
+
 def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
              skip_browser=False, llm_client=None):
     from .events import EventSink, HumanBridge
@@ -259,6 +469,16 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     ddir.mkdir(parents=True, exist_ok=True)
     scope = store.get("scope", "all")
     sink.task_start(store["name"], f"{date_from}~{date}", [store.get("platform", "taobao")])
+
+    # 需求 B(2026-10-12): 模板日期预检 + 确认门 —— 必须在这里(登录/浏览器/下载之前),
+    # 否则等采集跑完才发现"模板里没这个日期", 用户的时间全白花了。
+    # 单店/全店、各平台一视同仁; 用区间终点 date 做检查(逐日填表最终要落的就是它)。
+    if not _template_date_gate(sink, human, store.get("template"), date, cfg):
+        sink.result(False, error_code="E_DATE_NOT_IN_TEMPLATE",
+                    message=(f"模板里没有 {date}。已结束本次流程——你可以修复模板日期、"
+                             f"或更换模板/日期后，再手动点「生成日报」重跑。"),
+                    retryable=False)
+        return None
 
     summary = {"商家": store["name"], "区间": f"{date_from}~{date}", "范围": "全部门店" if scope == "all" else f"门店#{store.get('id') or store.get('keyword')}"}
     outputs = []
@@ -402,9 +622,19 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 if platform in ("meituan", "jd", "meituan_gj"):
                     extra = {}
                     if platform == "meituan_gj":
-                        # 多门店: 只抓模板里有对应 Sheet 的门店(模板是权威, 按关键词匹配)。
-                        # 但若开了「自动建 Sheet」(默认开) → 新店必须被抓到才能建表, 故不过滤。
-                        if (cfg.get("defaults") or {}).get("auto_create_store_sheet") is False:
+                        # 门店明细严格模式(需求 A2-3, 2026-10-12): **抓取循环只进门店明细里的店**,
+                        # 其余连店都不进 —— 逐店切店+读数是管家最耗时的部分, 这是本需求省时间的关键。
+                        # 过滤源 = 门店明细(名称映射的键 = 后端名; 编号映射的键 = 机构编码 12 位,
+                        # 与门店选择页卡片读到的 sid 同口径) → allow_name + allow_id。
+                        _by_name, _by_id = _strict_maps(store, "meituan_gj")
+                        if _by_name is not None:
+                            extra["allow_name"] = list(_by_name.keys())
+                            extra["allow_id"] = list(_by_id.keys())
+                            sink.log(f"🧾 门店明细严格模式（管家）: 只抓门店明细里的门店 → "
+                                     f"{len(extra['allow_name'])} 条名称 / {len(extra['allow_id'])} 条编号")
+                        # 旧口径: 关掉「自动建 Sheet」时按**模板 sheet 清单**过滤(未配置门店明细时的兜底),
+                        # 但若开了自动建表 → 新店必须被抓到才能建表, 故不过滤。
+                        elif (cfg.get("defaults") or {}).get("auto_create_store_sheet") is False:
                             try:
                                 from . import sheet_match
                                 import openpyxl as _o
@@ -596,6 +826,15 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 return None
             if not reports:
                 _stop_browser()
+                # 2026-10-12 真机: 浏览器被连关 3 次走到这里时, 原本报笼统的 E_NO_REPORT「平台未生成」
+                # → 真实原因(浏览器被关/配置目录被占)被整个盖掉, 用户被引去怀疑平台或日期。
+                # 现在: 最后一轮失败若是可自动恢复类(浏览器被关/配置目录被占) → 报真实原因 + 操作指引。
+                _lf = last_fail.get("download") or {}
+                _lc = root_cause(_lf.get("error") or "", _lf.get("exc_type") or "")
+                if _lc.get("auto_recover"):
+                    sink.result(False, error_code=_lc.get("code") or "E_BROWSER_DEAD",
+                                message=_browser_dead_exhausted_note(relaunched), retryable=True)
+                    return None
                 sink.result(False, error_code="E_NO_REPORT",
                             message=(f"平台未生成 {date_from}~{date} 的报表。可能原因: ①报表生成中(稍后重试) "
                                      f"②区间内日期过早(平台只保留近6个月) ③登录态异常。详见上方步骤错误。"),
@@ -714,6 +953,10 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         store_plan = None
         circle_by_sheet = {}
         promo_by_sheet = {}      # {Sheet: {日期: {recharge, consume, balance}}} 推广账户流水(CE/CJ)
+        # 需求 A2: 严格模式标志在 try 之外初始化 —— 下面的建表/兜底剔除分支要用到它, 而
+        # "_names 为空 / plan 异常" 等路径不会走到 try 内部赋值(否则 UnboundLocalError)。
+        _sc = {"strict": False, "names": [], "by_name": {}, "by_id": {}, "skipped": []}
+        _extra = {}
         if scope != "store":
             _names = set()
             for d in dates:
@@ -747,10 +990,13 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                     if _extra or _idmap:
                         sink.log(f"🧾 门店明细已加载: {len(_extra)} 条名称 / {len(_idmap)} 条编号"
                                  f"（本次报表识别到 {len(_ids)} 个编号）")
+                    # 门店明细严格模式(A2-1): 报表里有、但不在门店明细中的后台门店 → 不写入不报错;
+                    # 明细里有、报表里也有但模板没有对应 Sheet → 由下面的"不建表"分支给明确日志。
+                    _sc = _details_scope(sink, store, "meituan", _names, _ids, label="门店")
                     _merged = _merge_maps(_smap, _extra)
-                    store_plan = (sheet_match.plan_matches(_sheets, sorted(_names), _kw, main=_main,
+                    store_plan = (sheet_match.plan_matches(_sheets, _sc["names"], _kw, main=_main,
                                                           store_map=_merged, id_map=_idmap, store_ids=_ids)
-                                  if _main else sheet_match.plan_matches(_sheets, sorted(_names), _kw,
+                                  if _main else sheet_match.plan_matches(_sheets, _sc["names"], _kw,
                                                                         store_map=_merged, id_map=_idmap,
                                                                         store_ids=_ids))
                     sink.log(f"🗂 模板门店工作表: {'、'.join(store_plan['candidates']) or '(无)'}")
@@ -772,10 +1018,13 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                     sink.log(f"⚠️ 门店 Sheet 计划失败(仅影响一店一Sheet): {str(e)[:80]}", level="warn")
                     store_plan = None
             if store_plan and store_plan.get("unmatched"):
-                for _nm, _sn, _why in _autocreate_store_sheets(sink, store["template"], store_plan,
-                                                               _sheet_rules(cfg)):
+                for _nm, _sn, _why in _autocreate_store_sheets(
+                        sink, store["template"], store_plan, _sheet_rules(cfg),
+                        enabled=_autocreate_enabled(cfg) and not _sc["strict"],
+                        detail_map=_extra, strict=_sc["strict"]):
                     store_plan["matched"].append((_nm, _sn, _why))
                     sink.log(f"  🔗 门店「{_nm}」→ Sheet「{_sn}」（{_why}）")
+            _apply_strict_plan(sink, store_plan, _sc, label="门店")
             # 商圈Top: 仅**单门店视角**可得(wmPoiId=门店编号)。用户口径: 做单门店数据时才采集,
             # 全部门店模式不采集(Top 列留空)。抓不到就留空, 绝不臆造。
             circle_by_sheet = {}
@@ -907,7 +1156,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         _main_names = {SHEET} | {str(m) for m in ((cfg.get("defaults") or {}).get("main_sheets") or [])}
         try:
             _results = fill_many(store["template"], fill_jobs, mode=mode,
-                                 main_sheets=(cfg.get("defaults") or {}).get("main_sheets"))
+                                 main_sheets=(cfg.get("defaults") or {}).get("main_sheets"),
+                                 create_missing=_create_missing_for(store, "meituan"))
         except Exception as e:
             sink.step_fail("fill", "填入模板", str(e)[:200], "E_FILL_FAIL")
             sink.result(False, error_code="E_FILL_FAIL",
@@ -953,6 +1203,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                                                 "、".join(n for n, _ in store_plan["unmatched"][:6]))
             if store_plan["idle"]:
                 summary["模板里未写入数据的Sheet"] = "、".join(store_plan["idle"][:8])
+        _skip_txt = _strict_summary(store_plan, _plan_scope(store_plan))
+        if _skip_txt:
+            summary["不在门店明细中(已跳过)"] = _skip_txt
         if discovered:
             summary["discovered_stores"] = discovered
         outputs.append(store["template"])
@@ -1030,7 +1283,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         store_plan = None
         if scope != "store":
             store_plan = _plan_store_sheets(sink, store,
-                                            _store_names_from_rows(jd_rows_store, dates), cfg)
+                                            _store_names_from_rows(jd_rows_store, dates), cfg,
+                                            ids_by_name=_store_ids_from_rows(jd_rows_store, dates,
+                                                                             id_key="门店id"))
         sink.step_start("fill", "填入模板", f"区间 {dates[0]}~{dates[-1]} 共{len(dates)}天 (京东 HI~HK)")
         # 先算 write_set, 最后批量写入一次(逐日逐店直接写 = 每店一轮读+写+存+回读)
         # 主数据表 = 默认解析(第 3 个 sheet; 可用 config defaults.main_sheet 覆盖),
@@ -1064,7 +1319,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         _main_names = {SHEET} | {str(m) for m in ((cfg.get("defaults") or {}).get("main_sheets") or [])}
         try:
             _results = fill_many(store["template"], fill_jobs, mode=mode,
-                                 main_sheets=(cfg.get("defaults") or {}).get("main_sheets"))
+                                 main_sheets=(cfg.get("defaults") or {}).get("main_sheets"),
+                                 create_missing=_create_missing_for(store, "jd"))
         except Exception as e:
             sink.result(False, error_code="E_FILL_FAIL",
                         message=f"京东批量写入失败: {str(e)[:120]}", retryable=True)
@@ -1097,6 +1353,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         elif store_plan:
             summary["一店一Sheet"] = (f"未写入（匹配到 {len(store_plan.get('matched') or [])} 家，"
                                       f"检查模板 Sheet 名）")
+        _skip_txt = _strict_summary(store_plan, _plan_scope(store_plan))
+        if _skip_txt:
+            summary["不在门店明细中(已跳过)"] = _skip_txt
         outputs.append(store["template"])
 
         # 5. LLM 解读(京东区数据少, 只喂实有字段)
@@ -1167,16 +1426,22 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             sink.log(f"🧾 门店明细已加载(管家): {len(_extra)} 条名称 / {len(_idmap)} 条编号"
                      f"（本次识别到 {len(_ids)} 个门店编号）")
         _merged = _merge_maps(_smap, _extra)
+        # 门店明细严格模式(A2): stores 已被适配器按明细过滤过, 这里只决定"要不要自动建表"
+        # 与兜底剔除(适配器未过滤的旧路径/映射表混入的明细外门店)。
+        _sc = _details_scope(sink, store, "meituan_gj", set(stores.keys()), _ids, label="后台门店")
         plan = (sheet_match.plan_matches(all_sheets, list(stores.keys()), kw_cfg, main=main_sheets,
                                          store_map=_merged, id_map=_idmap, store_ids=_ids)
                 if main_sheets else sheet_match.plan_matches(all_sheets, list(stores.keys()), kw_cfg,
                                                              store_map=_merged, id_map=_idmap,
                                                              store_ids=_ids))
         # 匹配不到的店 → 按地名关键字决定 Sheet 名(真建表交给 fill_many 一次完成, 省掉逐店读写)
+        # 严格模式下不建(门店明细里没有对应模板 Sheet → 跳过并提示补模板/改明细)。
         for _nm, _sn, _why in _autocreate_store_sheets(sink, store["template"], plan,
                                                        _sheet_rules(cfg),
-                                                       enabled=_autocreate_enabled(cfg)):
+                                                       enabled=_autocreate_enabled(cfg) and not _sc["strict"],
+                                                       detail_map=_extra, strict=_sc["strict"]):
             plan["matched"].append((_nm, _sn, _why))
+        _apply_strict_plan(sink, plan, _sc, label="后台门店")
         sink.log(f"🗂 模板门店工作表: {'、'.join(plan['candidates']) or '(无)'}")
         for name, sn, why in plan["matched"]:
             sink.log(f"  🔗 门店「{name}」→ Sheet「{sn}」（{why}）")
@@ -1214,7 +1479,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 fill_errs.append(f"{name}: {str(e)[:80]}")
         try:
             _results = fill_many(store["template"], fill_jobs, mode=mode,
-                                 main_sheets=(cfg.get("defaults") or {}).get("main_sheets"))
+                                 main_sheets=(cfg.get("defaults") or {}).get("main_sheets"),
+                                 create_missing=_create_missing_for(store, "meituan_gj"))
         except Exception as e:
             sink.result(False, error_code="E_FILL_FAIL",
                         message=f"美团管家批量写入失败: {str(e)[:120]}", retryable=True)
@@ -1248,6 +1514,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                                           ("…" if len(gj_failed) > 8 else ""))
         if fill_errs:
             summary["部分失败"] = "; ".join(fill_errs[:3])
+        _skip_txt = _strict_summary(plan, _sc)
+        if _skip_txt:
+            summary["不在门店明细中(已跳过)"] = _skip_txt
         outputs.append(store["template"])
         sink.result(ok=True, outputs=outputs, summary=summary)
         return {"outputs": outputs, "summary": summary, "dates": dates}
@@ -1372,7 +1641,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     store_plan = None
     per_store_filled = []
     if scope != "store":
-        store_plan = _plan_store_sheets(sink, store, _store_names_from_rows(all_rows_store, dates), cfg)
+        store_plan = _plan_store_sheets(sink, store, _store_names_from_rows(all_rows_store, dates), cfg,
+                                        ids_by_name=_store_ids_from_rows(all_rows_store, dates))
     filled_rows = []
     fill_errs = []
     sink.step_start("fill", "填入模板", f"区间 {dates[0]}~{dates[-1]} 共{len(dates)}天")
@@ -1425,7 +1695,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     _main_names = {SHEET} | {str(m) for m in ((cfg.get("defaults") or {}).get("main_sheets") or [])}
     try:
         _results = fill_many(store["template"], fill_jobs, mode=mode,
-                             main_sheets=(cfg.get("defaults") or {}).get("main_sheets"))
+                             main_sheets=(cfg.get("defaults") or {}).get("main_sheets"),
+                             create_missing=_create_missing_for(store, platform))
     except Exception as e:
         sink.step_fail("fill", "填入模板", str(e)[:200], "E_FILL_FAIL")
         sink.result(False, error_code="E_FILL_FAIL", message=f"批量写入失败: {str(e)[:120]}", retryable=True)
@@ -1463,6 +1734,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                                             "、".join(n for n, _ in store_plan["unmatched"][:6]))
         if store_plan["idle"]:
             summary["模板里未写入数据的Sheet"] = "、".join(store_plan["idle"][:8])
+    _skip_txt = _strict_summary(store_plan, _plan_scope(store_plan))
+    if _skip_txt:
+        summary["不在门店明细中(已跳过)"] = _skip_txt
     if discovered:
         summary["discovered_stores"] = discovered
     outputs.append(store["template"])

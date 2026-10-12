@@ -28,6 +28,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             py_runner::run_task,
+            py_runner::read_store_platforms,
             py_runner::send_to_kernel,
             py_runner::abort_task,
             py_runner::check_file

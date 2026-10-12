@@ -141,7 +141,8 @@ def _gj_date_ms(df):
 class MeituanGjAdapter:
     platform = "meituan_gj"
 
-    def __init__(self, ctx, sink: EventSink, human_bridge, store_id="", keyword="", want=None):
+    def __init__(self, ctx, sink: EventSink, human_bridge, store_id="", keyword="", want=None,
+                 allow_name=None, allow_id=None):
         self.ctx = ctx
         self.sink = sink
         self.human = human_bridge
@@ -150,7 +151,30 @@ class MeituanGjAdapter:
         self.keyword = keyword or ""
         # want: 模板里的门店工作表名(地名关键词); 只有对得上的门店才进店抓取, 省时间
         self.want = [w for w in (want or []) if w]
+        # 需求 A2-3(2026-10-12): 门店明细严格模式的允许集合 —— 只进"门店明细里的门店", 其余连店都不进。
+        # allow_name=明细的名称映射键(后端门店名); allow_id=明细的编号映射键(机构编码).
+        # 未配置门店明细 → 两者为空 → 与旧行为**完全一致**(不按门店明细过滤)。
+        self.allow_name = [str(n) for n in (allow_name or []) if str(n).strip()]
+        self.allow_id = [str(i).strip() for i in (allow_id or []) if str(i).strip()]
         self.skipped_by_sheet = []
+
+    def _allowed_store(self, card, name_norm):
+        """门店选择页卡片是否在《门店明细》允许集合里 —— 编号优先、名称兜底。
+
+        编号通道: 卡片上的 sid = 机构编码(12 位), 与《门店明细》编号列同口径 → sid 命中即保留。
+        名称通道: 后端名(_gj_norm_name 归一化)与明细名称映射的键(_tidy 规范化后)双向包含。
+        为什么不复用 sheet_match.match_sheet: 那个是**按 Sheet 名**匹配; 这里过滤的是
+        "门店明细里的门店", 两者口径不同(明细可能指向一张模板里还没有的 Sheet)。
+        编号缺失(如京东式无编号组)时名称兜底即可(用户口径 A3)。
+        """
+        sid = str(card.get("sid") or "").strip()
+        if sid and self.allow_id and sid in self.allow_id:
+            return True
+        n_now, n_card = _gj_norm_name(card.get("name")), name_norm
+        for k in n_card:
+            if k and (k in n_now or n_now in k):
+                return True
+        return False
 
     # ---------- 登录 ----------
     def _find_login_frame(self, page, max_wait_s=75):
@@ -1054,9 +1078,24 @@ class MeituanGjAdapter:
                 stores = [s for s in stores if self.keyword in s["name"]]
                 if not stores:
                     raise RuntimeError(f"美团管家门店选择页无匹配「{self.keyword}」")
-            # 只抓模板里有对应 Sheet 的门店(模板是权威): 其余连进店都不进
+            # 只抓"该抓"的门店: 门店明细严格模式(allow)优先, 否则回退旧口径(模板 sheet 清单 want);
+            # 都没配 → 不按门店过滤(与旧行为完全一致)。其余门店**连进店都不进**(省时间的关键)。
             self.skipped_by_sheet = []
-            if self.want:
+            if self.allow_name or self.allow_id:
+                from .. import sheet_match as _sm
+                _name_norm = {_sm._tidy(n) for n in self.allow_name}
+                keep = [s for s in stores if self._allowed_store(s, _name_norm)]
+                if not keep:
+                    raise RuntimeError(
+                        f"门店选择页 {len(stores)} 家没有一家在《门店明细》里（明细名称 {len(self.allow_name)} 条 / "
+                        f"编号 {len(self.allow_id)} 条）—— 请核对该平台的门店明细")
+                self.skipped_by_sheet = [s["name"] for s in stores if s not in keep]
+                stores = keep
+                if self.skipped_by_sheet:
+                    self.sink.log(f"⏭ 跳过 {len(self.skipped_by_sheet)} 家不在门店明细中的门店: "
+                                  + "、".join(self.skipped_by_sheet[:6])
+                                  + ("…" if len(self.skipped_by_sheet) > 6 else ""), level="warn")
+            elif self.want:
                 from .. import sheet_match
                 keep = [s for s in stores if sheet_match.match_sheet(self.want, s["name"])[0]]
                 if not keep:

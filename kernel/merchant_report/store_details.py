@@ -9,6 +9,9 @@
 产出: {platform: {"by_id": {编号: sheet}, "by_name": {规范化名: sheet}}}
   platform ∈ taobao / meituan / meituan_gj / jd —— 与 PLATFORM_COL_HINTS 同一套键。
 匹配纪律: 编号优先、名称兜底、对不上不猜(调用方留空+告警)。
+
+另: `platforms_in(path)` 只回答"表里**有门店数据**的平台有哪些"(字典的键),
+供壳/前端决定「一键跑所有平台」要跑哪几个(真实样例只有淘宝/美团/管家, 没有京东)。
 """
 import re
 
@@ -21,6 +24,9 @@ _GROUP_PLAT = (
     ("京东", "jd"),
     ("美团", "meituan"),
 )
+
+# 前端「一键跑所有平台」的固定相对顺序 —— 必须与壳/Python 两侧一致(见 __main__ 与 App.tsx)。
+PLATFORM_ORDER = ("taobao", "meituan", "meituan_gj", "jd")
 
 
 def _platform_of(group):
@@ -94,3 +100,39 @@ def load_store_details(path):
             wb.close()
         except Exception:
             pass
+
+
+def platforms_in(path, order=PLATFORM_ORDER):
+    """门店明细表里**有门店数据**的平台(按固定相对顺序 淘宝→美团→管家→京东 过滤)。
+
+    为什么要单独这个函数: 前端「一键跑所有平台」需要先知道该跑哪几个平台 —— 真实样例表里
+    只有 淘宝/美团/管家(没有京东), 但旧逻辑写死四个平台全要配模板才能开跑, 用户被迫为
+    一个根本没数据的平台去配模板。探测必须由内核做(壳里不解析 xlsx), 故提供
+    `python -m merchant_report.store_details --platforms <path>` 供壳调用。
+    读不了/空表/没配置 → 返回 [] (调用方回退旧行为)。
+    """
+    try:
+        keys = set((load_store_details(path) or {}).keys())
+    except Exception:
+        return []
+    return [p for p in order if p in keys]
+
+
+if __name__ == "__main__":
+    # 壳调用口径: 输出**一行 JSON 数组**(stdout), 读失败 → [] + 退出码非零(壳据此回退旧行为)。
+    import json
+    import sys
+
+    argv = sys.argv[1:]
+    path = ""
+    if "--platforms" in argv:
+        i = argv.index("--platforms")
+        path = argv[i + 1] if i + 1 < len(argv) else ""
+    if not path:
+        sys.stderr.write("用法: python -m merchant_report.store_details --platforms <门店明细.xlsx>\n")
+        print("[]")
+        sys.exit(2)
+    plats = platforms_in(path)
+    print(json.dumps(plats, ensure_ascii=False))
+    # 只认"表里真有平台分组且读得出映射"为成功; 读失败/空表 → 非零退出(壳回退旧行为)
+    sys.exit(0 if plats else 1)
