@@ -96,11 +96,53 @@ def test_format_diag_filter():
     print("✅ 取证格式: 只收 chrome/msedge 家族, 事件行照录")
 
 
+def test_parse_proc_table():
+    import json as J
+    rows = [{"ProcessId": 100, "ParentProcessId": 1, "CommandLine": r'C:\x\chrome.exe --user-data-dir="P"'},
+            {"ProcessId": 101, "ParentProcessId": 100, "CommandLine": r'C:\x\chrome.exe --type=renderer'}]
+    mk = lambda body: ("__TBL_OK__\n" + body).encode("utf-8")
+    # ① utf-8 正常
+    got = T._parse_proc_table(mk(J.dumps(rows, ensure_ascii=False)))
+    assert got == [(100, 1, rows[0]["CommandLine"]), (101, 100, rows[1]["CommandLine"])], got
+    # ② 单对象(只有一条时 ConvertTo-Json 不套数组)
+    one = T._parse_proc_table(mk(J.dumps(rows[0], ensure_ascii=False)))
+    assert one == [(100, 1, rows[0]["CommandLine"])], one
+    # ③ 中文路径 GBK 字节也要能解(中文 Windows 常见)
+    gbk_rows = [{"ProcessId": 7, "ParentProcessId": 1, "CommandLine": "C:\\360壁纸\\x.exe"}]
+    g = T._parse_proc_table(("__TBL_OK__\n" + J.dumps(gbk_rows, ensure_ascii=False)).encode("gbk"))
+    assert g == [(7, 1, "C:\\360壁纸\\x.exe")], g
+    # ④ 空结果(无匹配) → []；没有哨兵(静默失败) → None；坏 JSON → None
+    assert T._parse_proc_table(mk("")) == []
+    assert T._parse_proc_table(mk("null")) == []
+    assert T._parse_proc_table(b"") is None
+    assert T._parse_proc_table(b"some error text, no marker") is None
+    assert T._parse_proc_table(mk("not json {")) is None
+    # ⑤ utf-16-le(无 BOM) 也要认
+    u16 = ("__TBL_OK__\n" + J.dumps(rows, ensure_ascii=False)).encode("utf-16-le")
+    assert T._parse_proc_table(u16) == [(100, 1, rows[0]["CommandLine"]), (101, 100, rows[1]["CommandLine"])]
+    print("✅ 进程表解析: utf-8/gbk/utf-16 + 空/单条/静默失败/坏JSON 全对")
+
+
+def test_cleanup_note():
+    n = T._cleanup_note(-1, False, -1)
+    assert n and "兜底" in n[0] and "-1" not in n[0], n
+    n2 = T._cleanup_note(2, True, 0)
+    assert n2 and "2 个" in n2[0] and "-1" not in n2[0], n2
+    n3 = T._cleanup_note(2, False, 1)
+    assert n3 and "仍有 1 个" in n3[0], n3
+    n4 = T._cleanup_note(0, False, -1)
+    assert n4 and n4[1] == "warn" and "-1" not in n4[0], n4
+    assert T._cleanup_note(0, True, 0) is None
+    print("✅ 清理文案: 兜底/正常/残留/探测不可用 —— 不再出现 \"-1 个\"")
+
+
 def test_wiring_source():
     src_cl = inspect.getsource(T._cleanup_stale_browser)
     assert "_other_live_task_pids" in src_cl, "双开防护闸不许丢(CI 冒烟同查)"
     assert "wait_profile_free" in src_cl, "杀完必须等 profile 真正释放(本次修复点)"
     assert "select_profile_kill_pids" in src_cl, "要按'顶层+后代'序列杀"
+    assert "_cleanup_note" in src_cl, "收尾文案走纯函数(不许再打出 '-1 个')"
+    assert "time.sleep(3)" in src_cl, "探测不可用时固定等待兜底"
     from merchant_report import orchestrator as O
     src_rt = inspect.getsource(O.run_task)
     assert "wait_browser_ready" in src_rt, "重开必须校验'真的活着'"
@@ -115,8 +157,10 @@ def main():
     test_wait_browser_ready()
     test_forensics_file()
     test_format_diag_filter()
+    test_parse_proc_table()
+    test_cleanup_note()
     test_wiring_source()
-    print("\n✅ 浏览器恢复路径(Windows 竞态修复+取证)全绿")
+    print("\n✅ 浏览器恢复路径(Windows 竞态修复+取证+探测加固)全绿")
 
 
 if __name__ == "__main__":

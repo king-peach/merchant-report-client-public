@@ -92,24 +92,75 @@ def _other_live_task_pids():
         return None
 
 
-def _win_process_table():
-    """Windows 全量进程表 [(pid, ppid, cmdline)]; 非 Windows / 探测失败 → None。"""
-    if os.name != "nt":
-        return None
-    ps = ("Get-CimInstance Win32_Process | "
-          "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress")
+def _ps_text(raw):
+    """PowerShell stdout 字节 → 文本(多编码回退); 全失败 → ""。"""
+    for enc in ("utf-8-sig", "gbk", "utf-16-le"):
+        try:
+            t = raw.decode(enc) if isinstance(raw, (bytes, bytearray)) else str(raw)
+        except Exception:
+            continue
+        if "\x00" in t:      # utf-16 被当 utf-8 读会满屏 NUL → 换下一种编码
+            continue
+        return t.strip()
+    return ""
+
+
+def _build_proc_table_ps(profile=""):
+    """浏览器相关进程表查询(服务端先过滤, 输出小一个数量级)。
+
+    2026-10-12 客户机实证: **全量** Win32_Process 的 ConvertTo-Json 在中文 Windows 上失败
+    (编码/超时/体量) → 日志出现"仍有 -1 个"、等释放断腿。改成:
+    只取浏览器家族(chrome/msedge/chromium) + 命令行含 profile 的进程 + 强制 UTF-8 输出;
+    开头打一个哨兵行, 便于区分"没有匹配"与"查询静默失败"。"""
+    flt = "$_.Name -match 'chrome|msedge|chromium'"
+    if profile:
+        esc = str(profile).replace("'", "''")
+        flt += f" -or $_.CommandLine -like '*{esc}*'"
+    return ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+            "$tbl = @(Get-CimInstance Win32_Process | "
+            f"Where-Object {{ {flt} }} | "
+            "Select-Object ProcessId,ParentProcessId,CommandLine); "
+            "Write-Output '__TBL_OK__'; "
+            "$tbl | ConvertTo-Json -Compress")
+
+
+def _parse_proc_table(raw):
+    """PowerShell 输出字节 → [(pid, ppid, cmdline)]; 不可解析/静默失败 → None。纯函数。"""
+    text = _ps_text(raw)
+    if "__TBL_OK__" not in text:
+        return None                      # 没有哨兵 = 查询没正常产出 → 判"探测不可用"
+    body = text.split("__TBL_OK__", 1)[1].strip()
+    if body in ("", "null"):
+        return []
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                             capture_output=True, text=True, timeout=40).stdout.strip()
-        if not out:
-            return []
-        data = json.loads(out)
-        if isinstance(data, dict):
-            data = [data]
-        return [(int(d.get("ProcessId") or 0), int(d.get("ParentProcessId") or 0),
-                 str(d.get("CommandLine") or "")) for d in data]
+        data = json.loads(body)
     except Exception:
         return None
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return None
+    out = []
+    for d in data:
+        try:
+            out.append((int(d.get("ProcessId") or 0), int(d.get("ParentProcessId") or 0),
+                        str(d.get("CommandLine") or "")))
+        except Exception:
+            continue
+    return out
+
+
+def _win_process_table(profile=""):
+    """Windows 浏览器相关进程表 [(pid, ppid, cmdline)]; 非 Windows / 探测失败 → None。"""
+    if os.name != "nt":
+        return None
+    try:
+        raw = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                              _build_proc_table_ps(profile)],
+                             capture_output=True, timeout=60).stdout
+    except Exception:
+        return None
+    return _parse_proc_table(raw)
 
 
 def select_profile_kill_pids(procs, profile):
@@ -133,7 +184,7 @@ def select_profile_kill_pids(procs, profile):
 def _profile_process_pids(profile):
     """当前仍指向该 profile 的进程 pid; 探测失败 → None。"""
     if os.name == "nt":
-        table = _win_process_table()
+        table = _win_process_table(profile)
         if table is None:
             return None
         return [p for p, _pp, cmd in table if str(profile).lower() in str(cmd).lower()]
@@ -162,6 +213,27 @@ def wait_profile_free(profile, timeout_s=12.0, poll_s=1.0, probe=None):
         if time.time() >= end:
             return False, len(pids)
         time.sleep(poll_s)
+
+
+def _cleanup_note(killed, released, remaining):
+    """清理收尾日志(纯函数): 返回 (msg, level) 或 None(无事可报)。
+
+    2026-10-12 客户机: 旧文案把"探测不可用"打成"仍有 -1 个未退出"——又怪又误导。
+    remaining==-1 = 进程表探测不可用; killed<0 = 走了兜底方式(数量未知)。"""
+    if killed:
+        n = "（兜底方式，数量未知）" if killed < 0 else f" {killed} 个"
+        if remaining == -1:
+            extra = "；进程表探测不可用，已固定等待兜底"
+        elif released:
+            extra = ""
+        else:
+            extra = f"；仍有 {remaining} 个未退出，已尽量等待"
+        return (f"🧹 已清理残留浏览器进程{n}{extra}", "info")
+    if remaining == -1:
+        return ("⚠️ 浏览器配置目录无法确认已释放（进程表探测不可用）——已按兜底等待", "warn")
+    if not released and remaining:
+        return (f"⚠️ 仍有 {remaining} 个进程占用浏览器配置目录(未能安全清理), 已等待", "warn")
+    return None
 
 
 def _cleanup_stale_browser(profile_dir, sink=None):
@@ -198,7 +270,7 @@ def _cleanup_stale_browser(profile_dir, sink=None):
     try:
         killed = 0
         if os.name == "nt":
-            table = _win_process_table()
+            table = _win_process_table(prof)
             if table is not None:
                 pids = [p for p in select_profile_kill_pids(table, prof) if p != os.getpid()]
                 if pids:
@@ -229,14 +301,15 @@ def _cleanup_stale_browser(profile_dir, sink=None):
         # 释放 profile** 才返回 —— 此前 Windows 分支杀完立即启动新浏览器, 旧进程还在释放中
         # → 新 Chromium 秒退, 把一次死亡放大成"连续关闭"。POSIX 原来也只盲睡 3s, 统一改成轮询。
         released, remaining = wait_profile_free(prof, timeout_s=12)
+        if remaining == -1:
+            # 探测不可用(2026-10-12 客户机日志"仍有 -1 个"=这里没等就放行, 等释放断腿):
+            # 固定等待兜底(≈旧版 sleep(3)), 保住"杀完别立刻重开"的效果
+            time.sleep(3)
         if sink is not None:
             try:
-                if killed:
-                    extra = "" if released else f"（仍有 {remaining} 个未退出, 已尽量等待）"
-                    n = f" {killed} 个" if killed > 0 else ""
-                    sink.log(f"🧹 已清理残留浏览器进程{n}{extra}")
-                elif not released and remaining and remaining > 0:
-                    sink.log(f"⚠️ 仍有 {remaining} 个进程占用浏览器配置目录(未能安全清理), 已等待", level="warn")
+                note = _cleanup_note(killed, released, remaining)
+                if note:
+                    sink.log(note[0], level=note[1])
             except Exception:
                 pass
         return True
@@ -332,11 +405,15 @@ def browser_death_forensics(profile_dir, out_dir, err_text=""):
     procs, events = [], []
     if os.name == "nt":
         try:
-            ps = ("Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,"
-                  "CreationDate,CommandLine | ConvertTo-Json -Compress")
-            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                                 capture_output=True, text=True, timeout=40).stdout.strip()
-            data = json.loads(out) if out else []
+            esc = str(profile_dir).replace("'", "''")
+            ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                  "Get-CimInstance Win32_Process | "
+                  f"Where-Object {{ $_.Name -match 'chrome|msedge|chromium' -or $_.CommandLine -like '*{esc}*' }} | "
+                  "Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine | ConvertTo-Json -Compress")
+            raw = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                                 capture_output=True, timeout=60).stdout
+            text = _ps_text(raw)
+            data = json.loads(text) if text and text != "null" else []
             if isinstance(data, dict):
                 data = [data]
             procs = [(int(d.get("ProcessId") or 0), int(d.get("ParentProcessId") or 0),
@@ -344,14 +421,23 @@ def browser_death_forensics(profile_dir, out_dir, err_text=""):
                      for d in data]
         except Exception:
             procs = []
+        if not procs:
+            try:
+                _tbl = _win_process_table(str(profile_dir)) or []
+                if _tbl:
+                    procs = [(p, pp, "", c) for p, pp, c in _tbl]
+            except Exception:
+                pass
         try:
-            ps_ev = ("$ws = Get-WinEvent -FilterHashtable @{LogName='Application'; "
+            ps_ev = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                     "$ws = Get-WinEvent -FilterHashtable @{LogName='Application'; "
                      "StartTime=(Get-Date).AddMinutes(-30)} -MaxEvents 400 -ErrorAction SilentlyContinue | "
                      "Where-Object { $_.Message -match 'chrome|chromium|msedge' } | Select-Object -First 12; "
                      "foreach ($e in $ws) { Write-Output ($e.TimeCreated.ToString('MM-dd HH:mm:ss') + "
                      "' [id=' + $e.Id + '] ' + $e.Message) }")
             out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_ev],
-                                 capture_output=True, text=True, timeout=30).stdout.strip()
+                                 capture_output=True, encoding="utf-8", errors="replace",
+                                 timeout=30).stdout.strip()
             if out:
                 events = out.splitlines()
         except Exception:
