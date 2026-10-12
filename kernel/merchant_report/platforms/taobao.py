@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess   # 必留: _cleanup_stale_browser 用(曾漏 → 整段清理被 except 静默吞失效)
 import time
-import urllib.parse
 from pathlib import Path
 
 from ..events import EventSink
@@ -19,31 +18,6 @@ DOWNLOAD_CENTER = "https://melody.shop.ele.me/app/shop/{shop_id}/downloadCenter#
 STATS_HOME = "https://melody.shop.ele.me/"
 # 增值服务页(充值/消费记录): 单店 URL, shop_id 由 switch_shop 拿到
 VAS_URL = "https://melody.shop.ele.me/app/shop/{shop_id}/vas#app.shop.vas"
-
-# OSS 报表文件的 percent-encoding 末段(「门店下载」): 图片 URL 里中文被编码, 命中判定必须同时认它
-_OSS_NAME_ENC = "%E9%97%A8%E5%BA%97%E4%B8%8B%E8%BD%BD"
-
-
-def is_oss_report_url(url):
-    """URL 是不是淘宝闪购的 OSS 报表文件(纯函数, 便于单测)。
-
-    判定(2026-10-12 客户机日志实证的报表文件 URL):
-        https://kbtdatacenter.oss-cn-zhangjiakou.aliyuncs.com/2026-10/2026-10-12/1791820442870/
-        %E9%97%A8%E5%BA%97%E4%B8%8B%E8%BD%BD_20260926%E8%87%B320260926_%E5%85%A8...xlsx
-    规则: host 含 ".oss-" 且含 "aliyuncs.com"(阿里云 OSS 专属域名),
-          且 (路径含「门店下载」/其 percent-encoding, 或路径以表格/压缩后缀结尾)。
-    为什么两重都留: 平台文件名可能换文案(如「报表下载」)但后缀不变; 反之后缀被签名参数挡住时,
-          中文名仍能认出。宁可从宽命中(它只影响我们主动拦不拦, 不改变页面语义)。
-    """
-    u = str(url or "")
-    low = u.lower()
-    if ".oss-" not in low or "aliyuncs.com" not in low:
-        return False
-    path = low.split("?", 1)[0]
-    if "门店下载" in u or _OSS_NAME_ENC.lower() in low:
-        return True
-    return path.endswith((".xlsx", ".xls", ".csv", ".zip"))
-
 
 
 def parse_vas_ledger(rows, date):
@@ -956,24 +930,6 @@ class TaobaoAdapter:
                 self.sink.log("🛰 已挂载下载 URL 嗅探(仅排查记录, 不影响流程)")
             except Exception as e:
                 self.sink.log(f"ℹ️ 下载 URL 嗅探挂载失败(忽略): {str(e)[:60]}", level="warn")
-        # OSS 报表文件「接口直取」拦截(2026-10-12 客户机根治):
-        # 现象是"报表从 OSS 开始下载的那一瞬, 整个自动化浏览器被关闭"(browser disconnected →
-        # Download.save_as 报 Target closed)。同机美团可跑通, 区别就在美团取文件走 ctx.request
-        # (纯 HTTP, 完全不碰浏览器下载机制, 见 meituan._fetch_via_request)。这里照搬该思路:
-        # 报表文件请求一出现就 abort 掉, 不让 Chromium 去落盘, 改由 _wait_files 用 ctx.request 拉。
-        self._oss_urls = []
-        self._oss_pull_tries = {}        # URL → 已试轮数(到上限就放弃并回退浏览器直下)
-        self._oss_pull_done = set()      # 已判定"不必再试"的 URL(成功/放弃, 防重复拉)
-        self._oss_gave_up = set()        # 直取放弃的 URL → 路由放行(回退浏览器直下, 见 _on_route)
-        try:
-            # 用 catch-all "**/*" + handler 内快速 continue 放行页面自身请求(lsycm/fourier/gm.mmstat
-            # 等)—— 比按 host 猜 pattern 更稳: 与 grep 同级的字符串判断, 事件线程每秒几十次的量级
-            # 完全无感, 且绝不漏掉 OSS 报表(命中判定见 is_oss_report_url 纯函数)。
-            self.ctx.route("**/*", self._on_route)
-            self.sink.log("🛡 已启用 OSS 直取拦截(浏览器不再直下报表)")
-        except Exception as e:
-            self.sink.log(f"⚠️ OSS 直取拦截挂载失败({str(e)[:70]}) — 本次仍走浏览器直下, 不影响流程",
-                          level="warn")
         # 记住本次请求区间: 下载事件 _save_download 用它给文件改规范名
         # (平台原名末段是**下载时间戳**不是报表日期, 分不清是哪天的报表)
         self._dl_range = (date_from or date_to or "", date_to or date_from or "")
@@ -1133,127 +1089,6 @@ class TaobaoAdapter:
             self._dl_events = getattr(self, "_dl_events", 0) + 1
             self._save_download(d, dl_dir)
         return _h
-
-    def _on_route(self, route):
-        """context 级路由: OSS 报表文件 → 拦下(改走接口直取); 其他一律放行。
-
-        ⚠️ 这个 handler 在 Playwright 的**事件线程**里被调用, 必须立刻返回 —— **绝不在这里
-        发网络请求**(线程被占住会把整个页面的请求全卡死)。因此这里只做三件极快的事:
-        判定 URL → 记进 self._oss_urls → abort/continue。真正的拉取在 _wait_files 轮询里做。
-        """
-        try:
-            req = route.request
-            url = getattr(req, "url", "") or ""
-            if is_oss_report_url(url):
-                if url in self._oss_gave_up:
-                    # 直取已放弃(重试耗尽) → 对这条 URL 放行: 回退浏览器直下。
-                    # (2026-10-12 复核发现的"假回退": 若这里仍 abort, 日志承诺的回退就不会发生)
-                    route.continue_()
-                    return
-                # 上限 8 条: 一次下载最多就 2 份, 留些冗余防病态刷屏; 超上限的仍 abort(不看漏),
-                # 只是不再记录/不再尝试直取 —— 这种情况几乎不会发生。
-                known = url in self._oss_urls
-                if not known and len(self._oss_urls) < 8:
-                    self._oss_urls.append(url)
-                    known = True
-                try:
-                    route.abort()
-                except Exception:
-                    pass
-                if known:
-                    self.sink.log(f"🛰 已拦下浏览器直下, 改走接口直取: {url[:120]}")
-                else:
-                    self.sink.log(f"🛰 已拦下浏览器直下(超记录上限, 交由超时兜底): {url[:120]}",
-                                  level="warn")
-                return
-            route.continue_()
-        except Exception:
-            # 拦截器自身出错 **绝不能**把页面请求弄坏: 一律退回放行
-            try:
-                route.continue_()
-            except Exception:
-                pass
-
-    def _fetch_oss_reports(self, ddir):
-        """把拦下来的 OSS 报表 URL 用 ctx.request 拉回本地(纯 HTTP, 不碰浏览器下载机制)。
-
-        每轮 _wait_files 调一次: 逐个未完成的 URL, 有重试余额就试一次; 校验响应 ok 且 body
-        是 xlsx(=zip, 以 b"PK\\x03\\x04" 开头)才落盘。失败只记一次简短原因, 不刷屏。
-        返回本轮新落盘的文件名列表。
-        """
-        got = []
-        if not getattr(self, "_oss_urls", None):
-            return got
-        for url in list(self._oss_urls):
-            if url in self._oss_pull_done:
-                continue                      # 已成功或已放弃 → 不再重复拉
-            tries = self._oss_pull_tries.get(url, 0)
-            if tries >= self._oss_pull_max_tries():
-                # 重试耗尽 → 放弃直取, 并让路由放行这条 URL(回退浏览器直下: 别的机器可能活)
-                self._oss_pull_done.add(url)
-                self._oss_gave_up.add(url)
-                self.sink.log(f"⚠️ 接口直取失败, 回退浏览器直下(已放行): {url[:90]}", level="warn")
-                continue
-            self._oss_pull_tries[url] = tries + 1
-            name = self._oss_filename(url)
-            target = Path(ddir) / name
-            if target.exists():       # 已有同名文件 → 视为同一份, 不必再拉(省一次网络请求)
-                self._oss_pull_done.add(url)
-                continue
-            reason = ""
-            try:
-                ref = ""
-                try:
-                    if self.page is not None and not self.page.is_closed():
-                        ref = self.page.url or ""
-                except Exception:
-                    ref = ""
-                r = self.ctx.request.get(url, timeout=120_000,
-                                         headers={"Referer": ref or "https://melody.shop.ele.me/"})
-                ok, body = r.ok, r.body()
-                if not ok:
-                    reason = f"HTTP {r.status}"
-                elif not isinstance(body, (bytes, bytearray)) or not bytes(body).startswith(b"PK\x03\x04"):
-                    reason = f"响应不是 xlsx(前4字节 {bytes(body)[:4]!r})"
-                else:
-                    with open(target, "wb") as fh:
-                        fh.write(body)
-                    size = len(body)
-                    if size < 1024:           # 空/极小 → 平台还在生成, 丢弃等下一轮(同 _save_download)
-                        try:
-                            target.unlink()
-                        except Exception:
-                            pass
-                        reason = f"文件过小({size} 字节, 平台可能还在生成)"
-                    else:
-                        try:
-                            target = self._rename_canonical(target)   # 与浏览器直下落盘同款命名规整
-                        except Exception:
-                            pass
-                        self.sink.log(f"✅ 接口直取成功: {target.name} ({size} 字节)")
-                        self._oss_pull_done.add(url)
-                        got.append(target.name)
-                        continue
-            except Exception as e:
-                reason = str(e)[:60]
-            self.sink.log(f"ℹ️ 接口直取未成(第{self._oss_pull_tries[url]}次): {reason or '未知'}"
-                          f" — {url[:80]}", level="warn")
-        return got
-
-    @staticmethod
-    def _oss_pull_max_tries():
-        """同一 URL 每轮重试的最大轮数(轮询间隔 4s → 累计约 32s)。"""
-        return 8
-
-    @staticmethod
-    def _oss_filename(url):
-        """OSS URL 末段 → 落盘文件名(percent-encoding 还原成中文)。"""
-        tail = str(url or "").split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
-        try:
-            tail = urllib.parse.unquote(tail)
-        except Exception:
-            pass
-        return tail or "report.xlsx"
 
     def _recover_stray_downloads(self, ddir, max_age_min=40):
         """兜底: 下载事件没能落盘时, 去浏览器默认下载目录把本次文件**复制**回来(不移动原文件)。
@@ -1440,21 +1275,10 @@ class TaobaoAdapter:
             time.sleep(4)
             new = [x for x in set(os.listdir(ddir)) - before
                    if x.endswith(".xlsx") and not x.startswith(".")]
+            got = new
             if len(new) >= need:
                 self.sink.step_ok("download", "下载报表", f"{len(new)} 份文件落盘")
                 return new
-            # OSS 直取: 被路由拦下的报表 URL 用 ctx.request 拉回本地(纯 HTTP)。放在"看文件"之后
-            # —— 直取落盘的文件下一轮就会被上面的 new 判定到, 满足即直接返回。
-            try:
-                self._fetch_oss_reports(ddir)
-            except Exception as e:
-                self.sink.log(f"ℹ️ 接口直取异常(忽略, 稍后重试): {str(e)[:60]}", level="warn")
-            new = [x for x in set(os.listdir(ddir)) - before
-                   if x.endswith(".xlsx") and not x.startswith(".")]
-            if len(new) >= need:
-                self.sink.step_ok("download", "下载报表", f"{len(new)} 份文件落盘(含接口直取)")
-                return new
-            got = new
             try:
                 txt = f.evaluate("() => document.body.innerText")
             except Exception:
