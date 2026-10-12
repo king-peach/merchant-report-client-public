@@ -270,6 +270,43 @@ def _autocreate_enabled(cfg):
     return (cfg.get("defaults") or {}).get("auto_create_store_sheet", True) is not False
 
 
+def _other_task_gate(sink, human):
+    """双开/旧版残留防护(2026-10-12 客户机实证): 两个「商家报表助手」客户端同时跑任务时,
+    **共用同一个浏览器配置目录** —— 先启动的浏览器占住目录, 后启动方的新浏览器被顶死,
+    表现就是"浏览器被反复关闭、重开也没用"的死循环。与其让用户一头雾水, 不如先讲清楚。
+
+    返回 True=继续 / False=干净结束(用户选了"结束本次")。
+    探测不可用/无响应 → 继续(保持自动化旧行为, 只 warn)。"""
+    try:
+        from .platforms.taobao import _other_live_task_pids
+        others = _other_live_task_pids()
+    except Exception:
+        others = None
+    if not others:
+        return True
+    pids = "、".join(str(p) for p in others[:6])
+    sink.log(f"⚠️ 检测到另一个「商家报表助手」任务在运行(进程 {pids})——两个客户端同时跑会"
+             f"共用浏览器配置、互相顶死(这是浏览器被反复关闭的常见原因)", level="warn")
+    msg = (f"检测到**另一个窗口正在运行任务**（进程 {pids}）。\n"
+           f"两个客户端共用同一个浏览器配置目录，同时跑任务会互相顶死，"
+           f"表现就是浏览器被反复关闭、重开也没用。\n"
+           f"建议：结束本次，只保留一个窗口后重跑；如果那是旧版本的残留窗口，"
+           f"请把它完全退出（含右下角托盘里的图标）。")
+    try:
+        sink.need_human("confirm", msg,
+                        choices=["结束本次（只留一个窗口后重跑）", "仍然继续试试"], timeout_s=120)
+        resp = human.wait({"type": "need_human", "action": "confirm"}) or {}
+        choice = str(resp.get("choice") or "").strip()
+    except Exception:
+        choice = ""
+    if not choice:
+        sink.log("⚠️ 双开冲突确认未收到响应（无人值守/超时）→ 按「继续」处理", level="warn")
+        return True
+    if "结束" in choice:
+        return False
+    return True
+
+
 def _template_date_gate(sink, human, template, date, cfg):
     """需求 B: 模板里一张门店表都没有 {date} → 停下问用户「继续跑流程 / 结束流程」。
 
@@ -470,6 +507,15 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     ddir.mkdir(parents=True, exist_ok=True)
     scope = store.get("scope", "all")
     sink.task_start(store["name"], f"{date_from}~{date}", [store.get("platform", "taobao")])
+
+    # 双开/旧版残留防护(2026-10-12 客户机实证): 两个客户端同时跑会共用浏览器配置互相顶死 ——
+    # 在启动浏览器之前先说清楚, 而不是让用户看到"浏览器被反复关闭"后再自己猜。
+    if not _other_task_gate(sink, human):
+        sink.result(False, error_code="E_OTHER_TASK_RUNNING",
+                    message=("检测到另一个窗口正在运行任务，已按你的选择结束本次。"
+                             "请只保留一个客户端窗口后重跑；旧版本残留窗口请连同托盘一起完全退出。"),
+                    retryable=True)
+        return None
 
     # 需求 B(2026-10-12): 模板日期预检 + 确认门 —— 必须在这里(登录/浏览器/下载之前),
     # 否则等采集跑完才发现"模板里没这个日期", 用户的时间全白花了。
