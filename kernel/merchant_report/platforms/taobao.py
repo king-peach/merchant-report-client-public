@@ -236,6 +236,32 @@ def _cleanup_note(killed, released, remaining):
     return None
 
 
+def _msplaywright_sweep_ps():
+    """兜底清扫命令(纯函数便于单测): 结束本程序 ms-playwright 目录下的全部浏览器进程。
+
+    2026-10-13 客户机"残留链"修复: 按 profile 命令行匹配的清理会漏杀(有的子进程命令行
+    里不带 profile 路径), 日志实证"已清理残留浏览器进程 1 个; 仍有 1 个未退出"。
+    这些浏览器只可能来自本程序的浏览器组件目录, 按**可执行文件路径**扫更彻底;
+    用户自己的浏览器路径不同, 不会被碰到。
+    """
+    return ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.ProcessId -ne $PID -and "
+            "$_.ExecutablePath -like '*MerchantReportClient\\ms-playwright*' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+
+
+def _survivor_lines(rows, limit=3):
+    """清理后仍占用 profile 的进程 → 日志短行列表(纯函数便于单测)。rows: [(pid, ppid, cmd)]"""
+    out = []
+    for r in list(rows or [])[:limit]:
+        try:
+            out.append(f"↳ 仍占用: pid={int(r[0])} {str(r[2])[:120]}")
+        except Exception:
+            continue
+    return out
+
+
 def _cleanup_stale_browser(profile_dir, sink=None):
     """结束仍占用本 profile 的**残留**浏览器(上一轮任务未完全退出)。
     否则新启动的浏览器会把参数转发给旧实例, Playwright 拿不到控制权。
@@ -305,11 +331,32 @@ def _cleanup_stale_browser(profile_dir, sink=None):
             # 探测不可用(2026-10-12 客户机日志"仍有 -1 个"=这里没等就放行, 等释放断腿):
             # 固定等待兜底(≈旧版 sleep(3)), 保住"杀完别立刻重开"的效果
             time.sleep(3)
+        if os.name == "nt" and not released and isinstance(remaining, int) and remaining > 0:
+            # 升级清扫(2026-10-13 客户机"残留链"): 按 profile 匹配仍杀不净("仍有 1 个未退出"
+            # 实证) → 按**本程序 ms-playwright 目录的可执行文件路径**再全量扫一遍(那些进程
+            # 只可能是我们的浏览器; 用户自己的浏览器路径不同, 不受影响), 然后重新等释放。
+            try:
+                subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                _msplaywright_sweep_ps()],
+                               capture_output=True, text=True, timeout=25)
+            except Exception:
+                pass
+            released, remaining = wait_profile_free(prof, timeout_s=8)
         if sink is not None:
             try:
                 note = _cleanup_note(killed, released, remaining)
                 if note:
                     sink.log(note[0], level=note[1])
+                if os.name == "nt" and not released and isinstance(remaining, int) and remaining > 0:
+                    # 仍杀不掉 → 逐个点名(pid+命令行): 客户/我们一眼看出是谁赖着不走
+                    try:
+                        rows = _win_process_table(prof) or []
+                    except Exception:
+                        rows = []
+                    for ln in _survivor_lines(rows):
+                        sink.log(ln, level="warn")
+                    sink.log("⚠️ 上面的残留进程未能清掉(可能被安全软件保护) —— 建议重启助手, "
+                             "仍不行就重启电脑后再跑; 反复出现请把日志发给支持", level="warn")
             except Exception:
                 pass
         return True

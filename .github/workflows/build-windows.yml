@@ -120,8 +120,12 @@ jobs:
           Push-Location $kernel
           & "..\..\resources\python\python.exe" -c "from merchant_report import bootstrap as b, browser_pref as p; assert 'npmmirror' in b.DEFAULT_MIRROR, 'mirror wrong'; import merchant_report.platforms.taobao as t, inspect; s = inspect.getsource(t.launch_browser); assert 'MRC_BROWSER_CHANNEL' in s, 'browser pref not wired'; assert 'msedge' in s and 'chrome' in s, 'candidates missing'; assert 'auto_slider = False' in open('merchant_report/platforms/taobao.py', encoding='utf-8').read(), 'slider policy wrong'; assert 'import subprocess' in open('merchant_report/platforms/taobao.py', encoding='utf-8').read(), 'subprocess import lost(清理会静默空转)'; assert '_other_live_task_pids' in inspect.getsource(t._cleanup_stale_browser), 'dual-open guard missing(双开会互相关闭)'; assert 'tauri_plugin_single_instance' in open('../../src/main.rs', encoding='utf-8').read(), 'single-instance plugin not registered'; print('browser bootstrap ok:', b.DEFAULT_MIRROR)"
           $code2 = $LASTEXITCODE
+          # 退出清理链路防回归(2026-10-13): 关窗必须送走内核+浏览器, 否则必留残留孤儿进程
+          & "..\..\resources\python\python.exe" -c "import pathlib; m = pathlib.Path('../../src/main.rs').read_text(encoding='utf-8'); p = pathlib.Path('../../src/py_runner.rs').read_text(encoding='utf-8'); assert 'ExitRequested' in m, 'exit cleanup hook lost'; assert 'cleanup_on_exit' in p, 'sidecar exit cleanup lost'; assert 'ms-playwright' in p, 'browser sweep lost'; print('exit hygiene ok')"
+          $code3 = $LASTEXITCODE
           Pop-Location
           if ($code2 -ne 0) { throw "浏览器引导/顺序/滑块/双开防护检查失败" }
+          if ($code3 -ne 0) { throw "退出清理链路检查失败(关窗会留残留)" }
 
       - name: 前端构建
         run: npm ci

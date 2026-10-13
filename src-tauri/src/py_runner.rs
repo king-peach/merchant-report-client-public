@@ -405,3 +405,42 @@ fn kill_pid(pid: u32) {
         let _ = Command::new("kill").arg(pid.to_string()).output();
     }
 }
+
+/// 退出前清理(2026-10-13 客户机"残留链"根因修复): 关窗/托盘退出必须先送走内核与其浏览器。
+/// Windows 上子进程不随父进程退出 —— 不清理的话, 任务跑着时直接关掉助手会留下
+/// python 内核 + 自动化浏览器两个孤儿进程(残留), 下次启动带着脏状态跑就容易出各种怪问题。
+/// 全程无感、不需用户确认: 任务中断的代价本来就发生在"用户主动关闭"这一刻。
+pub fn cleanup_on_exit(app: &AppHandle) {
+    {
+        let state = app.state::<TaskState>();
+        {
+            let mut guard = state.child_stdin.lock().unwrap();
+            if let Some(stdin) = guard.as_mut() {
+                // 先礼貌中止(内核若还在跑任务, 收到 abort 会收尾), 随后无论死活都整树结束
+                let _ = stdin.write_all(b"{\"type\":\"abort\"}\n");
+                let _ = stdin.flush();
+            }
+            *guard = None;
+        }
+        let pid = state.child_pid.lock().unwrap().take();
+        if let Some(pid) = pid {
+            kill_pid(pid); // 整树结束: python → node 驱动 → chromium 全在树上
+        }
+    }
+    // 兜底: 内核即使已经死了(kill_pid 够不着它遗留的浏览器), 也把本程序目录下的浏览器清掉
+    sweep_app_browsers();
+}
+
+#[cfg(windows)]
+fn sweep_app_browsers() {
+    use std::os::windows::process::CommandExt;
+    // 只扫本程序数据目录: ms-playwright 下只可能是我们的浏览器; 用户自己的浏览器路径不同
+    let ps = r#"Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.ExecutablePath -like '*MerchantReportClient\ms-playwright*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps])
+        .creation_flags(0x08000000)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn sweep_app_browsers() {}

@@ -8,6 +8,9 @@ use tauri::{
     Manager,
 };
 
+// 退出清理只做一次(防止 prevent_exit → cleanup → exit(0) 再触发的循环)
+static EXIT_CLEANED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() {
     tauri::Builder::default()
         // 单实例锁(2026-10-11 双开互杀根治): 重复打开时不再开第二份窗口,
@@ -54,6 +57,26 @@ fn main() {
                 .build(app)?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // 退出前清理(2026-10-13 客户机"残留链"根因修复):
+            // 关窗/托盘退出 → 先把内核与自动化浏览器送走, 再放行退出。
+            // 否则 Windows 上子进程不随父进程退出, 任务跑着时关助手必留孤儿进程(残留),
+            // 下次启动带着脏状态跑就会出各种怪问题(客户机事故链路)。
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if !EXIT_CLEANED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    api.prevent_exit();
+                    let h = app.clone();
+                    std::thread::spawn(move || {
+                        // 清理过程吞掉一切异常: 再怎么样也要把应用退掉,
+                        // 绝不因为清理自身出错把用户卡在"窗口关不掉"的状态。
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            py_runner::cleanup_on_exit(&h);
+                        }));
+                        h.exit(0);
+                    });
+                }
+            }
+        });
 }

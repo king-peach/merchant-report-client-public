@@ -141,6 +141,27 @@ def test_cleanup_note():
     print("✅ 清理文案: 兜底/正常/残留/探测不可用 —— 不再出现 \"-1 个\"")
 
 
+def test_orphan_sweep():
+    # ① 兜底清扫命令: 按**可执行文件路径**扫本程序浏览器目录(不碰用户自己的浏览器)
+    ps = T._msplaywright_sweep_ps()
+    assert "MerchantReportClient" in ps and "ms-playwright" in ps, ps
+    assert "ExecutablePath" in ps, "要按可执行文件路径扫, 不许只按命令行(漏杀根源)"
+    assert "Stop-Process" in ps and "-ne $PID" in ps, ps
+    # ② 残留点名(纯函数): pid+命令行、超长截断、坏行跳过、limit 生效
+    lines = T._survivor_lines([(123, 1, "C:\\x\\chrome.exe --type=renderer " + "x" * 300),
+                               (124, 1, "C:\\y\\chrome.exe"),
+                               ("bad",),
+                               (125, 1, "C:\\z\\third.exe")])
+    assert len(lines) == 2, f"坏行要跳过, limit=3 只取前 3 行(其中坏行被跳): {lines}"
+    assert lines[0].startswith("↳ 仍占用: pid=123") and len(lines[0]) <= 140, lines[0]
+    assert "pid=124" in lines[1], lines[1]
+    # ③ 接线: 清理流程用上"升级清扫"与"残留点名"
+    src = inspect.getsource(T._cleanup_stale_browser)
+    assert "_msplaywright_sweep_ps" in src, "升级清扫未接线(残留链修复点)"
+    assert "_survivor_lines" in src, "残留点名未接线"
+    print("✅ 残留链: 升级清扫(按路径全量, 不碰用户浏览器) + 残留点名(pid+命令行) 都在位")
+
+
 def test_wiring_source():
     src_cl = inspect.getsource(T._cleanup_stale_browser)
     assert "_other_live_task_pids" in src_cl, "双开防护闸不许丢(CI 冒烟同查)"
@@ -164,6 +185,7 @@ def main():
     test_format_diag_filter()
     test_parse_proc_table()
     test_cleanup_note()
+    test_orphan_sweep()
     test_wiring_source()
     print("\n✅ 浏览器恢复路径(Windows 竞态修复+取证+探测加固)全绿")
 
