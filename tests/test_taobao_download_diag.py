@@ -31,7 +31,13 @@ def main():
     full = open(pathlib.Path(T.__file__), encoding="utf-8").read()
     assert 'cdp.send("Browser.setDownloadBehavior"' not in full, "不许真调用 CDP 下载设置"
     assert "new_cdp_session" not in full, "全文件不许再出现 new_cdp_session"
-    print("✅ 淘宝下载路径: CDP 移除 ✓ 事件接管保留 ✓ URL 嗅探在位 ✓")
+    # 2026-10-13 客户机实证: "下载**完成**后浏览器才断开 → save_as 报 Target closed" 的解耦链
+    assert "downloads_path" in full and "down_stage" in full, "launch 必须设置下载暂存目录(与连接解耦)"
+    assert "def _pickup_staged" in full and "def _sweep_staged" in full, "要有纯文件系统捡回通道"
+    assert "已从下载暂存目录捡回" in inspect.getsource(T.TaobaoAdapter._save_download), "save_as 失败必须走捡回"
+    assert "_sweep_staged(ddir" in inspect.getsource(T.TaobaoAdapter._wait_files), "等待循环要实时搬运暂存文件"
+    assert "暂存目录清场" in inspect.getsource(T.TaobaoAdapter.download_reports), "跑前清场暂存目录(防捡旧文件)"
+    print("✅ 淘宝下载路径: CDP 移除 ✓ 事件接管保留 ✓ URL 嗅探在位 ✓ 断开解耦(暂存+捡回) ✓")
     print("\n✅ 淘宝-美团下载路径对齐守卫 全绿")
 
 

@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""浏览器启动回退测试: 启动超时必须换候选(不能直接失败), 且错误信息要带可操作建议
+"""浏览器启动回退测试: 启动超时/缺失必须换候选; Windows 新默认=系统浏览器优先(2026-10-13 报告)
 
-用户 Windows 实测: 'BrowserType.launch_persistent_context: Timeout 180000ms exceeded'
-—— 自带 Chromium 下载成功但启动超时。旧代码的回退关键字里没有 timeout, 于是直接抛错失败,
-而不是回退系统 Edge。这里把该行为钉死。
+客户机排查报告(2026-10-13): 自带 Chromium 153 在"下载报表"环节 100% 进程内崩溃;
+系统 Chrome 155 同机同流程 0 崩溃、完整任务跑通。→ Windows 默认顺序改为
+[chrome → msedge → 自带], 自带只做兜底。本测试把"回退行为 + 默认顺序"钉死。
+(跨平台: 顺序按运行平台取与 launch_browser 相同的表达式, 断言语义一致。)
 """
+import os
 import sys
 from pathlib import Path as _P
 
@@ -20,6 +22,11 @@ _BP = _PP(_tf.mkdtemp()) / "browser_pref.json"
 BP._path = lambda: _BP
 
 TB._cleanup_stale_browser = lambda *a, **k: None   # 不碰进程表(sink=None 兼容)
+
+# 与 launch_browser 内部同一表达式(Windows=系统优先; macOS=自带优先)
+DEFAULT = ["chrome", "msedge", None] if os.name == "nt" else [None, "msedge", "chrome"]
+D0, D1, D2 = DEFAULT
+LBL = lambda ch: ch or "chromium(自带)"
 
 
 class FakeChromium:
@@ -46,36 +53,39 @@ class FakePW:
 TIMEOUT_ERR = RuntimeError(
     "BrowserType.launch_persistent_context: Timeout 90000ms exceeded.\nCall log:\n"
     "- <launching> C:\\Users\\admin\\AppData\\Roaming\\MerchantReportClient\\ms-playwright\\"
-    "chromium-1200\\chrome-win\\chrome.exe --disable-blink-features=AutomationControlled\n"
+    "chromium-1243\\chrome-win64\\chrome.exe --disable-blink-features=AutomationControlled\n"
     "- <launching>   userDataDir=\"...\"\n- <launching> <process did not exit>")
 
 MISSING_ERR = RuntimeError(
     "BrowserType.launch_persistent_context: Executable doesn't exist at "
-    "/Users/x/Library/Caches/ms-playwright/chromium-1200/chrome-mac/Chromium.app/...")
+    "C:\\...\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe\n"
+    "Please run the following command to download new browsers")
 
 if _BP.exists():
     _BP.unlink()
-print("=== 1. 自带 Chromium 启动超时 → 自动回退系统 Edge(不再直接失败) ===")
-pw = FakePW({None: TIMEOUT_ERR, "msedge": "OK_EDGE", "chrome": MISSING_ERR})
+print(f"=== 1. 首选({LBL(D0)})启动超时 → 自动回退 {LBL(D1)}(不直接失败) ===")
+pw = FakePW({D0: TIMEOUT_ERR, D1: "OK_SECOND", D2: "OK_LAST"})
 ctx = TB.launch_browser(pw, "/tmp/prof")
-assert ctx == {"ctx": "msedge", "profile": "/tmp/prof"}, ctx
+assert ctx == {"ctx": D1, "profile": "/tmp/prof"}, ctx
 tried = [c["channel"] for c in pw.chromium.calls]
-assert tried == [None, "msedge"], tried
+assert tried == [D0, D1], tried
 assert all(c["timeout"] == TB.LAUNCH_TIMEOUT_MS for c in pw.chromium.calls), pw.chromium.calls
-print(f"  ✓ 尝试顺序 {tried}, 均带 {TB.LAUNCH_TIMEOUT_MS}ms 超时(默认 180s 太长)")
+print(f"  ✓ 尝试顺序 {[LBL(c) for c in tried]}, 均带 {TB.LAUNCH_TIMEOUT_MS}ms 超时")
 
 if _BP.exists():
     _BP.unlink()
-print("=== 2. 自带 Chromium 不存在 → 回退 Edge(原有行为保持) ===")
-pw = FakePW({None: MISSING_ERR, "msedge": "OK_EDGE"})
+print(f"=== 2. 前两个候选都缺失 → 落到最后一个({LBL(D2)}) ===")
+pw = FakePW({D0: MISSING_ERR, D1: MISSING_ERR, D2: "OK_LAST"})
 ctx = TB.launch_browser(pw, "/tmp/prof")
-assert ctx["ctx"] == "msedge"
-print(f"  ✓ 回退成功")
+assert ctx["ctx"] == D2, ctx
+tried = [c["channel"] for c in pw.chromium.calls]
+assert tried == [D0, D1, D2], tried
+print(f"  ✓ 尝遍 {[LBL(c) for c in tried]} 后成功")
 
 if _BP.exists():
     _BP.unlink()
 print("=== 3. 全部候选都失败 → 报错含可操作建议 + 原始 Call log 片段 ===")
-pw = FakePW({None: TIMEOUT_ERR, "msedge": TIMEOUT_ERR, "chrome": TIMEOUT_ERR})
+pw = FakePW({D0: TIMEOUT_ERR, D1: TIMEOUT_ERR, D2: TIMEOUT_ERR})
 try:
     TB.launch_browser(pw, "/tmp/prof")
     raise AssertionError("应当抛错")
@@ -93,13 +103,25 @@ if _BP.exists():
 print("=== 4. profile 锁这类非浏览器缺失错误 → 不盲目回退, 原样抛出 ===")
 lock = RuntimeError("ProcessSingleton: user data directory is already in use, "
                     "please close the browser and try again")
-pw = FakePW({None: lock, "msedge": "OK_EDGE"})
+pw = FakePW({D0: lock, D1: "OK_SECOND"})
 try:
     TB.launch_browser(pw, "/tmp/prof")
-    raise AssertionError("应原样抛出, 不换成 Edge(换了也解不了 profile 冲突)")
+    raise AssertionError("应原样抛出, 不换候选(换了也解不了 profile 冲突)")
 except RuntimeError as e:
     assert "already in use" in str(e), str(e)[:120]
     assert len(pw.chromium.calls) == 1, f"不该继续尝试其他候选: {pw.chromium.calls}"
-    print(f"  ✓ 只尝试 1 次即抛出(未掩盖真因)")
+    print("  ✓ 只尝试 1 次即抛出(未掩盖真因)")
+
+if _BP.exists():
+    _BP.unlink()
+print("=== 5. 记忆自洽: 第二个候选成功后, 下次它排最前(不再白试第一个) ===")
+beh = {D0: MISSING_ERR, D1: "OK_SECOND", D2: "OK_LAST"}
+pw = FakePW(beh)
+TB.launch_browser(pw, "/tmp/prof")
+pw2 = FakePW(beh)
+TB.launch_browser(pw2, "/tmp/prof")
+assert pw2.chromium.calls[0]["channel"] == D1, f"第二次应直接用上次成功的候选: {pw2.chromium.calls}"
+print(f"  第1次 [{[LBL(c['channel']) for c in pw.chromium.calls]}] → "
+      f"第2次 [{[LBL(c['channel']) for c in pw2.chromium.calls]}]（直接命中）")
 
 print("\n✅ 浏览器启动回退测试全部通过")

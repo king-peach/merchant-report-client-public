@@ -727,6 +727,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                     if platform == "meituan_gj" and _sid_map:
                         a.id_by_name = _sid_map      # 切店按机构编码搜索直选用
                         sink.log(f"🔢 切店编号映射已接线(管家): {len(_sid_map)} 家门店可用编码搜索直选")
+                    elif platform == "meituan_gj":
+                        sink.log("ℹ️ 切店编号映射为空(管家): 门店明细未配置或无编号列 → "
+                                 "切店走「展开+按名」", level="warn")
                     cred = store.get("credentials") or {}
                     ok = a.ensure_login(username=cred.get("username", ""),
                                         password=cred.get("password", ""))
@@ -736,6 +739,11 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 if _sid_map:
                     a.id_by_name = _sid_map          # 切店按 shop_id 搜索直选用
                     sink.log(f"🔢 切店编号映射已接线(淘宝): {len(_sid_map)} 家门店可用编号搜索直选")
+                else:
+                    # 2026-10-13: 为空多半=门店明细未配置/编号列缺失/店名对不上 —— 说出来,
+                    # 免得用户看"切店没走搜ID"时无从下手。
+                    sink.log("ℹ️ 切店编号映射为空(淘宝): 门店明细未配置或无编号列 → 切店走「展开+按名」",
+                             level="warn")
                 if not a._logged_in():
                     plat_cfg = (cfg.get("platforms") or {}).get("taobao") or {}
                     u = plat_cfg.get("username") or ""

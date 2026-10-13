@@ -45,9 +45,10 @@ TIMEOUT = RuntimeError("BrowserType.launch_persistent_context: Timeout 90000ms e
                        "Call log:\n- <launching> ...\\ms-playwright\\chromium\\chrome.exe")
 MISSING = RuntimeError("Executable doesn't exist at .../ms-playwright/chromium-1200/...")
 
-print("=== 1. 无记忆 → 默认顺序(自带 Chromium 优先, 与 macOS 一致) ===")
+print("=== 1. 无记忆 → 原样返回传入的默认顺序(默认序列由调用方决定: Windows=系统优先) ===")
 assert BP.order([None, "msedge", "chrome"]) == [None, "msedge", "chrome"]
-print(f"  ✓ {BP.order([None, 'msedge', 'chrome'])}")
+assert BP.order(["chrome", "msedge", None]) == ["chrome", "msedge", None]
+print(f"  ✓ {BP.order(['chrome', 'msedge', None])}")
 
 print("=== 2. 记住 Chrome 可用后 → Chrome 排最前, 自带 Chromium 排最后 ===")
 BP.remember_ok("chrome")
@@ -79,18 +80,20 @@ assert BP.preferred() is None and BP.bundled_broken() is False
 assert BP.order([None, "msedge", "chrome"])[0] is None
 print(f"  ✓ 记忆已清, 回到默认顺序")
 
-print("=== 6. 端到端: 首次白等一次, 之后直接命中可用的浏览器 ===")
+print("=== 6. 端到端: 首次按默认序列试探, 之后直接命中可用的浏览器 ===")
 _TMP.unlink()
-beh = {None: TIMEOUT, "msedge": MISSING, "chrome": "OK"}
+import os as _os
+D0, D1, D2 = (["chrome", "msedge", None] if _os.name == "nt" else [None, "msedge", "chrome"])
+beh = {D0: MISSING, D1: "OK_MID", D2: TIMEOUT}
 pw = FakePW(beh)
 ctx = TB.launch_browser(pw, "/tmp/prof")
-assert ctx == {"ctx": "chrome"}, ctx
+assert ctx == {"ctx": D1}, ctx
 first = list(pw.chromium.calls)
-assert first == [None, "msedge", "chrome"], first
+assert first == [D0, D1], first
 pw2 = FakePW(beh)
 TB.launch_browser(pw2, "/tmp/prof")
-assert pw2.chromium.calls[0] == "chrome", f"第二次应直接用 Chrome: {pw2.chromium.calls}"
-print(f"  第1次尝试 {first}（有一次超时代价）→ 第2次 {pw2.chromium.calls}（直接命中）")
+assert pw2.chromium.calls[0] == D1, f"第二次应直接用 {D1}: {pw2.chromium.calls}"
+print(f"  第1次尝试 {first} → 第2次 {pw2.chromium.calls}（直接命中）")
 
 print("=== 7. 自检失败记忆 + 24h 冷却(不每次白等) ===")
 _TMP.unlink()

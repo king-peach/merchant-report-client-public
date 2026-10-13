@@ -141,8 +141,11 @@ def _build_proc_table_ps(profile=""):
     命令行**就包含这条查询** —— 不排除自身时每次探测都把自己快照进表:
       · _profile_process_pids 永远看到 1 个"未退出" → 等释放每轮白等满超时(12+8s);
       · 日志每轮出现"仍有 1 个未退出, 已尽量等待"+"未能清掉"告警(实为探针自身幽灵)。
-    修复: 服务端 `-ne $PID` 排除自身(与其他几处探测的 guard 保持一致)。"""
-    flt = "$_.ProcessId -ne $PID -and ($_.Name -match 'chrome|msedge|chromium'"
+    修复: 服务端 `-ne $PID` 排除自身(与其他几处探测的 guard 保持一致)。
+    2026-10-13 再改: 家族判定改为前缀匹配 + 排除 msedgewebview2.exe(系统组件的 WebView,
+    非浏览器); 并增出 Name 字段供调用方做"浏览器家族"精确判定(客户机排查报告)。"""
+    fam = "$_.Name -match '^(chrome|msedge|chromium)' -and $_.Name -notmatch 'msedgewebview2'"
+    flt = f"$_.ProcessId -ne $PID -and ({fam}"
     if profile:
         esc = str(profile).replace("'", "''")
         flt += f" -or $_.CommandLine -like '*{esc}*'"
@@ -150,13 +153,13 @@ def _build_proc_table_ps(profile=""):
     return ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
             "$tbl = @(Get-CimInstance Win32_Process | "
             f"Where-Object {{ {flt} }} | "
-            "Select-Object ProcessId,ParentProcessId,CommandLine); "
+            "Select-Object ProcessId,ParentProcessId,Name,CommandLine); "
             "Write-Output '__TBL_OK__'; "
             "$tbl | ConvertTo-Json -Compress")
 
 
 def _parse_proc_table(raw):
-    """PowerShell 输出字节 → [(pid, ppid, cmdline)]; 不可解析/静默失败 → None。纯函数。"""
+    """PowerShell 输出字节 → [(pid, ppid, name, cmdline)]; 不可解析/静默失败 → None。纯函数。"""
     text = _ps_text(raw)
     if "__TBL_OK__" not in text:
         return None                      # 没有哨兵 = 查询没正常产出 → 判"探测不可用"
@@ -175,7 +178,7 @@ def _parse_proc_table(raw):
     for d in data:
         try:
             out.append((int(d.get("ProcessId") or 0), int(d.get("ParentProcessId") or 0),
-                        str(d.get("CommandLine") or "")))
+                        str(d.get("Name") or ""), str(d.get("CommandLine") or "")))
         except Exception:
             continue
     return out
@@ -194,18 +197,34 @@ def _win_process_table(profile=""):
     return _parse_proc_table(raw)
 
 
+def _is_browser_proc_name(name):
+    """进程名是否浏览器家族(chrome/msedge/chromium 前缀; 如 chrome.exe/chrome_crashpad_handler.exe)。
+
+    msedgewebview2 永远不是我们的浏览器 —— 它是系统组件(SearchHost/UU远程/界面壳)的
+    WebView(2026-10-13 客户机排查报告点名排除)。"""
+    n = str(name or "").lower().strip()
+    if n.endswith(".exe"):
+        n = n[:-4]
+    if n.startswith("msedgewebview2"):
+        return False
+    return n.startswith(("chrome", "msedge", "chromium"))
+
+
 def select_profile_kill_pids(procs, profile):
-    """从进程表选出「命令行含 profile 的进程 + 它们的全部后代」pid 列表(纯函数)。
+    """从进程表选出「**浏览器家族且**命令行含 profile 的进程 + 它们的全部后代」pid 列表(纯函数)。
 
     为什么要带后代: Chromium 是多进程(renderer/gpu/crashpad), 子进程命令行里可能不带
     profile 路径 → 只杀顶层会把孤儿留给下一轮, 新一轮启动就会被残留占着。
-    2026-10-12 客户机"重开连死"事件: 与"杀完不等退出"叠加才放大成连续死亡。"""
+    为什么必须带家族判定(2026-10-13 客户机排查报告, 实测两次误杀): 此前只按"命令行含
+    profile"匹配 —— 对照实验的测试运行器/bash 命令行里恰好带了该路径, 被本应用静默杀掉。
+    非浏览器进程哪怕命令行含 profile 也**绝不动**; 后代例外(浏览器自己的子孙才算数)。"""
     prof = str(profile).lower()
-    kill = {p for p, _pp, cmd in procs if prof in str(cmd).lower()}
+    kill = {p for p, _pp, name, cmd in procs
+            if prof in str(cmd).lower() and _is_browser_proc_name(name)}
     changed = True
     while changed:
         changed = False
-        for p, pp, _cmd in procs:
+        for p, pp, _name, _cmd in procs:
             if p not in kill and pp in kill:
                 kill.add(p)
                 changed = True
@@ -218,7 +237,8 @@ def _profile_process_pids(profile):
         table = _win_process_table(profile)
         if table is None:
             return None
-        return [p for p, _pp, cmd in table if str(profile).lower() in str(cmd).lower()]
+        return [p for p, _pp, name, cmd in table
+                if str(profile).lower() in str(cmd).lower() and _is_browser_proc_name(name)]
     try:
         out = subprocess.run(["pgrep", "-f", str(profile)], capture_output=True, text=True,
                              timeout=5).stdout
@@ -283,11 +303,11 @@ def _msplaywright_sweep_ps():
 
 
 def _survivor_lines(rows, limit=3):
-    """清理后仍占用 profile 的进程 → 日志短行列表(纯函数便于单测)。rows: [(pid, ppid, cmd)]"""
+    """清理后仍占用 profile 的进程 → 日志短行列表(纯函数便于单测)。rows: [(pid, ppid, name, cmd)]"""
     out = []
     for r in list(rows or [])[:limit]:
         try:
-            out.append(f"↳ 仍占用: pid={int(r[0])} {str(r[2])[:120]}")
+            out.append(f"↳ 仍占用: pid={int(r[0])} {str(r[3])[:120]}")
         except Exception:
             continue
     return out
@@ -303,7 +323,7 @@ def pick_profile_rows(rows, profile, limit=None):
     out = []
     for r in (rows or []):
         try:
-            if prof and prof in str(r[2]).lower():
+            if prof and prof in str(r[3]).lower() and _is_browser_proc_name(r[2]):
                 out.append(r)
         except Exception:
             continue
@@ -356,8 +376,11 @@ def _cleanup_stale_browser(profile_dir, sink=None):
             else:
                 # 进程表探测失败 → 退回"按命令行直接杀"兜底; 杀完同样要等释放(见下)
                 esc = prof.replace("'", "''")
+                # 家族限定(2026-10-13 报告: 纯"命令行含 profile"匹配会误杀测试运行器/bash)
                 ps = ("Get-CimInstance Win32_Process "
-                      f"| Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{esc}*' }} "
+                      f"| Where-Object {{ $_.ProcessId -ne $PID -and "
+                      f"$_.Name -match '^(chrome|msedge|chromium)' -and $_.Name -notmatch 'msedgewebview2' -and "
+                      f"$_.CommandLine -like '*{esc}*' }} "
                       "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
                 subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                                capture_output=True, text=True, timeout=25)
@@ -414,11 +437,25 @@ def _cleanup_stale_browser(profile_dir, sink=None):
         return False
 
 
+# 下载暂存目录(2026-10-13): launch 时设为用户数据目录同级的 down_stage/。
+# 客户机实证: 下载**已完成**后浏览器才断开 → save_as 报 "Target closed" 取不回文件;
+# downloads_path 让浏览器把完成文件直接写进这里, 之后纯文件系统"捡回", 与连接无关。
+DOWNLOAD_STAGE = ""
+
+
 def _launch_persistent(pw, profile_dir, args, exclude, channel=None, timeout_ms=LAUNCH_TIMEOUT_MS):
-    kw = dict(headless=False, args=args, ignore_default_args=exclude,
-              viewport=None, accept_downloads=True, timeout=timeout_ms)
+    kw: dict = dict(headless=False, args=args, ignore_default_args=exclude,
+                    viewport=None, accept_downloads=True, timeout=timeout_ms)
     if channel:
         kw["channel"] = channel
+    global DOWNLOAD_STAGE
+    try:
+        _stage = Path(profile_dir).parent / "down_stage"
+        _stage.mkdir(parents=True, exist_ok=True)
+        kw["downloads_path"] = str(_stage)
+        DOWNLOAD_STAGE = str(_stage)
+    except Exception:
+        DOWNLOAD_STAGE = ""
     return pw.chromium.launch_persistent_context(str(profile_dir), **kw)
 
 
@@ -471,18 +508,23 @@ def watch_browser(browser, sink):
         return False
 
 
-def format_browser_diag(when, err_text, profile, procs, events, platform_name):
-    """组装浏览器死亡取证文本(纯函数, 单测直接喂合成数据)。"""
+def format_browser_diag(when, err_text, profile, procs, events, platform_name, dumps=None):
+    """组装浏览器死亡取证文本(纯函数, 单测直接喂合成数据)。
+
+    2026-10-13 客户机排查报告修正判词: Chromium 自带崩溃处理器会吞掉异常 → WER 可能
+    **不记** Application Error 条目, 但 Crashpad 有 dump。所以"无事件条目"绝不能单独
+    作为"被外部结束"的判据 —— 必须把 dump 一起看。"""
     lines = [f"[浏览器死亡现场] {when} ({platform_name})",
              f"错误: {str(err_text)[:600]}",
              f"profile: {profile}",
              "",
-             "---- 相关进程(chrome/msedge/chromium; pid / 父pid / 启动时间 / 命令行) ----"]
+             "---- 相关进程(chrome/msedge/chromium; pid / 父pid / 进程名 / 命令行) ----"]
     rows = [r for r in (procs or [])
-            if any(k in str(r[3]).lower() for k in ("chrome", "msedge", "chromium"))]
+            if any(k in (str(r[2]) + " " + str(r[3])).lower()
+                   for k in ("chrome", "msedge", "chromium"))]
     if rows:
-        for pid, ppid, start, cmd in rows[:30]:
-            lines.append(f"pid={pid} ppid={ppid} start={start} cmd={str(cmd)[:220]}")
+        for pid, ppid, name, cmd in rows[:30]:
+            lines.append(f"pid={pid} ppid={ppid} name={name} cmd={str(cmd)[:220]}")
     else:
         lines.append("(无相关进程存活)")
     lines += ["", "---- Application 错误事件(近30分钟, 消息含 chrome/msedge) ----"]
@@ -492,8 +534,16 @@ def format_browser_diag(when, err_text, profile, procs, events, platform_name):
         lines += list(events[:15])
     else:
         lines.append("(无崩溃事件记录 —— Application 日志无 chrome/msedge 相关报错)")
-    lines += ["", "说明: 有 Application Error 条目=浏览器自身崩溃(看 faulting module); "
-                  "无条目但进程消失=被外部结束(安全软件/系统/手动)。本文件由客户端自动生成。"]
+    lines += ["", "---- Crashpad 崩溃转储(近60分钟; 进程内崩溃的直接证据) ----"]
+    if dumps:
+        lines.append(f"发现 {len(dumps)} 个 dump —— 判定：浏览器**进程内崩溃**"
+                     f"(最新 {dumps[0][0]}, {dumps[0][1]} 分钟前; 无符号也可读异常码/模块/RVA)")
+        for _fn, _age in dumps[:6]:
+            lines.append(f"  · {_fn} ({_age} 分钟前)")
+    else:
+        lines.append("(无近期 dump)")
+    lines += ["", "说明: ①有 Application Error 条目 **或** 有 Crashpad dump=浏览器自身崩溃(进程内); "
+                  "②两者皆无但进程消失=被外部结束(安全软件/系统/手动)。本文件由客户端自动生成。"]
     return "\n".join(lines)
 
 
@@ -511,8 +561,9 @@ def browser_death_forensics(profile_dir, out_dir, err_text=""):
             ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
                   "Get-CimInstance Win32_Process | "
                   f"Where-Object {{ $_.ProcessId -ne $PID -and "
-                  f"($_.Name -match 'chrome|msedge|chromium' -or $_.CommandLine -like '*{esc}*') }} | "
-                  "Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine | ConvertTo-Json -Compress")
+                  f"(($_.Name -match '^(chrome|msedge|chromium)' -and $_.Name -notmatch 'msedgewebview2') "
+                  f"-or $_.CommandLine -like '*{esc}*') }} | "
+                  "Select-Object ProcessId,ParentProcessId,Name,CreationDate,CommandLine | ConvertTo-Json -Compress")
             raw = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                                  capture_output=True, timeout=60).stdout
             text = _ps_text(raw)
@@ -520,7 +571,7 @@ def browser_death_forensics(profile_dir, out_dir, err_text=""):
             if isinstance(data, dict):
                 data = [data]
             procs = [(int(d.get("ProcessId") or 0), int(d.get("ParentProcessId") or 0),
-                      str(d.get("CreationDate") or ""), str(d.get("CommandLine") or ""))
+                      str(d.get("Name") or ""), str(d.get("CommandLine") or ""))
                      for d in data]
         except Exception:
             procs = []
@@ -528,7 +579,7 @@ def browser_death_forensics(profile_dir, out_dir, err_text=""):
             try:
                 _tbl = _win_process_table(str(profile_dir)) or []
                 if _tbl:
-                    procs = [(p, pp, "", c) for p, pp, c in _tbl]
+                    procs = [(p, pp, n, c) for p, pp, n, c in _tbl]
             except Exception:
                 pass
         try:
@@ -555,11 +606,27 @@ def browser_death_forensics(profile_dir, out_dir, err_text=""):
             procs = [(0, 0, "", ln) for ln in out.splitlines()] if out else []
         except Exception:
             pass
+    # Crashpad 转储(2026-10-13 报告: Chromium 自带崩溃处理器会吞掉异常, WER 可能不记 1000 事件
+    # —— "无事件条目"绝不能单独当"被外部结束"的判据; 有 dump 即进程内崩溃)
+    dumps = []
+    try:
+        import glob as _g
+        _now = time.time()
+        for _p in _g.glob(os.path.join(str(profile_dir), "Crashpad", "reports", "*.dmp")):
+            try:
+                _age = (_now - os.path.getmtime(_p)) / 60.0
+            except Exception:
+                continue
+            if _age <= 60:
+                dumps.append((os.path.basename(_p), round(_age, 1)))
+        dumps.sort(key=lambda x: x[1])
+    except Exception:
+        dumps = []
     try:
         path = Path(out_dir) / (f"browser_diag_"
                                 f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         path.write_text(format_browser_diag(when, err_text, str(profile_dir), procs, events,
-                                            "Windows" if os.name == "nt" else "posix"),
+                                            "Windows" if os.name == "nt" else "posix", dumps=dumps),
                         encoding="utf-8")
         return str(path)
     except Exception:
@@ -573,11 +640,12 @@ FALLBACK_MARKS = ("executable doesn't exist", "failed to launch", "channel", "no
 
 def launch_browser(pw, profile_dir, prefer=None, sink=None):
     """Playwright 启动 Chromium 系浏览器(持久 profile + 剔除自动化痕迹参数)。
-    候选顺序 = **本机记忆**优先(见 browser_pref): 
+    候选顺序 = 默认序列 + **本机记忆**优先(见 browser_pref):
+      - 2026-10-13 起 Windows 默认 = **系统浏览器优先**(chrome → msedge → 自带 Chromium,
+        客户机报告: 自带 153 下载环节 100% 进程内崩溃, 系统 Chrome 155 零崩溃); macOS 维持自带优先。
       - 上次成功的候选排最前(用户 VPS 上自带 Chromium 起不来、系统 Chrome 正常 → 直接记住 Chrome)
-      - 自带 Chromium 若被判过不可用则排到最后, 避免每次白等 90 秒超时
+      - 自带 Chromium 若被判过不可用则排到最后, 避免每次白等超时
     也支持环境变量 MRC_BROWSER_CHANNEL=chrome|msedge 强制指定。
-    macOS 上实测自带 Chromium 可用(滑块能过), 默认顺序不变。
     sink: 可选事件出口 —— 清理被跳过(双开/探测不可用)时把提示给用户看到(见 _cleanup_stale_browser)。"""
     _cleanup_stale_browser(profile_dir, sink=sink)
     args = [
@@ -593,7 +661,11 @@ def launch_browser(pw, profile_dir, prefer=None, sink=None):
     ]
     from ..browser_pref import order as _order, remember_ok
     forced = prefer or os.environ.get("MRC_BROWSER_CHANNEL") or None
-    order = _order([None, "msedge", "chrome"], forced=forced)
+    # 2026-10-13 客户机排查报告(Windows): 自带 Chromium 153 在"下载报表"环节 100% 进程内
+    # 崩溃(Crashpad dump 铁证, RVA 恒定); 系统 Chrome 155 同机同流程 0/6 崩溃、完整任务
+    # 跑通。→ Windows 默认改为**系统浏览器优先**(自带只做兜底); macOS 维持自带优先。
+    _default = ["chrome", "msedge", None] if os.name == "nt" else [None, "msedge", "chrome"]
+    order = _order(_default, forced=forced)
     errs = []
     for ch in order:
         try:
@@ -899,14 +971,24 @@ class TaobaoAdapter:
             self._ensure_day_mode(f)                    # 按月模式 → 切回按天(月选择器写不了具体日期)
             self._set_range_via_calendar(f, date_from, date_to)
             got = [x["v"] for x in self._date_inputs(f)][:2]
+            self.sink.log(f"📅 日历点选后页面显示 {got[:2]}")
         if got[:2] != [date_from, date_to]:             # 最后一层兜底: 键盘输入
             self.sink.log(f"📅 日历点选未一次到位(页面 {got[:2]}), 再用键盘输入补试")
             self._type_dates(f, date_from, date_to)
             got = [x["v"] for x in self._date_inputs(f)][:2]
+            self.sink.log(f"📅 键盘补试后页面显示 {got[:2]}")
         if got[:2] != [date_from, date_to]:
             raise RuntimeError(
                 f"下载页日期区间设置未生效: 期望 {date_from}~{date_to}, 页面实际 {got[:2]}"
                 f"（已中止，避免下载到别的区间的报表、把别的日期数据填进模板）")
+        # 双读兜底(2026-10-13 客户机排查报告提示"确认值与页面实际值不一致"风险): 隔 0.5s
+        # 再读一次 —— 抓"写入瞬间被看到、随后组件 state 又复位"的假确认。
+        time.sleep(0.5)
+        got2 = [x["v"] for x in self._date_inputs(f)][:2]
+        if got2[:2] != got[:2]:
+            raise RuntimeError(
+                f"下载页日期区间回读不一致: 首次 {got[:2]} → 0.5s 后 {got2[:2]}"
+                f"（已中止，避免下载到别的区间的报表）")
         self.sink.log(f"📅 下载区间已确认 = {got[0]} ~ {got[1]}")
         return 2
 
@@ -1000,6 +1082,15 @@ class TaobaoAdapter:
         # —— 新版 Chrome(152+) 会拒绝/忽略我们直接发的这个 CDP 调用, 症状是文件下到别处、
         #   我们永远等不到文件 → "下载报表没有拿到数据")。
         dl_dir = Path(ddir)
+        # 暂存目录清场(单实例运行: 此刻里面任何文件都是上一轮的残留, 防误捡旧文件)
+        try:
+            if DOWNLOAD_STAGE and os.path.isdir(DOWNLOAD_STAGE):
+                for _fn in os.listdir(DOWNLOAD_STAGE):
+                    _p = os.path.join(DOWNLOAD_STAGE, _fn)
+                    if os.path.isfile(_p):
+                        os.unlink(_p)
+        except Exception:
+            pass
         self._dl_events = 0   # 收到几次下载事件(诊断: 0=浏览器侧根本没触发下载)
         try:
             self.ctx.on("download", self._on_download(dl_dir))
@@ -1252,6 +1343,140 @@ class TaobaoAdapter:
             self.sink.log(f"💾 已保存下载: {target.name} ({size // 1024}KB)")
         except Exception as e:
             self.sink.log(f"⚠️ 下载保存失败: {str(e)[:90]}", level="warn")
+            # 2026-10-13 客户机实证(下载**已完成**后浏览器才断开, save_as 报 Target closed):
+            # 文件其实完好落在 downloads_path 暂存目录 → 纯文件系统捡回, 不依赖连接。
+            try:
+                nm = ""
+                try:
+                    nm = d.suggested_filename or ""
+                except Exception:
+                    pass
+                got = self._pickup_staged(dl_dir, nm)
+                if got:
+                    t2 = Path(dl_dir) / got
+                    size2 = t2.stat().st_size
+                    t2 = self._rename_canonical(t2)
+                    self.sink.log(f"💾 已从下载暂存目录捡回: {t2.name} "
+                                  f"({size2 // 1024}KB)｜浏览器断开不影响", level="warn")
+            except Exception as e2:
+                self.sink.log(f"⚠️ 暂存目录捡回失败: {str(e2)[:80]}", level="warn")
+
+    def _pickup_staged(self, dl_dir, name="", timeout_s=40):
+        """等暂存目录里目标文件写完, 搬进 dl_dir; 返回搬入的文件名(失败返回空串)。
+
+        不碰浏览器/连接 —— save_as 撞上"浏览器已断开"之后走的就是这里。
+        采样大小连续两次不变(且≥1KB)才搬, 防止搬走还在写入的半成品。
+        """
+        stage = DOWNLOAD_STAGE
+        if not stage or not os.path.isdir(stage):
+            return ""
+        want = os.path.basename(str(name or ""))
+        stem = os.path.splitext(want)[0] if want else ""
+        end = time.time() + max(3, int(timeout_s))
+        last, last_sz, stable = "", -1, 0
+        while time.time() < end:
+            try:
+                fs = [os.path.join(stage, fn) for fn in os.listdir(stage)
+                      if not fn.startswith(".") and os.path.isfile(os.path.join(stage, fn))]
+            except Exception:
+                fs = []
+            pick = ""
+            for p in fs:
+                b = os.path.basename(p)
+                if want and b != want and (not stem or stem not in b):
+                    continue
+                try:
+                    if not pick or os.path.getmtime(p) > os.path.getmtime(pick):
+                        pick = p
+                except Exception:
+                    continue
+            if pick:
+                try:
+                    sz = os.path.getsize(pick)
+                except Exception:
+                    sz = -1
+                if pick == last and sz == last_sz and sz >= 1024:
+                    stable += 1
+                else:
+                    stable = 0
+                last, last_sz = pick, sz
+                if stable >= 1:
+                    base = os.path.basename(pick)
+                    s2, suf = os.path.splitext(base)
+                    dst = os.path.join(dl_dir, base)
+                    i = 1
+                    while os.path.exists(dst):
+                        dst = os.path.join(dl_dir, f"{s2}_{i}{suf}")
+                        i += 1
+                    try:
+                        os.replace(pick, dst)
+                        return os.path.basename(dst)
+                    except Exception:
+                        try:
+                            shutil.copy2(pick, dst)
+                            os.unlink(pick)
+                            return os.path.basename(dst)
+                        except Exception:
+                            pass
+            time.sleep(1.0)
+        return ""
+
+    def _sweep_staged(self, ddir, min_age_s=8):
+        """把暂存目录里"已写完且静置过"的报告文件搬进 ddir; 返回搬入的文件名列表。
+
+        2026-10-13 客户机实证补救链: 下载完成后浏览器断开 → save_as 取不回文件, 但文件
+        完好落在 downloads_path 暂存目录。双采样(≈1s)大小不变 + mtime 冷却 双闸防半成品;
+        跨卷时 os.replace 会失败 → 退化为"复制+删源"; 文件仍被占住 → 本轮跳过下轮再试。
+        """
+        stage = DOWNLOAD_STAGE
+        if not stage or not os.path.isdir(stage):
+            return []
+        try:
+            cands = [os.path.join(stage, fn) for fn in os.listdir(stage)
+                     if not fn.startswith(".") and os.path.isfile(os.path.join(stage, fn))]
+        except Exception:
+            return []
+        if not cands:
+            return []
+        snap = {}
+        for p in cands:
+            try:
+                snap[p] = os.path.getsize(p)
+            except Exception:
+                pass
+        if snap:
+            time.sleep(1.0)
+        moved = []
+        for p, s1 in snap.items():
+            try:
+                s2 = os.path.getsize(p)
+                age = time.time() - os.path.getmtime(p)
+            except Exception:
+                continue
+            if s2 != s1 or s2 < 1024 or age < float(min_age_s):
+                continue
+            base = os.path.basename(p)
+            stem, suf = os.path.splitext(base)
+            dst = os.path.join(ddir, base)
+            i = 1
+            while os.path.exists(dst):
+                dst = os.path.join(ddir, f"{stem}_{i}{suf}")
+                i += 1
+            try:
+                os.replace(p, dst)
+            except Exception:
+                try:
+                    shutil.copy2(p, dst)
+                    os.unlink(p)
+                except Exception:
+                    try:
+                        if os.path.exists(dst) and os.path.getsize(dst) != s2:
+                            os.unlink(dst)
+                    except Exception:
+                        pass
+                    continue
+            moved.append(os.path.basename(dst))
+        return moved
 
     def _rename_canonical(self, target):
         """按**内容表头签名**把下载文件改成规范名 淘宝_{类型}_{实际区间}_{平台原名}。
@@ -1376,6 +1601,12 @@ class TaobaoAdapter:
         self.sink.step_start("download", "下载报表", f"任务已提交, 等待生成(期望{need}份)")
         while time.time() < end:
             time.sleep(4)
+            # 暂存目录实时搬运: 下载完成但 save_as 撞上"浏览器断开"时文件会留在这里;
+            # 纯文件系统操作, 与连接无关(2026-10-13 客户机实证的补救链)。
+            try:
+                self._sweep_staged(ddir)
+            except Exception:
+                pass
             new = [x for x in set(os.listdir(ddir)) - before
                    if x.endswith(".xlsx") and not x.startswith(".")]
             got = new
@@ -1420,6 +1651,19 @@ class TaobaoAdapter:
         #    时就是靠这个数字区分「平台慢」还是「我们收不到」。
         # ② 去浏览器默认下载目录找回本次文件(CDP 下载行为被忽略时文件会落到那里)。
         _ev = getattr(self, "_dl_events", 0)
+        # ②a 暂存目录最后再扫两遍(刚写完的文件要等 mtime 冷却, min_age=2 快些放行)
+        _staged = []
+        try:
+            time.sleep(1.5)
+            _staged = self._sweep_staged(ddir, min_age_s=2)
+            if not _staged:
+                time.sleep(3.0)
+                _staged = self._sweep_staged(ddir, min_age_s=2)
+        except Exception:
+            _staged = []
+        if _staged:
+            self.sink.log("♻️ 已从下载暂存目录搬回本次文件: " + "、".join(_staged), level="warn")
+            return _staged
         try:
             _stray = self._recover_stray_downloads(ddir)
         except Exception:
@@ -1665,6 +1909,12 @@ class TaobaoAdapter:
             self.switch_timer = ShopSwitchTimer()   # 兜底: 老测试用 __new__ 造适配器
         t0 = time.time()
         tid = self._id_for(name)
+        if not tid and not getattr(self, "_idmiss_noted", False):
+            # 2026-10-13 用户报"切店逻辑没生效"时最大的盲区: 没有编号是**静默**跳过快路径的,
+            # 日志里看不出"为什么没用搜ID"。首次出现说清楚(只记一次, 不刷屏)。
+            self._idmiss_noted = True
+            self.sink.log("ℹ️ 切店: 本次没拿到门店编号(门店明细未配置/该店无编号/店名对不上) → "
+                          "「搜索ID直选」跳过, 走「展开+按名」; 若应启用请检查 门店明细 的编号列与店名")
         if tid:
             sid = self._switch_by_id(page, name, tid)
             if sid:
@@ -1708,11 +1958,15 @@ class TaobaoAdapter:
         """
         cands = [
             f"{self.SHOP_SWITCHER} input[placeholder*='搜索']",
+            f"{self.SHOP_SWITCHER} input[placeholder*='店铺']",
             f"{self.SHOP_SWITCHER} input[placeholder*='门店']",
             f"{self.SHOP_SWITCHER} [class*=search] input",
             "#shopSwitcher input",
+            # 2026-10-13 用户真机截图实证: 弹层搜索框 placeholder = 「搜索店铺名称/ID」。
+            # 弹层可能渲染在 #shopSwitcher 之外(portal) → 下面两条按全页可见框兜底探测。
+            "input[placeholder*='搜索店铺名称/ID']",
+            "input[placeholder*='搜索店铺']",
             "input[placeholder*='搜索门店']",
-            "input[placeholder*='搜索门店名']",
         ]
         for sel in cands:
             try:

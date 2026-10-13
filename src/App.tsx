@@ -298,48 +298,25 @@ export default function App() {
     }
   }
 
-  // 一键跑所有平台: 依次 淘宝闪购 → 美团 → 美团管家 → 京东(各用各自在设置里配的模板)
-  // 队列改由《门店明细》驱动(2026-10-12): 明细里有门店数据的平台才跑/才需要模板 ——
-  // 真实样例表只有 淘宝/美团/管家(没有京东), 旧实现却要求 4 个平台全配模板才允许开跑。
-  // 探测交给壳(内核 openpyxl 读 xlsx, 见 read_store_platforms); 未配置/探测失败 → 回退旧行为。
+  // 一键跑所有平台: 依次 淘宝闪购 → 美团 → 美团管家 → 京东 —— **4 个平台全跑**(2026-10-13 用户口径:
+  // "所有平台都要跑的")。《门店明细》**不决定队列**, 只决定**切店方式**: 明细里有编号的平台 →
+  // 切店走「搜索ID直选」; 没有的(如京东) → 按之前的逻辑处理(逐层展开+按名)。各平台日志会写明方式。
+  // 预检: 全部平台都要跑 → 4 个平台都必须先在「设置 → 商家管理」配好各自的模板。
   const PLATFORM_ORDER = ["taobao", "meituan", "meituan_gj", "jd"];
   async function startAll() {
     if (!merchant) return;
-    const storeDetails = (merchant as any)?.store_details ?? "";
-    let order = PLATFORM_ORDER;
-    let note = "ℹ️ 未配置门店明细 → 和以前一样跑全部 4 个平台";
-    if (isTauri && storeDetails) {
-      try {
-        const plats = await invoke("read_store_platforms", { storeDetails });
-        if (Array.isArray(plats) && plats.length) {
-          order = PLATFORM_ORDER.filter((p) => plats.includes(p));
-          note = `📋 门店明细里有门店数据的平台: ${order.map((p) => PLATFORM_LABEL[p] ?? p).join("、")}`;
-        } else {
-          note = "⚠️ 门店明细里没读到任何有数据的平台 → 回退为全部 4 个平台";
-        }
-      } catch (e) {
-        note = `⚠️ 读取门店明细平台失败(${String(e).slice(0, 60)}) → 回退为全部 4 个平台`;
-      }
-    } else if (!storeDetails) {
-      note = "ℹ️ 未配置门店明细 → 和以前一样跑全部 4 个平台";
-    } else {
-      note = "ℹ️ 浏览器 dev 模式无法调用内核探测 → 回退为全部 4 个平台";
-    }
-    // 预检只看**队列内**平台: 明细里有数据的平台就必须要模板, 其余平台没数据也就不用配
+    const order = PLATFORM_ORDER;
     const missing = order.filter((p) => !(merchant as any)?.[p]?.template);
     if (missing.length) {
-      setLogs(order === PLATFORM_ORDER
-        ? [`❌ 一键跑所有平台前，请先在「设置 → 商家管理」为这些平台各选一个模板：`
-          + missing.map((p) => PLATFORM_LABEL[p] ?? p).join("、")]
-        : [`❌ 门店明细里有这些平台的门店数据，但还没为它配置模板；请到「设置 → 商家管理」配置：`
-          + missing.map((p) => PLATFORM_LABEL[p] ?? p).join("、")]);
+      setLogs([`❌ 一键跑所有平台前，请先在「设置 → 商家管理」为这些平台各选一个模板：`
+        + missing.map((p) => PLATFORM_LABEL[p] ?? p).join("、")]);
       return;
     }
     allQueue.current = order.slice(1);
     allTotal.current = order.length;
     allDone.current = 0;
     allResults.current = [];
-    setLogs([note, `▶▶ 一键跑所有平台：${order.map((p) => PLATFORM_LABEL[p] ?? p).join(" → ")}`]);
+    setLogs([`▶▶ 一键跑所有平台（4 个平台全跑）：${order.map((p) => PLATFORM_LABEL[p] ?? p).join(" → ")}`]);
     await launch(order[0], false);
   }
 
@@ -481,7 +458,7 @@ export default function App() {
                 {running ? "运行中…" : "▶ 生成日报"}
               </button>
               <button className="ghost" disabled={running} onClick={startAll}
-                      title="按门店明细中配置的平台依次跑（没配置则和以前一样跑 淘宝闪购 → 美团 → 美团管家 → 京东；某个平台失败也继续跑下一个）">
+                      title="4 个平台全跑：淘宝闪购 → 美团 → 美团管家 → 京东（切店方式自动按门店明细优化：有编号走搜索直选；某个平台失败也继续跑下一个）">
                 ▶▶ 一键跑所有平台
               </button>
               {running && <button className="ghost" onClick={abort}>终止</button>}

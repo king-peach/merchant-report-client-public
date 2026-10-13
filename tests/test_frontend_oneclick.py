@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """前端「一键跑所有平台」源码守卫(tsx 没单测框架, 用源码断言兜底)。
 
-2026-10-12 需求 A1: 队列改由《门店明细》驱动 —— 明细里有门店数据的平台才跑/才需要模板。
-真实样例表只有 淘宝/美团/管家(没有京东), 旧实现却要求 4 个平台全配模板才允许开跑。
-未配置/探测失败/浏览器 dev → 回退旧行为(原 4 平台 + 原预检)。
+2026-10-13 用户口径: **所有平台都要跑** —— 队列 = 4 个平台全跑(淘宝→美团→管家→京东)。
+《门店明细》不决定队列, 只决定**切店方式**(有编号的平台走「搜索ID直选」, 其余按旧逻辑)。
+历史: 10-12 曾按明细过滤队列(京东空组被整条滤掉 → 用户报"京东没跑"), 当日撤销。
 """
 import pathlib
 
@@ -16,20 +16,19 @@ def main():
     # 相对顺序仍是 淘宝→美团→管家→京东, 且起点=队列第一个平台(不再是写死的淘宝)
     assert 'const PLATFORM_ORDER = ["taobao", "meituan", "meituan_gj", "jd"]' in src, \
         "平台相对顺序必须保持不变"
-    assert "PLATFORM_ORDER.filter((p) => plats.includes(p))" in src, "队列=明细里有数据的平台(保序)"
+    assert "const order = PLATFORM_ORDER;" in src, "队列=全部 4 个平台(用户口径: 所有平台都要跑)"
+    assert "plats.includes" not in src, "队列不许再按门店明细过滤(明细只决定切店方式)"
+    assert "4 个平台全跑" in src, "一键日志/按钮说明要明示 4 平台全跑"
     assert "allQueue.current = order.slice(1)" in src and "await launch(order[0], false)" in src, \
         "要从队列第一个平台开始, 其余进队列"
     assert "一键模式 第" in src, "要有 第N/4 个平台的进度提示"
     assert "一键跑所有平台 · 汇总" in src, "结尾要有汇总"
     assert "allTotal.current > 0" in src and "allQueue.current.shift()" in src, "result 回调里要自动续跑下一个"
     assert "某个平台失败也继续跑下一个" in src, "失败不停(用户口径: 跑一遍看全部问题)"
-    # A1: 平台探测走壳命令(内核读 xlsx), 失败回退旧行为
-    assert 'await invoke("read_store_platforms", { storeDetails })' in src, \
-        "要调壳命令 read_store_platforms(参数名沿用 camelCase 约定)"
-    assert "门店明细里没读到任何有数据的平台" in src and "回退为全部 4 个平台" in src, \
-        "探测失败/为空要回退旧行为并日志提示"
-    assert "门店明细里有这些平台的门店数据，但还没为它配置模板" in src, "缺模板提示要指向门店明细口径"
-    assert "没配置则和以前一样" in src, "按钮 title 要说明回退行为"
+    # 明细只决定"切店方式"(有编号走搜索直选/没有走旧逻辑) —— 该能力在平台模块里(各自守卫测);
+    # 这里钉: 队列不再依赖明细探测 + 4 平台模板预检保持 + 按钮说明更新
+    assert "请先在「设置 → 商家管理」为这些平台各选一个模板" in src, "缺模板要拦下并给出路"
+    assert "切店方式自动按门店明细优化" in src, "按钮 title 要说明明细的作用范围(只管切店方式)"
     # 单平台老路径不能被破坏
     assert "async function start(skipBrowser = false)" in src, "单平台入口必须保留"
     assert 'template: tpl' in src and "(merchant as any)?.[platform]?.template" in src, "要按**各平台自己的模板**跑"

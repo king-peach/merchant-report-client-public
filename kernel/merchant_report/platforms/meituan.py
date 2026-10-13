@@ -1258,6 +1258,25 @@ class MeituanAdapter:
                     except Exception:
                         pass
             if not _heads:
+                # 2026-10-13 用户报"没有选择自定义时间, 还是默认用的昨天": 若「自定义」元素改版/找不到,
+                # 面板永远打不开 → 该店留空。加现场取证: 把日期区附近的候选控件(文案+类名)打出来,
+                # 下次一跑就能按证据适配选择器(远程没有真实 DOM 不许瞎猜)。
+                try:
+                    _c = page.evaluate("""() => {
+                      const out = [];
+                      for (const el of document.querySelectorAll(
+                          '.selector-item, [class*="selector"], [class*="datepicker"], [class*="dropdown"] span, [class*="date"]')) {
+                        const t = (el.textContent || '').trim();
+                        if (!t || t.length > 16) continue;
+                        if (!/昨|今|自定义|近|周|月|日|时间/.test(t)) continue;
+                        out.push(t + ' ⟨' + String(el.className || '').slice(0, 50) + '⟩');
+                        if (out.length >= 12) break;
+                      }
+                      return out; }""")
+                    if _c:
+                        self.sink.log(f"   🔎 日期控件候选: {_c[:10]}", level="warn")
+                except Exception:
+                    pass
                 self.sink.log("   ⚠️ 流量页「自定义」面板未能打开 → 该店商圈列留空", level="warn")
                 return False
             # ③ 翻月到目标月: 只能点**可见面板里的单月 chevron**(chevron-left/right);

@@ -27,18 +27,24 @@ from merchant_report.platforms import taobao as T   # noqa: E402
 def test_select_kill_set():
     prof = r"C:\Users\demo\AppData\Roaming\MerchantReportClient\browser-profile"
     table = [
-        (100, 1, rf'...\chrome.exe --user-data-dir="{prof}" --disable-blink-features'),
-        (101, 100, r'...\chrome.exe --type=renderer'),            # 后代, 命令行里无 profile
-        (102, 101, r'...\chrome.exe --type=utility'),             # 孙代
-        (200, 1, r'...\python.exe merchant_report.task_main'),    # 无关
-        (300, 200, r'...\cmd.exe'),                               # 无关的后代
+        (100, 1, "chrome.exe", rf'...\chrome.exe --user-data-dir="{prof}" --disable-blink-features'),
+        (101, 100, "chrome.exe", r'...\chrome.exe --type=renderer'),   # 后代, 命令行里无 profile
+        (102, 101, "chrome.exe", r'...\chrome.exe --type=utility'),    # 孙代
+        (200, 1, "python.exe", r'...\python.exe merchant_report.task_main'),   # 无关
+        (300, 200, "cmd.exe", r'...\cmd.exe'),                         # 无关的后代
+        (400, 1, "msedgewebview2.exe",
+         '--embedded-browser-webview=1 --user-data-dir="' + prof + '"'),
+        # ↑ 系统组件 WebView: 哪怕命令行出现 profile 也绝不杀(2026-10-13 客户机报告)
+        (500, 1, "powershell.exe", 'powershell -c "Get-Item ' + prof + r'\x.txt"'),
+        # ↑ 命令行含 profile 的非浏览器(对照实验的测试运行器就这样被误杀过, 实测两次)
     ]
     got = T.select_profile_kill_pids(table, prof)
     assert got == [100, 101, 102], got
     # 大小写不敏感(Windows 路径)
-    got2 = T.select_profile_kill_pids([(7, 1, 'CHROME.EXE --USER-DATA-DIR=' + prof.upper())], prof)
+    got2 = T.select_profile_kill_pids(
+        [(7, 1, "CHROME.EXE", 'CHROME.EXE --USER-DATA-DIR=' + prof.upper())], prof)
     assert got2 == [7], got2
-    print("✅ 杀进程序列: 命中顶层 + 全部后代, 不碰无关进程")
+    print("✅ 杀进程序列: 家族+profile 命中顶层与全部后代; webview/非浏览器绝不碰")
 
 
 def test_wait_profile_free():
@@ -89,8 +95,8 @@ def test_forensics_file():
 
 
 def test_format_diag_filter():
-    rows = [(1, 0, "10:00", r"C:\x\chrome.exe --type=renderer"),
-            (2, 0, "10:00", r"C:\x\notepad.exe")]
+    rows = [(1, 0, "chrome.exe", r"C:\x\chrome.exe --type=renderer"),
+            (2, 0, "notepad.exe", r"C:\x\notepad.exe")]
     txt = T.format_browser_diag("now", "err", "prof", rows, ["evt-line"], "Windows")
     assert "chrome.exe" in txt and "notepad.exe" not in txt and "evt-line" in txt
     # 空列表=查询成功但无记录; None=查询失败/未查询 → 两种判词必须分得开(2026-10-12 判读教训)
@@ -98,24 +104,33 @@ def test_format_diag_filter():
     assert "无崩溃事件记录" in t2, t2
     t3 = T.format_browser_diag("now", "err", "prof", rows, None, "Windows")
     assert "读取失败" in t3 and "无崩溃事件记录" not in t3, t3
-    print("✅ 取证格式: 只收 chrome/msedge 家族, 事件行照录; 无记录/读取失败两判词可区分")
+    # Crashpad 转储段(2026-10-13 报告: 无事件条目≠被外部结束; 有 dump 即进程内崩溃)
+    t4 = T.format_browser_diag("now", "err", "prof", rows, [], "Windows",
+                               dumps=[("abc123.dmp", 3.2)])
+    assert "进程内崩溃" in t4 and "abc123.dmp" in t4, t4[-400:]
+    t5 = T.format_browser_diag("now", "err", "prof", rows, [], "Windows")
+    assert "无近期 dump" in t5, t5[-300:]
+    print("✅ 取证格式: 家族过滤+事件判别保留; dump 有/无两判词分明")
 
 
 def test_parse_proc_table():
     import json as J
-    rows = [{"ProcessId": 100, "ParentProcessId": 1, "CommandLine": r'C:\x\chrome.exe --user-data-dir="P"'},
-            {"ProcessId": 101, "ParentProcessId": 100, "CommandLine": r'C:\x\chrome.exe --type=renderer'}]
+    rows = [{"ProcessId": 100, "ParentProcessId": 1, "Name": "chrome.exe",
+             "CommandLine": r'C:\x\chrome.exe --user-data-dir="P"'},
+            {"ProcessId": 101, "ParentProcessId": 100, "Name": "chrome.exe",
+             "CommandLine": r'C:\x\chrome.exe --type=renderer'}]
     mk = lambda body: ("__TBL_OK__\n" + body).encode("utf-8")
-    # ① utf-8 正常
+    # ① utf-8 正常(字段: pid, ppid, name, cmdline)
     got = T._parse_proc_table(mk(J.dumps(rows, ensure_ascii=False)))
-    assert got == [(100, 1, rows[0]["CommandLine"]), (101, 100, rows[1]["CommandLine"])], got
+    assert got == [(100, 1, "chrome.exe", rows[0]["CommandLine"]),
+                   (101, 100, "chrome.exe", rows[1]["CommandLine"])], got
     # ② 单对象(只有一条时 ConvertTo-Json 不套数组)
     one = T._parse_proc_table(mk(J.dumps(rows[0], ensure_ascii=False)))
-    assert one == [(100, 1, rows[0]["CommandLine"])], one
-    # ③ 中文路径 GBK 字节也要能解(中文 Windows 常见)
+    assert one == [(100, 1, "chrome.exe", rows[0]["CommandLine"])], one
+    # ③ 中文路径 GBK 字节也要能解(中文 Windows 常见); 缺 Name 字段 → ""(防御)
     gbk_rows = [{"ProcessId": 7, "ParentProcessId": 1, "CommandLine": "C:\\360壁纸\\x.exe"}]
     g = T._parse_proc_table(("__TBL_OK__\n" + J.dumps(gbk_rows, ensure_ascii=False)).encode("gbk"))
-    assert g == [(7, 1, "C:\\360壁纸\\x.exe")], g
+    assert g == [(7, 1, "", "C:\\360壁纸\\x.exe")], g
     # ④ 空结果(无匹配) → []；没有哨兵(静默失败) → None；坏 JSON → None
     assert T._parse_proc_table(mk("")) == []
     assert T._parse_proc_table(mk("null")) == []
@@ -124,7 +139,8 @@ def test_parse_proc_table():
     assert T._parse_proc_table(mk("not json {")) is None
     # ⑤ utf-16-le(无 BOM) 也要认
     u16 = ("__TBL_OK__\n" + J.dumps(rows, ensure_ascii=False)).encode("utf-16-le")
-    assert T._parse_proc_table(u16) == [(100, 1, rows[0]["CommandLine"]), (101, 100, rows[1]["CommandLine"])]
+    assert T._parse_proc_table(u16) == [(100, 1, "chrome.exe", rows[0]["CommandLine"]),
+                                        (101, 100, "chrome.exe", rows[1]["CommandLine"])]
     print("✅ 进程表解析: utf-8/gbk/utf-16 + 空/单条/静默失败/坏JSON 全对")
 
 
@@ -148,10 +164,10 @@ def test_orphan_sweep():
     assert "ExecutablePath" in ps, "要按可执行文件路径扫, 不许只按命令行(漏杀根源)"
     assert "Stop-Process" in ps and "-ne $PID" in ps, ps
     # ② 残留点名(纯函数): pid+命令行、超长截断、坏行跳过、limit 生效
-    lines = T._survivor_lines([(123, 1, "C:\\x\\chrome.exe --type=renderer " + "x" * 300),
-                               (124, 1, "C:\\y\\chrome.exe"),
+    lines = T._survivor_lines([(123, 1, "chrome.exe", "C:\\x\\chrome.exe --type=renderer " + "x" * 300),
+                               (124, 1, "chrome.exe", "C:\\y\\chrome.exe"),
                                ("bad",),
-                               (125, 1, "C:\\z\\third.exe")])
+                               (125, 1, "third.exe", "C:\\z\\third.exe")])
     assert len(lines) == 2, f"坏行要跳过, limit=3 只取前 3 行(其中坏行被跳): {lines}"
     assert lines[0].startswith("↳ 仍占用: pid=123") and len(lines[0]) <= 140, lines[0]
     assert "pid=124" in lines[1], lines[1]
@@ -167,21 +183,27 @@ def test_selfmatch_and_survivor_filter():
     ps = T._build_proc_table_ps("C:\\Users\\x\\AppData\\Roaming\\MerchantReportClient\\browser-profile")
     assert "-ne $PID" in ps, "进程表查询未排除自身(自伤: '仍有1个未退出'永远清不掉)"
     assert "browser-profile" in ps and "__TBL_OK__" in ps, ps
+    assert "msedgewebview2" in ps, "家族判定要排除 msedgewebview2(系统组件 WebView)"
+    assert "Name" in ps, "查询要带 Name 字段(家族判定/点名展示都靠它)"
     assert "-ne $PID" in T._build_proc_table_ps(), "无 profile 时同样要排除自身"
     assert "-ne $PID" in inspect.getsource(T.browser_death_forensics), "死亡取证查询也要排除自身"
-    # ② 残留点名只列真占本 profile 的行(别家 WebView/别的目录不许出现)
+    # ② 残留点名只列真占本 profile 的行(别家 WebView/别的目录/非浏览器不许出现)
     prof = "C:\\Users\\x\\AppData\\Roaming\\MerchantReportClient\\browser-profile"
-    rows = [(1, 0, r'"C:\x\chrome.exe" --user-data-dir="C:\Users\x\AppData\Roaming\MerchantReportClient\browser-profile"'),
-            (2, 0, r'"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154\msedgewebview2.exe" --embedded-browser-webview=1'),
-            (3, 0, "C:\\x\\other.exe --user-data-dir=C:\\Other\\browser-profile"),
-            (4, 0, r'"chrome.exe" --type=renderer --user-data-dir="C:\Users\x\AppData\Roaming\MerchantReportClient\browser-profile\Default"')]
+    rows = [(1, 0, "chrome.exe", r'"C:\x\chrome.exe" --user-data-dir="C:\Users\x\AppData\Roaming\MerchantReportClient\browser-profile"'),
+            (2, 0, "msedgewebview2.exe", r'"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154\msedgewebview2.exe" --embedded-browser-webview=1'),
+            (3, 0, "other.exe", "C:\\x\\other.exe --user-data-dir=C:\\Other\\browser-profile"),
+            (4, 0, "chrome.exe", r'"chrome.exe" --type=renderer --user-data-dir="C:\Users\x\AppData\Roaming\MerchantReportClient\browser-profile\Default"')]
     got = T.pick_profile_rows(rows, prof)
     assert [r[0] for r in got] == [1, 4], got
+    # msedgewebview2 即使命令行出现本 profile 也不算(系统组件, 2026-10-13 报告)
+    rows2 = rows + [(5, 0, "msedgewebview2.exe",
+                     r'--user-data-dir="C:\Users\x\AppData\Roaming\MerchantReportClient\browser-profile"')]
+    assert [r[0] for r in T.pick_profile_rows(rows2, prof)] == [1, 4]
     assert T.pick_profile_rows(rows, prof, limit=1) == [rows[0]]
     assert T.pick_profile_rows(rows, "") == [], "空 profile → 一律不列(防御)"
     # ③ 接线: 清理流程点名走过滤函数
     assert "pick_profile_rows" in inspect.getsource(T._cleanup_stale_browser), "点名前必须按 profile 过滤"
-    print("✅ 自伤防护: 探测排除自身 + 残留点名只列真占 profile 的进程")
+    print("✅ 自伤防护+家族口径: 排除自身/webview/非浏览器; 点名只列真占 profile 的浏览器进程")
 
 
 def test_wiring_source():
