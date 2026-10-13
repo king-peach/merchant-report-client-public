@@ -58,8 +58,13 @@ ALL_MAPPING = [
     ("DB", "CB", "消息回复率"),
     ("DC", "AR", "营业时段"),
     ("DD", "AV", "高峰营业时长得分"),
-    # ⚠️ 「基础营业时长/得分」: 本报表**没有这两列**(只有 高峰营业时长得分 AV / 近30日日均高峰营业时长 BB)
-    #    → 不映射、留空, 不再读 BM/BN(= 出餐完成上报率/配送准时率, 完全是别的指标)。
+    # ⚠️ 2026-10-14 (修复规格书 §4.5 / T05): DE/DF 一直空**不是**"报表没有这两列" —— 真机 83 列
+    #    「全部业务」报表里 第 65 列=基础营业时长得分 / 第 66 列=基础营业时长(样例 refs/samples/
+    #    美团_全部业务_*.csv 已核实)。空列根因 = 下载时「业务」没选「全部」(选了外卖/拼好饭就少这两列)。
+    #    仍按**表头名**取值: 字母只记录位置(BM/BN), 名字对不上 → 留空 + NAME_FALLBACKS 诊断, 不猜位置。
+    #    勿与 DD(高峰营业时长得分, AV)混填(规格书 §4.5 明确提示这两个是不同字段)。
+    ("DE", "BM", "基础营业时长得分"),
+    ("DF", "BN", "基础营业时长"),
 ]
 
 # 拼好饭报表(独立下载) → 模板拼好饭营收区
@@ -79,13 +84,15 @@ BAO_MAPPING = [
 CIRCLE_MAP = {
     "main": {          # 主站(业务=外卖): 模板 L~AR 区的 TOP 列
         "整体": {"曝光": "M", "进店": "P", "进店转化率": "S", "下单": "V", "下单转化率": "Y"},
-        "新客": {"曝光": "AB", "进店": "AE", "进店转化率": "AH"},
-        "老客": {"曝光": "AK", "进店": "AN", "进店转化率": "AQ"},
+        # ⚠️ 2026-10-13: 新客/老客组的**第 3 列列名是「下单转化率」**(AH/AQ 是"商圈TOP下单转化率"),
+        #    以前键写成「进店转化率」→ 把同漏斗上一级指标写进了下单列(规格书 §4.2 取错指标)。
+        "新客": {"曝光": "AB", "进店": "AE", "下单转化率": "AH"},
+        "老客": {"曝光": "AK", "进店": "AN", "下单转化率": "AQ"},
     },
     "bao": {           # 拼好饭: 模板 AX~CD 区的 TOP 列
         "整体": {"曝光": "AY", "进店": "BB", "进店转化率": "BE", "下单": "BH", "下单转化率": "BK"},
-        "新客": {"曝光": "BN", "进店": "BQ", "进店转化率": "BT"},
-        "老客": {"曝光": "BW", "进店": "BZ", "进店转化率": "CC"},
+        "新客": {"曝光": "BN", "进店": "BQ", "下单转化率": "BT"},
+        "老客": {"曝光": "BW", "进店": "BZ", "下单转化率": "CC"},
     },
 }
 
@@ -95,12 +102,18 @@ def circle_write_set(circle, biz="main"):
 
     circle: {"整体": {"曝光": 1186, "进店": 91, ...}, "新客": {...}, "老客": {...}}
     缺失的字段跳过(不写 None, 也不写 0 占位)。
+    新客/老客的下单转化率: 页面没给「下单转化率」时按 下单/进店 自算; 两者缺一 → 留空。
     """
     out = {}
     for grp, cols in (CIRCLE_MAP.get(biz) or {}).items():
         vals = ((circle or {}).get(grp) or {})
         for field, col in cols.items():
             v = vals.get(field)
+            if v is None and field == "下单转化率":
+                # 页面缺该率值时的自算兜底(分母为 0/缺失 → 不写)
+                _o, _e = vals.get("下单"), vals.get("进店")
+                if _o is not None and _e:
+                    v = round((_o or 0.0) / _e, 6)
             if v is not None:
                 out[col] = v
     return out
@@ -131,10 +144,13 @@ TRAFFIC_MAPPING = {
     "X":  ("all", "AB", "下单转化率"),
     "AA": ("all", "AC", "曝光新客"),
     "AD": ("all", "AD", "入店新客"),
-    "AG": ("all", "AE", "新客入店转化率"),
+    # ⚠️ 2026-10-13 修复规格书 P02.6: AG/AP 以前取的是**「入店转化率」**(同一漏斗的上一级指标)
+    #    → 必须取「下单转化率」。真机报表字段名逐字核实(83 列全部业务表):
+    #    AE=新客下单转化率、AI=老客下单转化率(另有 AC=入店新客 作率值兜底的自算分母)。
+    "AG": ("all", "AE", "新客下单转化率"),
     "AJ": ("all", "AG", "曝光老客"),
     "AM": ("all", "AH", "入店老客"),
-    "AP": ("all", "AI", "老客入店转化率"),
+    "AP": ("all", "AI", "老客下单转化率"),
     # -- 拼好饭流量(拼好饭报表) --
     "AX": ("bao", "O", "曝光人数"),
     "BA": ("bao", "P", "入店人数"),
@@ -143,10 +159,21 @@ TRAFFIC_MAPPING = {
     "BJ": ("bao", "R", "下单转化率"),
     "BM": ("bao", "S", "曝光新客"),
     "BP": ("bao", "T", "入店新客"),
-    "BS": ("bao", "U", "新客入店转化率"),
+    # 拼好饭报表字段名核实(31 列): U=新客入店转化率 / V=新客下单转化率 / Y=老客入店转化率 /
+    # Z=老客下单转化率 → BS 取 V、CB 取 Z。
+    "BS": ("bao", "V", "新客下单转化率"),
     "BV": ("bao", "W", "曝光老客"),
     "BY": ("bao", "X", "入店老客"),
-    "CB": ("bao", "Y", "老客入店转化率"),
+    "CB": ("bao", "Z", "老客下单转化率"),
+}
+
+# 「下单转化率」率值列(AG/AP/BS/CB)的**兜底来源**: 报表里没有该率值列时, 用 下单人数/进店人数 自算。
+# 两者都取不到 → 留空 + 记 NAME_FALLBACKS 告警(宁缺勿错: 绝不退回同漏斗上一级的「进店转化率」)。
+RATE_FALLBACK = {
+    "AG": ("all", "下单新客", "入店新客"),
+    "AP": ("all", "下单老客", "入店老客"),
+    "BS": ("bao", "下单新客", "入店新客"),
+    "CB": ("bao", "下单老客", "入店老客"),
 }
 
 
@@ -311,6 +338,49 @@ def collect(ddir, date_from, date_to):
 # 每轮抓取前应清空, 结束时若有内容说明仍有列只能靠位置取 → 需要人工核对。
 NAME_FALLBACKS = []
 
+# ---------- 数值合理性校验(规格书 铁律 8 / T11, 美团侧) ----------
+# 率值列(存**小数**, 模板按 % 显示: 0.2115 = 21.15%) → 必须 ∈ [0, 1](即 0~100%);
+# 其余数值列(人数/订单/金额/得分/时长) → 必须 ≥ 0。超界**不写该值** + 固定文案告警(可 grep)。
+# 三态校验: 全部 ≈ 新客 + 老客(人数类, ±1 容差) → 只提示, 不拦写入。
+RATE_COLS = frozenset({"R", "S", "X", "Y", "AG", "AH", "AP", "AQ",
+                       "BD", "BE", "BJ", "BK", "BS", "BT", "CB", "CC"})
+THREE_STATE = (("曝光人数", "曝光新客", "曝光老客"),
+               ("入店人数", "入店新客", "入店老客"),
+               ("下单人数", "下单新客", "下单老客"))
+VALIDATE_WARNINGS = []
+
+
+def validate_value(col, v):
+    """单值校验 → 通过原样返回; 超界返回 None(**不写该值**)并记固定文案。"""
+    if v is None or isinstance(v, str):
+        return v
+    if not isinstance(v, (int, float)):
+        return v
+    if col in RATE_COLS:
+        if not (0.0 <= float(v) <= 1.0):
+            VALIDATE_WARNINGS.append(f"[数值校验] {col}={v} 超出率值范围[0,100%] → 不写入")
+            return None
+    elif float(v) < 0:
+        VALIDATE_WARNINGS.append(f"[数值校验] {col}={v} 为负值(人数/订单/金额须≥0) → 不写入")
+        return None
+    return v
+
+
+def validate_write_set(vals):
+    """对 write_set 逐列校验(超界值置空); 返回新 dict(不改入参)。"""
+    return {k: validate_value(k, v) for k, v in (vals or {}).items()}
+
+
+def three_state_check(row, tag=""):
+    """三态校验: 全部 ≈ 新客 + 老客(人数类, ±1 容差)。不通过 → 记提示(不拦写入)。"""
+    row = row or {}
+    for tot, a, b in THREE_STATE:
+        T, A, B = num(row.get(tot)), num(row.get(a)), num(row.get(b))
+        if not all(isinstance(x, (int, float)) for x in (T, A, B)):
+            continue
+        if abs(T - (A + B)) > 1:
+            VALIDATE_WARNINGS.append(f"[三态校验] {tag}{tot}={T} ≠ 新客{A}+老客{B}(容差±1) → 提示(不拦写入)")
+
 
 def build_write_set(all_row, bao_row, weather=(None, None)):
     """报表行(+拼好饭行) + 天气 → write_set(模板列→值); 公式列由 fill.py 自动跳过"""
@@ -341,11 +411,37 @@ def build_write_set(all_row, bao_row, weather=(None, None)):
     for col, (src, letter, label) in TRAFFIC_MAPPING.items():
         row = all_row if src == "all" else bao_row
         vals[col] = num(_pick(row, letter, label))
+    # 新客/老客「下单转化率」(AG/AP/BS/CB) 兜底: 报表缺该率值列 → 用 下单人数/进店人数 自算;
+    # 两者都取不到 → 留空 + 记一笔待人工核对(宁缺勿错: 绝不拿「进店转化率」顶替)。
+    for col, (src, num_f, den_f) in RATE_FALLBACK.items():
+        if vals.get(col) is not None:
+            continue
+        row = (all_row if src == "all" else bao_row) or {}
+        _a, _b = num(row.get(num_f)), num(row.get(den_f))
+        if _a is not None and _b:
+            vals[col] = round((_a or 0.0) / _b, 6)
+        else:
+            NAME_FALLBACKS.append(f"{col}={num_f}/{den_f}")
     if weather and weather[0] is not None:
         vals["C"] = weather[0]
     if weather and len(weather) > 1 and weather[1] is not None:
         vals["D"] = weather[1]
-    return vals
+    # 数值合理性校验(规格书 铁律 8 / T11): 率值 ∈ [0,100%]、人数/金额 ≥ 0 —— 超界值不写,
+    # 三态(全部≈新客+老客, ±1)只提示。校验结果在 VALIDATE_WARNINGS(固定文案, 供编排层打印)。
+    three_state_check(all_row, tag="主站/全部业务 ")
+    if bao_row is not None:
+        three_state_check(bao_row, tag="拼好饭 ")
+    return validate_write_set(vals)
+
+
+def validate_report():
+    """数值校验结果 → 去重后的固定文案列表(编排层打印 + 复验 grep 断言用)。"""
+    seen, out = set(), []
+    for w in VALIDATE_WARNINGS:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
 
 
 def describe(all_path=None):

@@ -44,6 +44,51 @@ def main():
     assert "resolve_kernel_dir(" in rust, "kernel 目录发现要提取成公共函数(与 run_task 一致)"
     main_rs = (p.parent.parent / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
     assert "py_runner::read_store_platforms" in main_rs, "main.rs 要注册 read_store_platforms"
+
+    # ---------- 时间段逐日串行(2026-10-14 用户口径: 区间跨多天 → 按天串行跑单日一键全平台) ----------
+    assert "function clampRange(" in src, "区间要收敛成升序天列表(clamp 到昨天)"
+    assert "if (from > end) return [];" in src, "整段都在未来(clamp 后为空)要能识别"
+    assert "const end = to > yesterday() ? yesterday() : to;" in src, "区间终点要 clamp 到昨天(不跑今天/未来)"
+    assert "起始日期晚于结束日期" in src, "起点晚于终点要报错"
+    assert "没有可跑的天" in src, "整段在未来要报错提示"
+    assert "已收到昨天" in src, "clamp 发生时要有日志让用户可感知"
+    # 天循环状态
+    assert "const allDays = useRef<string[]>([])" in src, "要有剩余天队列"
+    assert "const allDayTotal = useRef(0)" in src and "const allDayDone = useRef(0)" in src, \
+        "要有 第 k/N 天 的进度计数"
+    assert 'useRef<OneClickResult[]>([])' in src, "结果要按 {day, platform, ok} 记账(汇总矩阵用)"
+    assert "const allMode = useRef<\"single\" | \"range\">" in src, "要区分单日/时间段两种模式"
+    # 入口分流: 单日路径不变, 多日才进时间段模式
+    assert "const days = clampRange(dateFrom, dateTo);" in src, "startAll 要先算出天列表"
+    assert "if (days.length === 1) {" in src, "单日区间必须走原单日路径"
+    assert "await launch(order[0], false);" in src, "单日区间必须仍走原来的一键发起(不传当天)"
+    assert "allMode.current = \"range\";" in src, "多日要进时间段模式"
+    assert "▶▶ 时间段模式：共 ${days.length} 天" in src, "时间段模式要有开工日志(天数可感知)"
+    # 天末装填: 平台队列跑空 → 装填下一天重新开跑
+    assert "const nextDay = allDays.current.shift();" in src, "一天跑完要取下一day"
+    assert "allQueue.current = PLATFORM_ORDER.slice(1);" in src, "下一天要重新装填 4 平台队列"
+    assert "void launch(PLATFORM_ORDER[0], false, nextDay);" in src, "下一天要从第一个平台重新开跑(并带上当天)"
+    assert "天完成：" in src and "（淘宝/美团/管家/京东）" in src, "每天要有一条 第k/N天完成 ✅✅❌✅ 的日志"
+    # 传参: 时间段模式 date/dateFrom/dateTo 全用当天
+    assert "async function launch(platform: string, skipBrowser = false, day = \"\")" in src, \
+        "launch 要多一个当天参数(最小侵入)"
+    assert "const runDay = day || allDayCurrent.current || dateTo;" in src, "当天值要有兜底"
+    assert "date: allMode.current === \"range\" ? runDay : dateTo," in src, "时间段模式 date 必须是当天"
+    assert "dateFrom: allMode.current === \"range\" ? runDay : dateFrom," in src, "dateFrom 必须是当天"
+    assert "dateTo: allMode.current === \"range\" ? runDay : dateTo," in src, "dateTo 必须是当天"
+    assert "await launch(order[0], false, days[0]);" in src, "时间段模式首日要带着当天发起"
+    assert "时间段的 第" in src or "[第 ${allDayDone.current + 1}/${allDayTotal.current} 天] 第" in src, \
+        "天循环里每条平台启动日志要带 [第 k/N 天] 前缀"
+    # E3 汇总
+    assert "━━━ 时间段跑完 · 汇总 ━━━" in src, "时间段模式要有独立汇总标题"
+    assert "function dayMarks(" in src and "天 × " in src and "任务：" in src, "汇总要有 天×平台 矩阵 + 总计行"
+    # E2 终止: 清空剩余天/平台队列 + 不再自动续跑
+    assert "const aborted = useRef(false)" in src, "要有终止标志"
+    assert "!aborted.current" in src, "result 回调在终止后不得再启动新任务"
+    assert "allQueue.current = []; allDays.current = [];" in src, "终止要清空剩余平台队列与剩余天"
+    assert "已终止：完成 " in src, "终止后如有已完成结果要给简短汇总"
+    # E4 UI 文案
+    assert "按天串行" in src and "每天跑全部 4 平台" in src, "区间提示要说明按天串行 + 每天全平台"
     print("✅ 一键跑所有平台(门店明细驱动) · 前端/壳守卫 全绿")
 
 

@@ -44,6 +44,58 @@ function yesterday() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+/**
+ * 「时间段」逐日串行（2026-10-14）：把用户选的区间收敛成**升序的天列表**。
+ * 规则：clamp 到昨天（不跑今天/未来）；起点晚于终点 → 空数组；整段都在未来 → 空数组。
+ * 空数组由调用方按情形给出不同报错文案。
+ */
+function clampRange(from: string, to: string): string[] {
+  if (!from || !to || from > to) return [];
+  const end = to > yesterday() ? yesterday() : to;
+  if (from > end) return [];
+  const days: string[] = [];
+  // 用本地日期逐天推进（不用 UTC 毫秒加减，避免时区/夏令时把日期算偏）
+  let [y, m, d] = from.split("-").map(Number);
+  const [ey, em, ed] = end.split("-").map(Number);
+  for (;;) {
+    days.push(`${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
+    if (y === ey && m === em && d === ed) break;
+    const nd = new Date(y, m - 1, d);
+    nd.setDate(nd.getDate() + 1);
+    y = nd.getFullYear(); m = nd.getMonth() + 1; d = nd.getDate();
+    if (days.length > 400) break; // 防御：异常输入不无限循环
+  }
+  return days;
+}
+
+/** 一键队列的平台相对顺序（4 个平台全跑）；模块级以便结果回调/汇总矩阵复用 */
+const PLATFORM_ORDER = ["taobao", "meituan", "meituan_gj", "jd"];
+/** 汇总矩阵里的平台短名 */
+const PLATFORM_SHORT: Record<string, string> = { taobao: "淘宝", meituan: "美团", meituan_gj: "管家", jd: "京东" };
+
+/** 一次一键任务里单个平台的结果（时间段模式的汇总矩阵用） */
+interface OneClickResult { day: string; platform: string; ok: boolean; err: string }
+
+/** 日期短标：2026-09-03 → 9/3 */
+function shortDay(day: string): string {
+  const [, m, d] = day.split("-");
+  return `${Number(m)}/${Number(d)}`;
+}
+
+/** 某天 4 个平台的 ✅/❌ 矩阵行（按固定平台序；没跑到的显示 ⬜） */
+function dayMarks(day: string, results: OneClickResult[]): string {
+  return PLATFORM_ORDER.map((p) => {
+    const r = results.find((x) => x.day === day && x.platform === p);
+    return r ? (r.ok ? "✅" : "❌") : "⬜";
+  }).join("");
+}
+
+/** 某天失败平台的短名列表（供汇总行括注），全成功返回空串 */
+function dayFailShort(day: string, results: OneClickResult[]): string {
+  return results.filter((r) => r.day === day && !r.ok)
+    .map((r) => PLATFORM_SHORT[r.platform] ?? r.platform).join("、");
+}
+
 // ---------- 类型 ----------
 type StepState = "running" | "ok" | "failed" | "skipped" | null;
 interface Step { id: string; name: string; state: StepState; detail?: string; elapsed_s?: number; error_code?: string }
@@ -132,8 +184,15 @@ export default function App() {
   const allQueue = useRef<string[]>([]);      // 还没跑的平台
   const allTotal = useRef(0);                 // 本次一键共几个平台(0 = 非一键模式)
   const allDone = useRef(0);                  // 已跑完几个
-  const allResults = useRef<string[]>([]);    // 每个平台的结果文案
+  const allResults = useRef<OneClickResult[]>([]); // 每个平台的结果(天×平台矩阵的来源)
   const allCurrent = useRef<string>("");      // 当前正在跑的平台(给 result 回调用)
+  // 「时间段」逐日串行(2026-10-14): 区间跨多天时, 每天 = 一次「单日一键全平台」, 一天跑完再跑下一天
+  const allDays = useRef<string[]>([]);       // 还没跑的天(升序); 空 = 非时间段模式或已跑完
+  const allDayTotal = useRef(0);              // 时间段共几天(0 = 单日/非一键)
+  const allDayDone = useRef(0);               // 已完成几天
+  const allDayCurrent = useRef("");           // 当前正在跑的天(给 launch/result 回调用)
+  const allMode = useRef<"single" | "range">("single"); // 本次一键是单日还是时间段
+  const aborted = useRef(false);              // 用户点了「终止」: 结果回调不得再自动续跑
   const [steps, setSteps] = useState<Record<string, Step>>({});
   const [banner, setBanner] = useState<Banner | null>(null);
   // need_human 超时兜底(2026-10-13): 面板超时未点 → 自动按"超时"应答, 内核走其既有的
@@ -188,11 +247,13 @@ export default function App() {
 
   useTaskEvents((e) => {
     if (e.type === "task_start") {
-      setRunning(true); setSteps({}); setLogs([]); setLlmText(""); setResult(null); clearHumanTimer();
+      setRunning(true); setSteps({}); setLlmText(""); setResult(null); clearHumanTimer();
+      // 时间段模式: 保留已跑天的进度与汇总(整天串行要能看到整段进度); 其余保持原行为(清空)
+      if (allMode.current !== "range") setLogs([]);
     } else if (e.type === "step") {
       setSteps((s) => ({ ...s, [e.id]: e }));
     } else if (e.type === "log") {
-      setLogs((l) => [...l.slice(-300), e.msg]);
+      setLogs((l) => [...l.slice(-2000), e.msg]);
     } else if (e.type === "need_human") {
       setBanner({ message: e.message, action: e.action, choices: e.choices,
                   context: e.context, free_text: e.free_text });
@@ -229,19 +290,69 @@ export default function App() {
           localStorage.setItem(LS_MERCHANTS, JSON.stringify(ns));
         }
       }
-      // 一键模式: 记录本平台结果 → 自动接着跑下一个(失败也继续, 最后统一汇总)
-      if (allTotal.current > 0 && !e.need_human) {
+      // 一键模式: 记录本平台结果 → 自动接着跑下一个(失败也继续, 最后统一汇总);
+      // 时间段模式: 平台队列跑空 = 当天跑完 → 装填下一天, 全部天跑完才出最终汇总。
+      // aborted: 用户已点「终止」→ 队列早被清空, 这里也不再启动任何新任务。
+      if (allTotal.current > 0 && !e.need_human && !aborted.current) {
+        const day = allDayCurrent.current || dateTo;
+        const platform = allCurrent.current;
         allDone.current += 1;
-        allResults.current.push(`${PLATFORM_LABEL[allCurrent.current] ?? allCurrent.current}：`
-          + (e.ok ? "✅ 成功" : `❌ ${e.error_code || e.message || "失败"}`));
+        allResults.current.push({
+          day, platform, ok: !!e.ok,
+          err: e.ok ? "" : (e.error_code || e.message || "失败"),
+        });
         const next = allQueue.current.shift();
         if (next) {
-          window.setTimeout(() => { void launch(next, false); }, 1200);
+          window.setTimeout(() => { if (!aborted.current) void launch(next, false); }, 1200);
+        } else if (allMode.current === "range") {
+          // ── 当天 4 个平台跑完 ──
+          // 注意: setLogs 的 updater 是**惰性**执行的, 里面引用的 ref 必须先在闭包里取值,
+          // 否则会被后续的"复位语句"改写(踩过一次: 汇总里天数变成 0)
+          const dayNo = allDayDone.current + 1;
+          const dayTotal = allDayTotal.current;
+          const okN = allResults.current.filter((r) => r.day === day && r.ok).length;
+          const marks = dayMarks(day, allResults.current);
+          setLogs((l) => [...l,
+            `第 ${dayNo}/${dayTotal} 天完成：${marks}（淘宝/美团/管家/京东），当天 ${okN}/4 成功`]);
+          const nextDay = allDays.current.shift();
+          if (nextDay) {
+            allDayDone.current += 1;
+            allDayCurrent.current = nextDay;
+            allQueue.current = PLATFORM_ORDER.slice(1);
+            allTotal.current = PLATFORM_ORDER.length;
+            allDone.current = 0;
+            const nextDayNo = allDayDone.current + 1;
+            setLogs((l) => [...l,
+              `▶▶ [第 ${nextDayNo}/${dayTotal} 天] ${nextDay}：开始跑 4 个平台`]);
+            window.setTimeout(() => { if (!aborted.current) void launch(PLATFORM_ORDER[0], false, nextDay); }, 1200);
+          } else {
+            allDayDone.current += 1;
+            const failList = allResults.current.filter((r) => !r.ok)
+              .map((r) => `${shortDay(r.day)} ${PLATFORM_SHORT[r.platform] ?? r.platform}`);
+            const total = dayTotal * PLATFORM_ORDER.length;
+            const okTotal = allResults.current.length - failList.length;
+            // 汇总矩阵: 每天一行 ✅✅❌✅ + 失败平台括注(按跑过的天去重、保持出现顺序)
+            const ranDays = allResults.current.map((r) => r.day).filter((d, i, a) => a.indexOf(d) === i);
+            const marksByDay = ranDays.map((d) => dayMarks(d, allResults.current));
+            const failsByDay = ranDays.map((d) => dayFailShort(d, allResults.current));
+            setLogs((l) => [...l,
+              "━━━ 时间段跑完 · 汇总 ━━━",
+              ...ranDays.map((d, i) => `  ${shortDay(d)}: ${marksByDay[i]}`
+                + (failsByDay[i] ? `（${failsByDay[i]}失败）` : "")),
+              `  共 ${dayTotal} 天 × ${PLATFORM_ORDER.length} 平台 = ${total} 任务：`
+              + `${okTotal} 成功 / ${failList.length} 失败`
+              + (failList.length ? `（${failList.join("、")}）` : ""),
+              `  失败不影响其它天/平台，可单独重跑该平台。`]);
+            allMode.current = "single"; allDayTotal.current = 0; allDayDone.current = 0;
+            allDays.current = []; allTotal.current = 0; allDone.current = 0;
+          }
         } else {
-          const okN = allResults.current.filter((s) => s.includes("✅")).length;
+          // ── 单日一键: 汇总文案保持原样(守卫测试钉住) ──
+          const okN = allResults.current.filter((r) => r.ok).length;
           setLogs((l) => [...l,
             "━━━ 一键跑所有平台 · 汇总 ━━━",
-            ...allResults.current.map((s) => `  · ${s}`),
+            ...allResults.current.map((r) => `  · ${PLATFORM_LABEL[r.platform] ?? r.platform}：`
+              + (r.ok ? "✅ 成功" : `❌ ${r.err}`)),
             `  共 ${allResults.current.length} 个平台，成功 ${okN} 个。任意平台失败不影响其它平台，可单独重跑该平台。`]);
           allTotal.current = 0; allDone.current = 0;
         }
@@ -259,7 +370,8 @@ export default function App() {
   async function start(skipBrowser = false) { return launch(activePlatform, skipBrowser); }
 
   // 单个平台的一次任务(原 start(); 抽出 platform 参数供「一键跑所有平台」串行复用)
-  async function launch(platform: string, skipBrowser = false) {
+  // day(可选): 时间段模式下的**当天**; 传了就 date/dateFrom/dateTo 全用当天, 不传沿用区间(单日老路径不变)
+  async function launch(platform: string, skipBrowser = false, day = "") {
     if (!merchant) return;
     const tpl = (merchant as any)?.[platform]?.template ?? "";
     if (!tpl) {
@@ -276,13 +388,25 @@ export default function App() {
     allCurrent.current = platform;
     if (platform !== activePlatform) setActivePlatform(platform as any);
     setRunning(true); setSteps({}); setLlmText(""); setResult(null);
-    setLogs(allTotal.current
-      ? [`▶️ 一键模式 第 ${allDone.current + 1}/${allTotal.current} 个平台：${PLATFORM_LABEL[platform] ?? platform}`]
-      : []);
+    // 时间段模式每条"平台启动"日志带 [第 k/N 天] 前缀, 且**追加**(保留逐日的完成记录);
+    // 单日一键 / 单平台保持原有行为(整块替换 → task_start 事件再清空)
+    if (allTotal.current) {
+      const line = allMode.current === "range"
+        ? `▶️ [第 ${allDayDone.current + 1}/${allDayTotal.current} 天] 第 ${allDone.current + 1}/${allTotal.current} 个平台：${PLATFORM_LABEL[platform] ?? platform}`
+        : `▶️ 一键模式 第 ${allDone.current + 1}/${allTotal.current} 个平台：${PLATFORM_LABEL[platform] ?? platform}`;
+      if (allMode.current === "range") setLogs((l) => [...l, line]);
+      else setLogs([line]);
+    } else {
+      setLogs([]);
+    }
+    // 当天值: 时间段模式由 day 传入(带兜底 allDayCurrent), 单日模式就是 dateTo/dateFrom
+    const runDay = day || allDayCurrent.current || dateTo;
     try {
       await invoke("run_task", {
-        merchant: merchant.name, platform, date: dateTo,
-        dateFrom, dateTo,
+        merchant: merchant.name, platform,
+        date: allMode.current === "range" ? runDay : dateTo,
+        dateFrom: allMode.current === "range" ? runDay : dateFrom,
+        dateTo: allMode.current === "range" ? runDay : dateTo,
         template: tpl,
         keyword: scope === "all" ? "" : (picked?.name ?? storeKeyword),
         storeId: scope === "store" ? pickedStoreId : "",
@@ -302,7 +426,6 @@ export default function App() {
   // "所有平台都要跑的")。《门店明细》**不决定队列**, 只决定**切店方式**: 明细里有编号的平台 →
   // 切店走「搜索ID直选」; 没有的(如京东) → 按之前的逻辑处理(逐层展开+按名)。各平台日志会写明方式。
   // 预检: 全部平台都要跑 → 4 个平台都必须先在「设置 → 商家管理」配好各自的模板。
-  const PLATFORM_ORDER = ["taobao", "meituan", "meituan_gj", "jd"];
   async function startAll() {
     if (!merchant) return;
     const order = PLATFORM_ORDER;
@@ -312,16 +435,73 @@ export default function App() {
         + missing.map((p) => PLATFORM_LABEL[p] ?? p).join("、")]);
       return;
     }
-    allQueue.current = order.slice(1);
+    // ── 区间 → 天列表(升序; clamp 到昨天) ──
+    if (dateFrom > dateTo) {
+      setLogs([`❌ 起始日期晚于结束日期（${dateFrom} > ${dateTo}），请重新选择「报表区间」`]);
+      return;
+    }
+    const days = clampRange(dateFrom, dateTo);
+    if (days.length === 0) {
+      setLogs([`❌ 区间 ${dateFrom} ~ ${dateTo} 没有可跑的天（调度只跑「昨天」及以前，今天/未来不跑）`]);
+      return;
+    }
+    // clamp 提示与开工日志合并成一次 setLogs(否则前面的提示会被后面的整块替换掉)
+    const clampNote = days[days.length - 1] !== dateTo
+      ? [`ℹ️ 区间末日 ${dateTo} 已收到昨天（${days[days.length - 1]}）：今天/未来的报表还不存在`]
+      : [];
+    aborted.current = false;
+    allResults.current = [];
     allTotal.current = order.length;
     allDone.current = 0;
-    allResults.current = [];
-    setLogs([`▶▶ 一键跑所有平台（4 个平台全跑）：${order.map((p) => PLATFORM_LABEL[p] ?? p).join(" → ")}`]);
-    await launch(order[0], false);
+    allQueue.current = order.slice(1);
+    if (days.length === 1) {
+      // 单日区间: 走现有单日路径, 行为与文案完全不变
+      allMode.current = "single";
+      allDays.current = []; allDayTotal.current = 0; allDayDone.current = 0;
+      allDayCurrent.current = days[0];
+      setLogs([...clampNote,
+        `▶▶ 一键跑所有平台（4 个平台全跑）：${order.map((p) => PLATFORM_LABEL[p] ?? p).join(" → ")}`]);
+      await launch(order[0], false);
+      return;
+    }
+    // ── 时间段模式: 逐日串行跑「单日一键全平台」 ──
+    allMode.current = "range";
+    allDayTotal.current = days.length;
+    allDayDone.current = 0;
+    allDayCurrent.current = days[0];
+    allDays.current = days.slice(1);
+    setLogs([...clampNote,
+      `▶▶ 时间段模式：共 ${days.length} 天（${days[0]} ~ ${days[days.length - 1]}），`
+      + `逐日串行跑「单日一键全平台」（每天：${order.map((p) => PLATFORM_LABEL[p] ?? p).join(" → ")}）`]);
+    await launch(order[0], false, days[0]);
   }
 
   async function respond(payload: any) { clearHumanTimer(); setBanner(null); await invoke("send_to_kernel", { payload }); }
-  async function abort() { clearHumanTimer(); setBanner(null); setRunning(false); await invoke("abort_task", {}); }
+  async function abort() {
+    // 终止 = 停当前任务 + **清空剩余天/平台队列**(不自动续跑); 事件回调里也会因 aborted 短路
+    aborted.current = true;
+    allQueue.current = []; allDays.current = [];
+    clearHumanTimer(); setBanner(null); setRunning(false);
+    if (allResults.current.length > 0) {
+      // 「完成 X 天」只数**跑满 4 个平台**的天(中途被终止的当天算"未跑满", 不计入完成)
+      const ranDays = [...new Set(allResults.current.map((r) => r.day))];
+      const completeDays = ranDays.filter((d) =>
+        allResults.current.filter((r) => r.day === d).length >= PLATFORM_ORDER.length).length;
+      const total = allDayTotal.current || 1;
+      // ⚠️ setLogs 的 updater 是**惰性**执行的(渲染阶段才跑): 模式判断与计数必须先落成闭包
+      //    局部量 —— 直接引用 ref 会被后面几行的"复位语句"改写(会显示"已完成 N/0 个平台")
+      const isRange = allMode.current === "range";
+      const doneCount = allResults.current.length;
+      const platTotal = allTotal.current;
+      setLogs((l) => [...l, isRange
+        ? `⛔ 已终止：完成 ${completeDays}/${total} 天（另有 ${ranDays.length - completeDays} 天未跑满，`
+          + `剩余天数与平台队列已清空，不会自动续跑）`
+        : `⛔ 已终止：已完成 ${doneCount}/${platTotal} 个平台，剩余队列已清空`]);
+    }
+    allMode.current = "single"; allDayTotal.current = 0; allDayDone.current = 0;
+    allTotal.current = 0; allDone.current = 0;
+    await invoke("abort_task", {});
+  }
 
   const stepIcon = (s?: StepState) =>
     s === "ok" ? "✅" : s === "running" ? "⏳" : s === "failed" ? "❌" : s === "skipped" ? "⏭️" : "⬜";
@@ -458,13 +638,14 @@ export default function App() {
                 {running ? "运行中…" : "▶ 生成日报"}
               </button>
               <button className="ghost" disabled={running} onClick={startAll}
-                      title="4 个平台全跑：淘宝闪购 → 美团 → 美团管家 → 京东（切店方式自动按门店明细优化：有编号走搜索直选；某个平台失败也继续跑下一个）">
+                      title="4 个平台全跑：淘宝闪购 → 美团 → 美团管家 → 京东（切店方式自动按门店明细优化：有编号走搜索直选；某个平台失败也继续跑下一个）。区间跨多天时按天串行：从区间起点到昨天，每天跑一遍全部 4 平台，一天跑完再跑下一天">
                 ▶▶ 一键跑所有平台
               </button>
               {running && <button className="ghost" onClick={abort}>终止</button>}
             </div>
             <div className="row dim" style={{ marginTop: 4 }}>
-              默认昨天（每次打开/回到前台自动对齐；手动改过就按你选的走）；当前填入区间末日（{dateTo}）的数据
+              默认昨天（每次打开/回到前台自动对齐；手动改过就按你选的走）；单日 = 只填这一天。
+              区间跨多天时，一键按钮将**按天串行**逐日跑（每天跑全部 4 平台），末日自动收敛到昨天，不跑今天/未来
             </div>
 
             <div className="steps">

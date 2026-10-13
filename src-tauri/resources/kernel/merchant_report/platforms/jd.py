@@ -20,6 +20,70 @@ class JDDateNotAvailable(RuntimeError):
     """目标日期超出平台可选范围(格子被禁用) —— 不可用键盘兜底, 直接报出。"""
 
 
+class JDWrongFile(RuntimeError):
+    """下载到的文件日期区间 ≠ 目标日 —— 规格书 §4.8/T10「下载到错误文件」, 必须报错不得静默。"""
+
+
+# ---------- 下载列表「取文件」纯函数(规格书 铁律 10 / §4.8): 可单测, 不碰浏览器 ----------
+# 文件名: 门店_{起YYYYMMDD}_{止YYYYMMDD}_{账号}_{导出时间}.xlsx
+# 实例: 门店_20260919_20260919_demo_account_2026-10-13 21_02_34.xlsx
+_JD_NAME_RE = re.compile(r"^门店_(\d{8})_(\d{8})_")
+# 操作时间: 2026-10-13 21:02:34 / 2026-10-13 21_02_34 / 2026/10/13 21:02 都认
+_OP_TIME_RE = re.compile(
+    r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})[日]?[ T_]+(\d{1,2})[:：_时](\d{1,2})(?:[:：_分](\d{1,2}))?")
+
+
+def jd_interval_matches(name, date_from, date_to):
+    """文件名前两段(起/止 YYYYMMDD)是否 == 目标日区间。"""
+    m = _JD_NAME_RE.match(str(name or ""))
+    if not m:
+        return False
+    df = str(date_from or "").replace("-", "")
+    dt = str(date_to or date_from or "").replace("-", "")
+    return bool(df) and m.group(1) == df and m.group(2) == dt
+
+
+def parse_op_time(s):
+    """下载列表「操作时间」→ 可比较元组; 解析不出返回 None。"""
+    m = _OP_TIME_RE.search(str(s or ""))
+    if not m:
+        return None
+    y, mo, d, h, mi, se = m.groups()
+    return (int(y), int(mo), int(d), int(h), int(mi), int(se or 0))
+
+
+def pick_latest_candidate(rows, date_from, date_to):
+    """从下载列表行里挑「文件名区间 = 目标日 且 操作时间最新」的一份。
+
+    rows: [{"name": 文件名, "time": 操作时间, "has_dl": 有下载按钮, ...}, ...](页面显示顺序)。
+    **禁止盲取第一条**: 平台列表按操作时间倒序但可能被筛选/分页, 必须按解析出的时间显式排序;
+    时间解析不出或相同时, 退回列表原序(平台即按操作时间倒序 → 原序第一条最可靠)。
+
+    返回 (best|None, 排序后的候选列表, 选取理由文案)。
+    """
+    cands = []
+    for i, r in enumerate(rows or []):
+        if not isinstance(r, dict):
+            continue
+        nm = str(r.get("name") or "").strip()
+        if not jd_interval_matches(nm, date_from, date_to):
+            continue
+        cands.append({**r, "name": nm, "_ord": i, "_t": parse_op_time(r.get("time"))})
+    if not cands:
+        return None, [], "无候选"
+    ordered = sorted(cands, key=lambda c: (c["_t"] is not None, c["_t"] or (0,) * 6, -c["_ord"]),
+                     reverse=True)
+    best = ordered[0]
+    tied = [c for c in ordered if c["_t"] == best["_t"]]
+    if best["_t"] is None:
+        why = "列表无可解析操作时间 → 取列表原序第一条(平台按操作时间倒序)"
+    elif len(tied) > 1:
+        why = f"操作时间最新 {best['time']}({len(tied)} 份同时间 → 取列表中靠前的那份)"
+    else:
+        why = f"操作时间最新 {best['time']}"
+    return best, ordered, why
+
+
 class JDAdapter:
     platform = "jd"
 
@@ -112,7 +176,9 @@ class JDAdapter:
             time.sleep(4)
             if logged():
                 self.sink.log("✅ 京东登录成功")
+                self.sink.browser_hide()         # 后台模式: 人工登录结束 → 窗口收回
                 return True
+        self.sink.browser_hide()                 # 超时退出同样收回
         self.sink.step_fail("login", "登录", "京东登录超时", "E_LOGIN_TIMEOUT")
         return False
 
@@ -312,6 +378,7 @@ class JDAdapter:
         if got[:2] != [date_from, date_to]:
             raise RuntimeError(f"京东日期区间设置未生效: {got[:2]} (期望 {date_from}~{date_to}, 已中止)")
         self.sink.log(f"📅 日期区间生效: {got[0]} ~ {got[1]}")
+        self._read_store_scope(tgt)     # 规格书 §4.8: 门店范围读回并日志(设计=全部门店)
 
         # 提交
         self._tab_click(tgt, "数据下载")
@@ -329,54 +396,131 @@ class JDAdapter:
         self.sink.log("⬇️ 已提交下载任务, 等待生成…")
         time.sleep(6)
 
-        # 下载列表等文件
-        fname_expect = f"门店_{date_from.replace('-', '')}_{date_to.replace('-', '')}_"
+        # 下载列表等文件(规格书 铁律 10 / §4.8: 必须取「文件名区间=目标日 且 操作时间最新」的一份,
+        # **禁止盲取列表第一条** —— 列表累积历史, 老文件在前/被筛选时就取错了)
         path = None
+        last_diag = ""
         for i in range(24):   # 最多 2 分钟
             time.sleep(5)
             try:
                 self._tab_click(tgt, "下载列表")
                 time.sleep(2)
-                hit = tgt.evaluate("""(prefix) => {
-                  if (!document.body.innerText.includes(prefix)) return null;
-                  const rows = [...document.querySelectorAll('tr,li')];
-                  for (const el of rows) {
-                    const t = el.textContent || '';
-                    if (t.includes(prefix) && t.includes('下载')) return true;
-                  }
-                  return true;
-                }""", fname_expect)
-                if not hit:
-                    continue
-                # 触发行内「下载」(浏览器下载事件)
-                with page.expect_download(timeout=60000) as dl_info:
-                    tgt.evaluate("""(prefix) => {
-                      const rows = [...document.querySelectorAll('tr,li,div')];
-                      for (const el of rows) {
-                        const t = el.textContent || '';
-                        if (t.includes(prefix) && t.includes('下载')) {
-                          for (const a of el.querySelectorAll('a,span,button')) {
-                            if ((a.textContent || '').trim() === '下载' && a.getBoundingClientRect().width > 0) {
-                              a.click(); return;
+                self._goto_download_list(tgt)       # 可能弹「前往下载列表」→ 探测→点; 不成立即忽略
+                rows = self._read_download_rows(tgt)
+                cands = [r for r in rows if jd_interval_matches(r.get("name"), date_from, date_to)]
+                if cands:
+                    best, ordered, why = pick_latest_candidate(rows, date_from, date_to)
+                    self.sink.log(f"📋 下载列表: 共 {len(rows)} 行, 目标区间候选 {len(cands)} 份")
+                    for c in ordered[:5]:
+                        self.sink.log(f"    · {c.get('name')} ｜ 操作时间 {c.get('time') or '(未读到)'}")
+                    self.sink.log(f"✅ 选中: {best.get('name')} ｜ 操作时间 {best.get('time') or '(未读到)'} "
+                                  f"｜ 理由: {why}")
+                    # 触发行内「下载」(浏览器下载事件) —— 按**文件名**精确点到选中那份
+                    with page.expect_download(timeout=60000) as dl_info:
+                        tgt.evaluate("""(name) => {
+                          const rows = [...document.querySelectorAll('tr,li,div')];
+                          for (const el of rows) {
+                            const t = el.textContent || '';
+                            if (!t.includes(name)) continue;
+                            for (const a of el.querySelectorAll('a,span,button')) {
+                              if ((a.textContent || '').trim() === '下载' && a.getBoundingClientRect().width > 0) {
+                                a.click(); return true;
+                              }
                             }
                           }
-                        }
-                      }
-                    }""", fname_expect)
-                d = dl_info.value
-                dest = os.path.join(str(ddir), f"京东_门店_{date_from.replace('-', '')}_{date_to.replace('-', '')}.xlsx")
-                d.save_as(dest)
-                path = dest
-                break
+                          return false;
+                        }""", best.get("name"))
+                    d = dl_info.value
+                    # 落盘前再验一次: 浏览器报的下载文件名区间也必须 = 目标日(下载到错误文件必须报错)
+                    got_name = str(getattr(d, "suggested_filename", "") or "")
+                    if got_name and not jd_interval_matches(got_name, date_from, date_to):
+                        raise JDWrongFile(
+                            f"京东下载到的文件不是目标日区间: {got_name} (期望 门店_{date_from.replace('-', '')}"
+                            f"_{date_to.replace('-', '')}_…), 已中止并丢弃")
+                    dest = os.path.join(str(ddir), f"京东_门店_{date_from.replace('-', '')}_{date_to.replace('-', '')}.xlsx")
+                    d.save_as(dest)
+                    path = dest
+                    break
+            except JDWrongFile:
+                raise
             except Exception as e:
+                last_diag = str(e)[:100]
                 if i >= 20:
                     self.sink.log(f"⚠️ 下载等待异常: {str(e)[:80]}", level="warn")
                 continue
         if not path:
-            raise RuntimeError("京东报表未生成/未取回(下载列表无目标文件)")
+            raise RuntimeError(f"京东报表未生成/未取回{(('[' + self.keyword + '] ') if self.keyword else '')}"
+                               f"[{date_from}~{date_to}]: 下载列表等 {24 * 5}s 仍无「文件名区间 = "
+                               f"门店_{date_from.replace('-', '')}_{date_to.replace('-', '')}_」的候选"
+                               + (f"（最后异常: {last_diag}）" if last_diag else ""))
         self.sink.log(f"💾 已保存 {os.path.basename(path)} ({os.path.getsize(path) / 1024:.0f}KB)")
         self.sink.step_ok("download", "下载报表", f"京东门店报表 {date_from}~{date_to}")
         return True
+
+    def _goto_download_list(self, tgt):
+        """探测并点「前往下载列表」(提交后可能的弹窗); 没有这个控件就跳过(不报错)。
+
+        返回 True=点了 / False=没这个控件。做成"探测→使用→不成立即忽略", 免得把可选项当硬步骤。
+        """
+        try:
+            clicked = tgt.evaluate("""() => {
+              for (const el of document.querySelectorAll('button,a,span')) {
+                if ((el.textContent || '').trim().replace(/\\s/g, '') === '前往下载列表') {
+                  const r = el.getBoundingClientRect();
+                  if (r.width > 0 && r.height > 0) { el.click(); return true; }
+                }
+              }
+              return false;
+            }""")
+        except Exception:
+            return False
+        if clicked:
+            self.sink.log("🧭 点「前往下载列表」")
+            time.sleep(2)
+        return bool(clicked)
+
+    def _read_store_scope(self, tgt):
+        """读回「门店范围」当前值并日志(设计上=全部门店; 读不到就如实说"未读到")。"""
+        try:
+            v = tgt.evaluate("""() => {
+              const t = document.body ? document.body.innerText : '';
+              if (t.includes('全部门店')) return '全部门店';
+              const el = [...document.querySelectorAll('input')]
+                .find(i => (i.placeholder || '').includes('门店'));
+              return el ? (el.value || '') : '';
+            }""") or ""
+        except Exception:
+            v = ""
+        self.sink.log(f"🏬 门店范围: {v or '未读到(按页面默认=全部门店继续)'}")
+        return v
+
+    def _read_download_rows(self, tgt):
+        """解析「下载列表」每一行 → [{"name": 文件名, "time": 操作时间, "has_dl": 有无下载按钮}]。
+
+        只认**含 门店_ 前缀 8 位日期**的行文本; 行文本形如:
+            门店_20260919_20260919_demo_account_2026-10-13 21:02:34  ｜ 成功 ｜ 下载
+        取不到时返回 [](调用方按"无候选"继续轮询), 绝不抛。
+        """
+        try:
+            rows = tgt.evaluate("""() => {
+              const out = [];
+              const re = /门店_\\d{8}_\\d{8}_[^\\s]*/;
+              for (const el of document.querySelectorAll('tr,li')) {
+                const t = (el.innerText || el.textContent || '').trim();
+                const m = t.match(re);
+                if (!m) continue;
+                const name = m[0];
+                // 操作时间 = 行内 日期+时刻 文本(取行内出现的那串, 不是文件名里的区间)
+                const tm = (t.match(/20\\d{2}[-/.\\u5e74]\\d{1,2}[-/.\\u6708]\\d{1,2}[\\u65e5]?[ T_]+\\d{1,2}[:\\uff1a_]\\d{1,2}(?::\\d{1,2})?/) || [''])[0];
+                const has_dl = [...el.querySelectorAll('a,span,button')]
+                  .some(x => (x.textContent || '').trim() === '下载' && x.getBoundingClientRect().width > 0);
+                out.push({name, time: tm, text: t.slice(0, 120), has_dl});
+              }
+              return out;
+            }""") or []
+            return [r for r in rows if isinstance(r, dict)]
+        except Exception:
+            return []
 
     def _set_dates_by_calendar(self, tgt, page, df, dt):
         """antd RangePicker 日历点选(实测唯一有效方式):

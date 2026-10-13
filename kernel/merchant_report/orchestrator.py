@@ -2,6 +2,7 @@
 """任务编排器: 登录 → 按区间下载报表 → 流量/推广抓取(区间自定义模式) → 天气 → 逐日填表 → (可选)LLM解读。
 全程 NDJSON 事件流(协议 v1)。区间 [date_from, date] 内每天一行数据; 填表 top 模式最新日期在第一行。"""
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -142,6 +143,43 @@ def _store_ids_from_rows(rows_by_date, dates, name_key="门店名称", id_key="�
             if nm and vid:
                 out.setdefault(nm, vid)
     return out
+
+
+# ---- 下载类报表(京东)门店行定位: 名称标准化 + 编号优先匹配(规格书 铁律 11 / §4.8) ----
+# 坑: 门店名含间隔号「·」(示例柠檬茶(长沙高桥店)), **漏掉「·」一行都匹配不到**。
+# 标准化: 去空格、全角括号 （）→ 半角 ()、**保留·**(sheet_match.norm 会把 · 一起剥掉, 不能直接套)。
+_JD_NAME_BRACKETS = str.maketrans({"（": "(", "）": ")", "［": "[", "］": "]", "　": ""})
+
+
+def _norm_store_name(s):
+    """门店名标准化(用于逐店行匹配): 去所有空白 + 全角括号→半角, **保留间隔号·**。"""
+    return re.sub(r"[\s]+", "", str(s or "").translate(_JD_NAME_BRACKETS))
+
+
+def _match_store_row(rows, name, store_id=None):
+    """在"某天的逐店行"里定位目标门店行 → (row|None, 说明)。
+
+    优先级(规格书 铁律 11): ① 门店id 精确 ② 名称标准化后精确 ③ 都拿不到 → (None, 原因),
+    由调用方**显式告警**(不再静默 continue)。同归一化名多行 → (None, 多候选原因) 不猜。
+    """
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    sid = str(store_id or "").strip().split(".")[0]
+    if sid:
+        hit = [r for r in rows if str(r.get("门店id") or "").strip().split(".")[0] == sid]
+        if len(hit) == 1:
+            return hit[0], f"编号锁定(门店id={sid})"
+        if len(hit) > 1:
+            return None, f"门店id={sid} 命中 {len(hit)} 行(不猜)"
+    key = _norm_store_name(name)
+    if not key:
+        return None, "门店名为空"
+    hit = [r for r in rows if _norm_store_name(r.get("门店名称")) == key]
+    if len(hit) == 1:
+        return hit[0], "名称标准化后精确匹配"
+    if len(hit) > 1:
+        return None, f"名称「{name}」归一化后命中 {len(hit)} 行(不猜)"
+    return None, ("报表里没有这个门店行(门店名/编号都对不上; 注意门店名含间隔号「·」且括号为半角)"
+                  if not sid else "报表里没有这个门店行(门店id 与名称都对不上)")
 
 
 def _details_scope(sink, store, platform, names, ids_by_name=None, label="门店"):
@@ -368,18 +406,124 @@ def _template_date_gate(sink, human, template, date, cfg):
     return True
 
 
-def _start_weather_prefetch(store, dates, holder):
+def _addr_by_sheet(store):
+    """《门店明细》→ {Sheet 名: 门店地址}(跨平台汇总; 同一 Sheet 取首个非空)。
+
+    未配置 / 老表没有「门店地址」列 → {}(调用方沿用旧口径: 整表一组天气, 不告警)。
+    """
+    p = str(store.get("store_details") or "").strip()
+    if not p:
+        return {}
+    try:
+        from . import store_details as _sd
+        d = _sd.load_store_details(p) or {}
+    except Exception:
+        return {}
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            for sn, addr in (v.get("addr_by_sheet") or {}).items():
+                if str(addr or "").strip():
+                    out.setdefault(str(sn), str(addr).strip())
+    return out
+
+
+def _weather_targets(store, extra=()):
+    """本次要**逐店**取天气的 {Sheet 名: 门店地址}。
+
+    「门店地址」列与「运营报表模板Sheet名」在同一数据行 → 明细里的 Sheet 名就是模板 Sheet 名。
+    单店模式点名要写的表用 extra 带进来(没配地址 → 回退默认长沙)。
+    **没有任何地址配置 → {}(整条链回退旧口径: 整表一组天气, 且不告警)。**
+    """
+    addr = _addr_by_sheet(store)
+    if not addr:
+        return {}
+    out = dict(addr)
+    for sn in extra:
+        if sn:
+            out.setdefault(str(sn), addr.get(str(sn)))
+    return out
+
+
+def _biz_hours_by_sheet(store, platform, rows_by_date, dates, name_key="门店名称", pick=None):
+    """逐店逐日「营业时段」→ {(Sheet 名, 日期): 'HH:MM-HH:MM'}。
+
+    为什么要按店: 温度是**按营业时段窗口**统计的(T01), 各家店的营业时间不同 → 用首店时段
+    取到的温度放到别家店的表里就是错的。报表行名 → Sheet 名用「门店明细 ∪ 模板映射表」
+    (与门店计划同一套映射); 解析不出的门店 **不猜**, 该店温度回落到全天口径(旧行为)。
+    """
+    if not rows_by_date:
+        return {}
+    try:
+        from . import sheet_match
+        _smap = sheet_match.load_store_map(store["template"], platform)
+    except Exception:
+        _smap = {}
+    _by_name, _ = _detail_maps(store, platform)
+    merged = {**(_smap or {}), **(_by_name or {})}
+    out = {}
+    for d in dates:
+        rows = rows_by_date.get(d) or []
+        rows = rows if isinstance(rows, list) else [rows]
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            nm = str(r.get(name_key) or r.get("B") or "").strip()
+            if not nm:
+                continue
+            sn = merged.get(sheet_match._tidy(nm))
+            if not sn:
+                continue
+            biz = (pick or (lambda x: x.get(name_key))) (r)
+            if biz:
+                out.setdefault((sn, d), biz)
+    return out
+
+
+def _wx_of(wx_by_sheet, wmap, sheet, date):
+    """该 Sheet 自己那天的 (天气, 温度)。
+
+    逐店表里没有这张 Sheet(没配地址/新匹配到的表) → 回退主表那组(旧口径)。
+    **绝不**拿别的店的天气顶替 —— 那正是本次要修的错。
+    """
+    per = (wx_by_sheet or {}).get(sheet)
+    if per and per.get(date):
+        return per[date]
+    return (wmap or {}).get(date)
+
+
+def _warn_no_store_weather(sink, sheet, targets, warned):
+    """写入前提示: 这张门店表没能参与逐店取数(门店明细里没配地址) → 回退了主表那组。
+
+    每个 Sheet 只提示一次(逐日逐店会调很多次)。整份明细都没配地址时不提示 ——
+    那是老配置的旧口径, 不是本次引入的问题。
+    """
+    if not sink or not targets or sheet in (warned or ()) or sheet in targets:
+        return
+    warned.add(sheet)
+    sink.log(f"⚠️ 门店「{sheet}」在《门店明细》里没有「门店地址」→ 该表天气/温度按主表口径"
+             f"(默认长沙)填入, C/D 列建议人工核对", level="warn")
+
+
+def _start_weather_prefetch(store, dates, holder, targets=None):
     """后台线程预取天气 —— 纯 HTTP, **不碰 Playwright**, 所以能与浏览器阶段并行。
 
     为什么只能搬天气: Playwright 的 sync API 不能在两个线程里同时操作同一个 context,
     「一边等下载一边抓页面」做不到; 但天气/文件准备这类非浏览器工作可以叠在浏览器时间里。
+    targets(需求 T01) = {Sheet 名: 门店地址} → 线程里**逐店**取(同城同日自动去重);
+    主表仍按账号默认坐标取一份(旧口径不变)。
     """
     import threading
 
     def _run():
         try:
-            holder["map"] = {d: weather_mod.fetch(d, store.get("lat", 28.187),
-                                                  store.get("lon", 112.921)) for d in dates}
+            if targets:
+                by_sheet, warns = weather_mod.fetch_map(targets, dates, label="门店")
+                holder["by_sheet"] = by_sheet
+                holder["warns"] = warns
+            holder["map"] = {d: weather_mod.fetch_cached(d, store.get("lat", 28.187),
+                                                         store.get("lon", 112.921))
+                             for d in dates}
         except Exception as e:
             holder["err"] = str(e)[:80]
 
@@ -390,7 +534,7 @@ def _start_weather_prefetch(store, dates, holder):
 
 
 def _take_weather_map(holder, dates, store, sink=None):
-    """取预取结果(最多等 90s); 没有/失败就原地串行抓一次。返回 {日期: (天气, 温度)}。"""
+    """取预取结果(最多等 90s); 没有/失败就原地串行抓一次。返回 {日期: (天气, 温度)}(主表口径)。"""
     t = holder.get("thread")
     if t is not None:
         t.join(timeout=90)
@@ -401,8 +545,38 @@ def _take_weather_map(holder, dates, store, sink=None):
             return m
         if sink and holder.get("err"):
             sink.log(f"⚠️ 天气预取失败({holder['err']})，改为串行抓取", level="warn")
-    return {d: weather_mod.fetch(d, store.get("lat", 28.187), store.get("lon", 112.921))
+    return {d: weather_mod.fetch_cached(d, store.get("lat", 28.187), store.get("lon", 112.921))
             for d in dates}
+
+
+def _log_weather_warns(sink, warns, limit=8):
+    """逐店天气的告警(缺地址/认不出城市/单店失败)挂到日志 —— 不许静默。"""
+    if not sink:
+        return
+    for w in (warns or [])[:limit]:
+        sink.log("⚠️ " + w, level="warn")
+    if len(warns or []) > limit:
+        sink.log(f"  …另有 {len(warns) - limit} 条逐店天气告警(见上同类)", level="warn")
+
+
+def _take_weather_by_sheet(holder, dates, store, sink=None, targets=None, biz_hours=None):
+    """逐店天气 {Sheet 名: {日期: (天气, 温度)}} —— 预取命中直接复用, 否则原地并发取一次。
+
+    返回 (by_sheet, warns)。用假 sink 的路径都走这里(美团外卖/淘宝的天气在报表解析后才有
+    营业时段, 所以那两条支路不走预取, 直接调本函数)。
+    """
+    t = holder.get("thread") if holder else None
+    if t is not None:
+        t.join(timeout=90)
+        m = holder.get("by_sheet")
+        if isinstance(m, dict) and m:
+            _log_weather_warns(sink, holder.get("warns"))
+            return m, list(holder.get("warns") or [])
+    if not targets:
+        return {}, []
+    by_sheet, warns = weather_mod.fetch_map(targets, dates, biz_hours, label="门店")
+    _log_weather_warns(sink, warns)
+    return by_sheet, warns
 
 
 def _single_store_sheet(store, cfg, template):
@@ -655,10 +829,17 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 pass
     platform = store.get("platform", "taobao")
     # 天气预取: 纯 HTTP 不碰浏览器 → 与整个浏览器阶段并行跑, 后面支路直接复用
-    # (京东实测串行天气 13.3s)。淘宝不预取: 它的天气要报表里的「营业时段」。
+    # (京东实测串行天气 13.3s)。淘宝/美团外卖不预取: 它们的天气要报表里的「营业时段」。
+    # 需求 T01(2026-10-14): targets = 《门店明细》里配了「门店地址」的本模板门店 Sheet
+    # → 线程里**逐店**取; 没配地址 → {}(旧口径: 整表一组天气, 不告警)。
+    # 本次任务开始时清一次进程内天气记忆: 跨任务/跨天重跑不拿旧值(同日同城仍自动去重)。
+    weather_mod.clear_cache()
+    wx_targets = _weather_targets(store)
     wx_holder = {}
     if platform in ("jd", "meituan_gj"):
-        _start_weather_prefetch(store, dates, wx_holder)
+        _start_weather_prefetch(store, dates, wx_holder, targets=wx_targets)
+        if wx_targets:
+            sink.log(f"🌤 天气逐店取: {len(wx_targets)} 家门店(长沙/湘潭分别取; 地址见《门店明细》)")
     if not skip_browser:
         # 失败最多走 3 轮面板: 护栏是用户的选择(面板在重试 2 次后自动隐藏「重试」选项),
         # 不再因"未配置 LLM"只给 1 次机会——否则用户失去跳过/发诊断的机会
@@ -683,6 +864,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 pass
             pw = sync_playwright().start()
             profile_path = Path(cfg.get("browser_profile", app_data_dir() / "browser-profile"))
+            # 后台模式(2026-10-13): None=按平台默认(Windows 后台) —— 由 launch_browser 解析
+            _bg_pref = (cfg.get("defaults") or {}).get("browser_background")
 
             def build_adapter(actx):
                 """建适配器并完成登录。返回 (adapter, ok)。首次启动与重开浏览器都走这里。"""
@@ -752,13 +935,15 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                         cred = store.get("credentials") or {}
                         u, p_ = cred.get("username", ""), cred.get("password", "")
                     from .autologin import auto_login
-                    if not auto_login(a, u, p_, sink, human):
+                    _login_ok = auto_login(a, u, p_, sink, human)
+                    sink.browser_hide()      # 人工登录环节结束 → 浏览器窗口收回后台
+                    if not _login_ok:
                         return a, False
                 a._dismiss_popups()
                 a._discover_shop_id()
                 return a, True
 
-            actx = launch_browser(pw, profile_path, sink=sink)
+            actx = launch_browser(pw, profile_path, sink=sink, background=_bg_pref)
             try:
                 _live = actx.browser
                 if _live is not None:
@@ -790,7 +975,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 launched = False
                 for attempt in (1, 2):
                     try:
-                        actx = launch_browser(pw, profile_path, sink=sink)
+                        actx = launch_browser(pw, profile_path, sink=sink, background=_bg_pref)
                     except Exception as e:
                         sink.log(f"⚠️ 浏览器重开失败(第{attempt}次): {str(e)[:120]}", level="warn")
                         time.sleep(2)
@@ -1000,6 +1185,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     # 口径来源: 脑图 运营报表.pdf 列位置级对应表, 已与真实报表逐列核对 → platforms/meituan_mapping.py
     if platform == "meituan":
         from .platforms import meituan_mapping as mt_map
+        # 诊断容器清零(本次运行从零开始): 表头名对不上的列 + 数值校验告警, 收尾统一打印进 summary
+        mt_map.NAME_FALLBACKS.clear()
+        mt_map.VALIDATE_WARNINGS.clear()
         all_rows = (stats or {}).get("all") or {}
         bao_rows = (stats or {}).get("bao") or {}
         _files = []
@@ -1059,27 +1247,54 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 discovered = [{"id": str(r.get("C", "")), "name": str(r.get("B", ""))}
                               for r in rl if r.get("B")]
 
-        # 3. 天气(逐日; 营业时段取自美团报表对应?列 → biz_hours)
+        # 3. 天气(逐日; 营业时段取自美团报表对应?列 → biz_hours) —— 主表口径(账号默认坐标)
         def do_weather():
             out = {}
             for d in dates:
                 rr = all_rows.get(d) or []
                 rr = rr if isinstance(rr, list) else [rr]
-                out[d] = weather_mod.fetch(d, store.get("lat", 28.187), store.get("lon", 112.921),
-                                           mt_map.biz_hours(rr[0] if rr else {}))
+                out[d] = weather_mod.fetch_cached(d, store.get("lat", 28.187), store.get("lon", 112.921),
+                                                  mt_map.biz_hours(rr[0] if rr else {}))
+
             return out
-        wmap = timed("weather", "天气获取", do_weather) or {}
+
+        # 3.5 逐店天气(T01/铁律 9): 每店按**自己的门店地址**取(长沙/湘潭分别), 温度按该店
+        # **当天**的营业时段窗口统计 —— 各家店的营业时间不同, 拿首店的时段算别家的温度是错的。
+        # 未配地址 → _wx_targets 为空 → 整条链保持旧口径(整表一组), 不告警。
+        # 单门店模式的目标表(要在天气之前定: 逐店取数要把它算进 targets)
+        _one_sheet = _single_store_sheet(store, cfg, store["template"]) if scope == "store" else None
+        _wx_targets = _weather_targets(store, extra=[_one_sheet] if _one_sheet else [])
+        _biz_by = _biz_hours_by_sheet(store, "meituan", all_rows, dates, pick=mt_map.biz_hours)
+
+        def do_weather_all():
+            base = do_weather()
+            if not _wx_targets:
+                return base, {}
+            by_sheet, warns = weather_mod.fetch_map(_wx_targets, dates, _biz_by, label="美团门店")
+            _log_weather_warns(sink, warns)
+            return base, by_sheet
+
+        wmap, wx_by_sheet = timed("weather", "天气获取", do_weather_all) or ({}, {})
         for d in dates:
             if wmap.get(d) and wmap[d][0]:
                 sink.log(f"[天气] {d} → {wmap[d][0]} {wmap[d][1]}")
+        if wx_by_sheet:
+            _cities = sorted({weather_mod.city_of_address(a) or "长沙" for a in _wx_targets.values()})
+            sink.log(f"🌤 天气逐店取: {len(wx_by_sheet)} 家门店 × {len(dates)} 天"
+                     f"（城市: {'、'.join(_cities)}）")
 
         # 4. 填表(区间逐日; top 模式从最旧到最新依次插入 → 最新日期在第一行)
         mode = cfg.get("defaults", {}).get("fill_mode", "auto")
         # 一店一 Sheet(多店模式; 与美团管家同口径): 模板 Sheet 名=地名关键词, 逐店匹配后各自写入。
         # 报表 E~DF 区本就逐店一行 → 按门店名匹配 Sheet; 匹配不到就跳过(不写、不报错、不建 Sheet)。
         store_plan = None
+        # 商圈/推广采集结果容器(在 try 之外声明: 单店模式走不到下面 scope!="store" 的采集分支,
+        # 但填表段要用它们 → 必须存在默认值)
         circle_by_sheet = {}
-        promo_by_sheet = {}      # {Sheet: {日期: {recharge, consume, balance}}} 推广账户流水(CE/CJ)
+        promo_by_sheet = {}      # {Sheet: {日期: {consume, recharge, balance}}} 推广流水(CE/CJ)
+        promo_ov_by_sheet = {}   # {Sheet: {expose, visit}} 推广概览(CF/CG, 仅昨日口径)
+        promo_pri_by_day = {}    # {日期: {consume, recharge}} 主表用量(逐店合计 = 本店或全店合计)
+        promo_pri_ov = None      # 主表 CF/CG 概览(单店=本店; 全店=账号级)
         # 需求 A2: 严格模式标志在 try 之外初始化 —— 下面的建表/兜底剔除分支要用到它, 而
         # "_names 为空 / plan 异常" 等路径不会走到 try 内部赋值(否则 UnboundLocalError)。
         _sc = {"strict": False, "names": [], "by_name": {}, "by_id": {}, "skipped": []}
@@ -1152,80 +1367,194 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                     store_plan["matched"].append((_nm, _sn, _why))
                     sink.log(f"  🔗 门店「{_nm}」→ Sheet「{_sn}」（{_why}）")
             _apply_strict_plan(sink, store_plan, _sc, label="门店")
-            # 商圈Top: 仅**单门店视角**可得(wmPoiId=门店编号)。用户口径: 做单门店数据时才采集,
-            # 全部门店模式不采集(Top 列留空)。抓不到就留空, 绝不臆造。
-            circle_by_sheet = {}
-            promo_by_sheet = {}          # {Sheet: {日期: {recharge, consume, balance}}} ← 推广账户流水
-            _cap_on = (cfg.get("defaults") or {}).get("capture_circle_top") is not False
-            # 门槛必须**说明白为什么没跑**: 2026-09-28 用户报「TOP 还是没取到」时, 日志里
-            # 一条商圈记录都没有 → 既不知道跑没跑, 也不知道卡在哪。这里逐个条件给理由。
-            if _cap_on and abort_salvage:
-                sink.log("⏭️ 已按「结束任务」停止后续商圈抓取 → 商圈列留空(重跑补)", level="warn")
-            elif not _cap_on:
-                sink.log("ℹ️ 商圈Top: 配置已关闭(defaults.capture_circle_top=false) → 跳过", level="warn")
-            elif ad_holder.get("ad") is None:
-                sink.log("ℹ️ 商圈Top: 本次无可用浏览器会话(如 skip_browser 复用报表) → 跳过", level="warn")
-            elif not (store_plan and store_plan.get("matched")):
-                sink.log(f"ℹ️ 商圈Top: 未匹配到模板门店 Sheet(scope={scope}, "
-                         f"匹配 {len((store_plan or {}).get('matched') or [])} 店) → 跳过。"
-                         f"(商圈值按门店写入各自 Sheet; 单门店模式需另外写主表)", level="warn")
-            if store_plan and store_plan.get("matched") and _cap_on and ad_holder.get("ad") is not None:
-                _ad = ad_holder["ad"]
-                _rows_last = all_rows.get(dates[-1]) or []
-                _rows_last = _rows_last if isinstance(_rows_last, list) else [_rows_last]
-                _id_by_name = {str(r.get("B") or "").strip(): str(r.get("C") or "").strip()
-                               for r in _rows_last if isinstance(r, dict) and r.get("B")}
-                sink.step_start("circle", "采集商圈Top",
-                                f"单门店视角 × {len(store_plan['matched'])} 店 × {dates[-1]}")
-                for _nm, _sn, _why in store_plan["matched"]:
-                    _sid = _id_by_name.get(_nm) or ""
+        # ---- 推广取数(CE/CJ 流水 + CF/CG 概览, 与商圈采集共用同一次浏览器会话) ----
+        # 2026-10-14 (规格书 §4.4/T04): 推广是**独立数据域**, 不再挂在「商圈Top」开关上。
+        #   · CE/CJ ← 对账页「推广费流水记录」按**自定义日期=目标日**过滤: CE =「推广订单扣款」
+        #     绝对值合计; CJ =「推广账户自动充值」合计(capture_promo_ledger)。
+        #   · CF/CG ← 推广概览页**切「昨日」**后读「总曝光量/总进店量」(capture_promo):
+        #     只有目标日==昨天才有值, 历史日期按规格书铁律 6 填 0。
+        # (容器已在上面声明, 这里只填内容 —— circle_by_sheet/promo_* 都按 Sheet+日期 存)
+        _yday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        _ad = ad_holder.get("ad")
+        _matched = list((store_plan or {}).get("matched") or [])
+        _ledger_fn = getattr(_ad, "capture_promo_ledger", None) if _ad is not None else None
+        _ov_fn = getattr(_ad, "capture_promo", None) if _ad is not None else None
+        # 单门店模式: 没有「门店 Sheet 计划」, 但推广列同样要按本店取(主表行 = 本店)。
+        #   本店编号优先级: 配置里的门店 id → 报表行(门店名称/关键词)匹配到的门店id。
+        #   两者都拿不到 → 不猜, 走「报表里没有门店编号」告警(CE/CJ/CF/CG 留空)。
+        if not _matched and scope == "store":
+            _sid0 = str(store.get("id") or "").strip()
+            if not _sid0:
+                _rows_l = all_rows.get(dates[-1]) or []
+                _rows_l = _rows_l if isinstance(_rows_l, list) else [_rows_l]
+                _kw0 = str(store.get("keyword") or store.get("name") or "").strip()
+                _hit0 = next((r for r in _rows_l if _kw0 and _kw0 in str(r.get("B") or "")), None)
+                if _hit0 is None and len(_rows_l) == 1:
+                    _hit0 = _rows_l[0]
+                _sid0 = str((_hit0 or {}).get("C") or "").strip()
+            if _sid0:
+                _matched = [(str(store.get("name") or store.get("keyword") or "本店"), None, _sid0)]
+        if _ad is not None and _matched and not abort_salvage:
+            _rows_last = all_rows.get(dates[-1]) or []
+            _rows_last = _rows_last if isinstance(_rows_last, list) else [_rows_last]
+            _id_by_name = {str(r.get("B") or "").strip(): str(r.get("C") or "").strip()
+                           for r in _rows_last if isinstance(r, dict) and r.get("B")}
+            if callable(_ledger_fn):
+                sink.step_start("promo", "采集推广", f"{len(_matched)} 店 × CE/CJ 流水"
+                                + ("+ CF/CG 概览(昨日)" if dates[-1] == _yday else "(CF/CG: 非昨日→0)"))
+                for _nm, _sn, _why in _matched:
+                    _sid = _why if _sn is None else (_id_by_name.get(_nm) or "")
                     if not _sid:
-                        sink.log(f"  · {_nm}: 报表里没有门店编号, 跳过商圈采集", level="warn")
+                        sink.log(f"  · {_nm}: 报表里没有门店编号, 跳过推广抓取", level="warn")
                         continue
-                    # 推广账户流水(CE 消耗 / CJ 充值): 同一次浏览器会话里顺手取, 按店按天
-                    # (真流水表能取历史日期 → 不再是"只有昨日口径、非末日就留空")
-                    # 只有实现了该接口的平台才走(目前=美团); 淘宝/京东走各自机制, 避免每店抛属性错误。
-                    _ledger_fn = getattr(_ad, "capture_promo_ledger", None)
-                    if callable(_ledger_fn):
-                        for _d in dates:
-                            try:
-                                _pl = _ledger_fn(_sid, _d)
-                                if not isinstance(_pl, dict):
-                                    _pl = None
-                            except Exception as e:
-                                sink.log(f"  · {_nm}: 推广流水异常 {str(e)[:70]}", level="warn")
+                    for _d in dates:
+                        try:
+                            _pl = _ledger_fn(_sid, _d)
+                            if not isinstance(_pl, dict):
                                 _pl = None
-                            if _pl and (_pl.get("recharge") is not None
-                                        or _pl.get("consume") is not None):
-                                promo_by_sheet.setdefault(_sn, {})[_d] = _pl
-                    _capd = None
-                    _ct0 = time.time()
-                    try:
-                        _capd = _ad.capture_circle(_sid, date=dates[-1])
-                    except Exception as e:
-                        sink.log(f"  · {_nm}: 商圈采集异常 {str(e)[:80]}", level="warn")
-                    if _capd:
-                        circle_by_sheet[_sn] = _capd
-                        _mm = mt_map.circle_write_set_all(_capd)
-                        sink.log(f"  ✓ {_nm} → 商圈列 主站{len(_mm['main'])}/拼好饭{len(_mm['bao'])}"
-                                 f"（口径 {_capd.get('bench') or '默认'} · {time.time() - _ct0:.0f}s）")
-                    else:
-                        sink.log(f"  · {_nm}: 商圈数据未取到(该店 Top 列留空)", level="warn")
-                sink.step_ok("circle", "采集商圈Top",
-                             f"{len(circle_by_sheet)}/{len(store_plan['matched'])} 店取到商圈值")
-            # 商圈采集是本任务最后一次用浏览器 → 到这里才真正释放
-            _stop_browser()
+                        except Exception as e:
+                            sink.log(f"  · {_nm}: 推广流水异常 {str(e)[:70]}", level="warn")
+                            _pl = None
+                        if _pl and (_pl.get("consume") is not None
+                                    or _pl.get("recharge") is not None):
+                            _sink_sheet = _sn if _sn else "_本店"
+                            promo_by_sheet.setdefault(_sink_sheet, {})[_d] = _pl
+                    # CF/CG: 仅「目标日==昨天」时抓概览(切昨日+硬验收在 capture_promo 内)
+                    if dates[-1] == _yday and callable(_ov_fn):
+                        try:
+                            _pv = _ov_fn(store_id=_sid)
+                        except Exception as e:
+                            sink.log(f"  · {_nm}: 推广概览异常 {str(e)[:70]}", level="warn")
+                            _pv = None
+                        if _pv:
+                            promo_ov_by_sheet[_sn if _sn else "_本店"] = _pv
+                # 主表用量: 各店逐日求和(单店模式=本店; 全部门店模式=该账号下已匹配各店合计)
+                for _byb in promo_by_sheet.values():
+                    for _d, _v in (_byb or {}).items():
+                        _acc = promo_pri_by_day.setdefault(_d, {})
+                        for _k in ("consume", "recharge"):
+                            if _v.get(_k) is not None:
+                                _acc[_k] = round((_acc.get(_k) or 0) + _v[_k], 2)
+                # 主表 CF/CG 来源: 单店模式=本店概览; 全店模式=账号级概览(capture_stats 里那份,
+                # 同样过了「昨日」硬验收)
+                if scope == "store":
+                    promo_pri_ov = promo_ov_by_sheet.get("_本店")
+                else:
+                    promo_pri_ov = (stats or {}).get("promo") or None
+                sink.step_ok("promo", "采集推广",
+                             f"流水 {len(promo_by_sheet)} 店 / 概览 {len(promo_ov_by_sheet)} 店")
+            else:
+                sink.log("ℹ️ 推广: 本平台无 capture_promo_ledger → 跳过(淘宝/京东走各自机制)")
+        elif abort_salvage:
+            sink.log("⏭️ 已按「结束任务」停止推广抓取 → CE~CG 留空(重跑补)", level="warn")
+        elif _ad is None:
+            sink.log("ℹ️ 推广: 本次无可用浏览器会话 → CE~CG 留空", level="warn")
+        elif not _matched:
+            sink.log(f"ℹ️ 推广: 未匹配到模板门店 Sheet(scope={scope}) → CE/CJ 留空"
+                     f"(推广流水按门店写入各自 Sheet)", level="warn")
+        # 商圈Top: 仅**单门店视角**可得(wmPoiId=门店编号)。用户口径: 做单门店数据时才采集,
+        # 全部门店模式不采集(Top 列留空)。抓不到就留空, 绝不臆造。
+        _cap_on = (cfg.get("defaults") or {}).get("capture_circle_top") is not False
+        # 门槛必须**说明白为什么没跑**: 2026-09-28 用户报「TOP 还是没取到」时, 日志里
+        # 一条商圈记录都没有 → 既不知道跑没跑, 也不知道卡在哪。这里逐个条件给理由。
+        if _cap_on and abort_salvage:
+            sink.log("⏭️ 已按「结束任务」停止后续商圈抓取 → 商圈列留空(重跑补)", level="warn")
+        elif not _cap_on:
+            sink.log("ℹ️ 商圈Top: 配置已关闭(defaults.capture_circle_top=false) → 跳过", level="warn")
+        elif ad_holder.get("ad") is None:
+            sink.log("ℹ️ 商圈Top: 本次无可用浏览器会话(如 skip_browser 复用报表) → 跳过", level="warn")
+        elif not (store_plan and store_plan.get("matched")):
+            sink.log(f"ℹ️ 商圈Top: 未匹配到模板门店 Sheet(scope={scope}, "
+                     f"匹配 {len((store_plan or {}).get('matched') or [])} 店) → 跳过。"
+                     f"(商圈值按门店写入各自 Sheet; 单门店模式需另外写主表)", level="warn")
+        if store_plan and store_plan.get("matched") and _cap_on and ad_holder.get("ad") is not None:
+            _ad = ad_holder["ad"]
+            _rows_last = all_rows.get(dates[-1]) or []
+            _rows_last = _rows_last if isinstance(_rows_last, list) else [_rows_last]
+            _id_by_name = {str(r.get("B") or "").strip(): str(r.get("C") or "").strip()
+                           for r in _rows_last if isinstance(r, dict) and r.get("B")}
+            sink.step_start("circle", "采集商圈Top",
+                            f"单门店视角 × {len(store_plan['matched'])} 店 × {dates[-1]}")
+            for _nm, _sn, _why in store_plan["matched"]:
+                _sid = _id_by_name.get(_nm) or ""
+                if not _sid:
+                    sink.log(f"  · {_nm}: 报表里没有门店编号, 跳过商圈采集", level="warn")
+                    continue
+                _capd = None
+                _ct0 = time.time()
+                try:
+                    _capd = _ad.capture_circle(_sid, date=dates[-1])
+                except Exception as e:
+                    sink.log(f"  · {_nm}: 商圈采集异常 {str(e)[:80]}", level="warn")
+                if _capd:
+                    circle_by_sheet[_sn] = _capd
+                    _mm = mt_map.circle_write_set_all(_capd)
+                    sink.log(f"  ✓ {_nm} → 商圈列 主站{len(_mm['main'])}/拼好饭{len(_mm['bao'])}"
+                             f"（口径 {_capd.get('bench') or '默认'} · {time.time() - _ct0:.0f}s）")
+                else:
+                    sink.log(f"  · {_nm}: 商圈数据未取到(该店 Top 列留空)", level="warn")
+            sink.step_ok("circle", "采集商圈Top",
+                         f"{len(circle_by_sheet)}/{len(store_plan['matched'])} 店取到商圈值")
+        # 商圈/推广采集是本次任务最后一次用浏览器 → 到这里才真正释放
+        _stop_browser()
         per_store_filled = []
-        # 推广数据: 推广页仅支持「昨日」快捷口径 → 只填区间末日(dates[-1] 恒为最新一天,
-        # top 模式填在第一行); 其余天推广列留空。页面日期与末日不一致时同样留空, 不错位填。
-        promo = (stats or {}).get("promo") or {}
-        promo_vals = {}
-        if promo.get("spend") is not None and promo.get("date") == dates[-1]:
-            promo_vals = {"CE": promo.get("spend"), "CF": promo.get("expose"),
-                          "CG": promo.get("visit")}
-        elif promo:
-            sink.log(f"⚠️ 推广数据日期({promo.get('date')})与区间末日({dates[-1]})不一致, 推广列留空",
-                     level="warn")
+        # ---- 推广列(CE/CJ 流水 + CF/CG 概览) ----
+        # 2026-10-14 口径重排(修复规格书 §4.4/T04 + 坑清单 7/8/9):
+        #   · CE ← 对账页「推广费流水记录」当日「**推广订单扣款**」金额**绝对值合计**(逐店按日; 主表=各店合计);
+        #   · CJ ← 同页当日「推广账户自动充值」合计;
+        #   · CF/CG ← 推广概览页**切「昨日」并硬验收**后的「总曝光量/总进店量」。该页只有「昨日」快捷口径
+        #     (无自定义日期), 所以: 目标日==昨天 → 写抓到的值; **其他日期写数值 0**(铁律 6, 不是留空)。
+        #   · 一律**不再**用概览「总推广花费」/旧账户页「推广消费」当 CE(两者与真实扣款差一天, 会写错)。
+        #   · 读不到 → 该列**不进 write_set**(留空) + 告警, 绝不拿旧口径或别天的值顶替。
+        _yday_main = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        _promo_warned = set()
+
+        def _promo_vals(day, sheet=None):
+            """该日·该Sheet(或主表)的推广列 → {CE/CJ/CF/CG 子集}; 取不到的键**不出现**(留空)。"""
+            out = {}
+            if sheet is None:
+                _v = (promo_pri_by_day or {}).get(day) or {}
+                _ov, _tag = promo_pri_ov, "主表"
+            else:
+                _v = ((promo_by_sheet.get(sheet) or {}).get(day)) or {}
+                _ov, _tag = promo_ov_by_sheet.get(sheet), f"[{sheet}]"
+            for _k, _c in (("consume", "CE"), ("recharge", "CJ")):
+                if _v.get(_k) is not None:
+                    out[_c] = _v[_k]
+            if not out.get("CE") and not out.get("CJ"):
+                # 该日流水没取到(页面读失败 / 该日无流水记录) → 留空, 不用任何旧口径顶替
+                if day not in _promo_warned:
+                    _promo_warned.add(day)
+                    sink.log(f"ℹ️ {_tag} 推广流水({day})未取到 → CE/CJ 留空"
+                             f"(不用概览「总花费」或旧账户页「推广消费」顶替)", level="warn")
+            if day == _yday_main:
+                _ov = _ov or {}
+                if (_ov.get("expose") is not None and _ov.get("visit") is not None
+                        and str(_ov.get("date") or day) == day):
+                    out["CF"], out["CG"] = _ov["expose"], _ov["visit"]
+                else:
+                    # 目标日=昨天但概览没通过「昨日」硬验收 → 留空(不写 0: 0 会被读成"确实没曝光")
+                    if "ov" not in _promo_warned:
+                        _promo_warned.add("ov")
+                        sink.log(f"⚠️ {_tag} 推广概览「昨日」未取到或未通过验收 → CF/CG 留空"
+                                 f"(不使用「今日」实时值冒充)", level="warn")
+            else:
+                # 非昨日: 概览页没有该日口径 → 铁律 6: 数值 0(不是留空)
+                out["CF"] = out["CG"] = 0
+            return out
+
+        def _promo_summary():
+            """收尾文案(给 UI): 直接说清 CE/CJ 来源与 CF/CG 是否为本期有效口径。"""
+            _has_ce = any(("consume" in ((promo_pri_by_day or {}).get(d) or {})) for d in dates)
+            _has_re = any(("recharge" in ((promo_pri_by_day or {}).get(d) or {})) for d in dates)
+            _ov_ok = bool(promo_pri_ov and promo_pri_ov.get("expose") is not None)
+            if dates[-1] == _yday_main:
+                _cf = (f"CF/CG=概览「昨日」{promo_pri_ov.get('expose')}/{promo_pri_ov.get('visit')}"
+                       if _ov_ok else "CF/CG 未取到(概览「昨日」未通过验收→留空)")
+            else:
+                _cf = f"CF/CG=0(目标日{dates[-1]}≠昨天{_yday_main}, 概览页无该日口径)"
+            return (f"CE{'✓' if _has_ce else '✗'}/CJ{'✓' if _has_re else '✗'}"
+                    f" 来自对账页「推广费流水记录」(扣款绝对值/自动充值; 按日按店); {_cf}")
         filled_rows, fill_errs = [], []
         sink.step_start("fill", "填入模板", f"区间 {dates[0]}~{dates[-1]} 共{len(dates)}天 (美团 E~DF)")
         # 先算 write_set, 最后批量写一次(逐日逐店直接写 = 每店一轮读+写+存+回读)
@@ -1240,14 +1569,16 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             # 真会写主表时才提示(单店模式压根不写主表, 不说); 信息级 —— 这是避让, 不是错误
             sink.log("  ℹ️ " + main_fallback_note(_fell_main, _fell_why), level="info")
         fill_jobs = []
+        _warned = set()      # 逐店天气缺失提示去重(见 _warn_no_store_weather)
         for d in sorted(dates):
             A, B = pick_pair(d)
             if A is None:
                 fill_errs.append(f"{d}: 未匹配到门店行")
                 continue
-            ws = mt_map.build_write_set(A, B, weather=wmap.get(d))
-            if d == dates[-1] and promo_vals:
-                ws.update(promo_vals)
+            ws = mt_map.build_write_set(A, B, weather=_wx_of(wx_by_sheet, wmap, _one_sheet or _main, d))
+            # 推广列: CE/CJ 流水 + CF/CG(昨日口径; 非昨日=0)。同样过一遍数值校验
+            # (人数/金额须 ≥0 —— 负数不写 + 固定文案), 免得推广列绕开铁律 8。
+            ws.update(mt_map.validate_write_set(_promo_vals(d)))
             blank = sorted(k for k, v in ws.items() if v is None)
             if blank:
                 sink.log(f"  · {d} 无数据留空 {len(blank)} 列: {','.join(blank)}", level="warn")
@@ -1264,19 +1595,17 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                         continue
                     _brow = next((r for r in _brows if str(r.get("B") or "").strip() == _nm), None)
                     try:
-                        _ws2 = mt_map.build_write_set(_row, _brow, weather=wmap.get(d))
+                        _warn_no_store_weather(sink, _sn, _wx_targets, _warned)
+                        _ws2 = mt_map.build_write_set(_row, _brow,
+                                                      weather=_wx_of(wx_by_sheet, wmap, _sn, d))
                         _c = circle_by_sheet.get(_sn)
                         if _c and d == dates[-1]:
                             _cw = mt_map.circle_write_set_all(_c)
                             _ws2.update(_cw["main"])
                             _ws2.update(_cw["bao"])
-                        # 推广账户流水(按店按日): CE 推广消耗 / CJ 充值金额
-                        # 来自 /ad/v1/pc#/account 的**真流水表**, 能取任意历史日期(概览页只有昨日/近7日/近30日)。
-                        _pl = ((promo_by_sheet.get(_sn) or {}).get(d)) or {}
-                        if _pl.get("consume") is not None:
-                            _ws2["CE"] = _pl["consume"]
-                        if _pl.get("recharge") is not None:
-                            _ws2["CJ"] = _pl["recharge"]
+                        # 推广列(按店按日): CE/CJ ← 对账页「推广订单扣款绝对值/自动充值」流水;
+                        # CF/CG ← 概览页「昨日」硬验收值(非昨日=0)。取不到 → 该列不写(留空)。
+                        _ws2.update(mt_map.validate_write_set(_promo_vals(d, _sn)))
                         fill_jobs.append((_sn, d, _ws2))
                     except Exception as e:
                         fill_errs.append(f"[{_sn}] {d}: {str(e)[:70]}")
@@ -1319,8 +1648,19 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                                     f"{next(iter(circle_by_sheet.values())).get('bench') or '默认'}）"
                                     if circle_by_sheet else
                                     "未采集(仅单门店视角可得：全部门店模式或单店漏斗不可用时留空)"),
-                        "推广": (f"已填昨日值(费用{promo.get('spend')}/曝光{promo.get('expose')}/进店{promo.get('visit')})"
-                                 if promo_vals else "未取到(CE~CG 留空; 推广页仅昨日口径)")})
+                        "推广": _promo_summary()})
+        # 数值合理性校验(规格书 铁律 8 / T11) + 表头名回退诊断: 收尾统一打印, 便于 grep 复验
+        for _w in mt_map.validate_report():
+            sink.log(_w, level="warn")
+            summary.setdefault("数值校验", []).append(_w)
+        if mt_map.NAME_FALLBACKS:
+            _nf = sorted(set(mt_map.NAME_FALLBACKS))
+            sink.log(f"⚠️ 表头名对不上的列 {len(_nf)} 个(按名取值失败 → 留空): {'、'.join(_nf[:10])}",
+                     level="warn")
+            summary.setdefault("待人工核对列(表头名对不上)", []).extend(_nf)
+        if fill_errs:
+            # B4(T10): 下载/解析/门店行未匹配等失败必须进 summary, 不能只躺在日志里
+            summary["失败明细"] = "; ".join(fill_errs[:5])
         if per_store_filled:
             summary["一店一Sheet"] = (f"{len({s for _, s, _ in per_store_filled})} 个 Sheet / "
                                       f"{len(per_store_filled)} 次写入(逐日逐店)")
@@ -1343,7 +1683,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 from .llm import daily_report
                 last = dates[-1]
                 a_last, b_last = pick_pair(last)
-                wl = mt_map.build_write_set(a_last, b_last, weather=wmap.get(last))
+                wl = mt_map.build_write_set(a_last, b_last,
+                                            weather=_wx_of(wx_by_sheet, wmap, _one_sheet or _main, last))
                 data = {"商家": store["name"], "日期": last, "平台": "美团外卖",
                         "总营业额": wl.get("E"), "总营业收入": wl.get("F"), "总订单量": wl.get("G"),
                         "平台活动补贴": wl.get("H"),
@@ -1354,7 +1695,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                         "消息回复率": wl.get("DB"), "营业时段": wl.get("DC"),
                         "主站曝光": wl.get("L"), "主站进店": wl.get("O"),
                         "拼好饭曝光": wl.get("AX"), "拼好饭进店": wl.get("BA"),
-                        "天气": (wmap.get(last) or (None, None))[0],
+                        "天气": (_wx_of(wx_by_sheet, wmap, _one_sheet or _main, last) or (None, None))[0],
                         "商圈TOP流量": "PC端无数据源, 列留空(勿推测)",
                         "推广数据": "未抓取(消耗/曝光暂缺, 勿推测)"}
                 text = daily_report(llm_client, data, on_delta=lambda t: sink.llm_delta("daily_report", t))
@@ -1366,14 +1707,19 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         sink.result(ok=True, outputs=outputs, summary=summary)
         return {"outputs": outputs, "summary": summary, "dates": dates}
 
-    # 1.6 京东支路: 门店报表 xlsx(每店每天一行) → 聚合行 → 模板 HI~HK(京东外卖数据)
+    # 1.6 京东支路: 门店报表 xlsx(每店每天一行) → 聚合行 → 模板 HH~HJ(京东外卖数据)
     if platform == "jd":
         from .platforms import jd_mapping
+        jd_mapping.IDENTITY_WARNINGS.clear()   # 诊断容器清零(本次运行从零开始)
         jd_rows = (stats or {}).get("rows") or {}
+        _jd_src = ""
         if not jd_rows:      # skip_browser / 复用已有报表
             f = JDAdapter._find_jd_file(str(ddir), date_from, date)
+            _jd_src = (f"目录已有: {os.path.basename(f)}" if f else f"目录 {ddir} 无目标区间报表")
             if f:
                 jd_rows = JDAdapter._parse_jd_file(f)
+        else:
+            _jd_src = f"本次下载: {os.path.basename(str((stats or {}).get('file') or '')) or '会话内'}"
         # 一店一 Sheet 用的逐店行(报表本就是一店一行, 聚合版把它们加成一个数)
         jd_rows_store = (stats or {}).get("rows_by_store") or {}
         if not jd_rows_store:
@@ -1381,14 +1727,18 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             if _fs:
                 jd_rows_store = JDAdapter._parse_jd_rows(_fs)
         if not jd_rows:
-            sink.result(False, error_code="E_NO_REPORT",
-                        message=f"京东 {date_from}~{date} 报表无可用数据行(下载或解析失败)", retryable=True)
+            # D4/T10: 解析失败(空)必须显式告警 → 带上门店/日期/原因, 并进 summary(不只躺在日志里)
+            _m = (f"京东报表解析失败/无数据行[{store.get('name', '')}][{date_from}~{date}]: "
+                  f"文件缺失或解析出 0 行({_jd_src})")
+            sink.log("⚠️ " + _m, level="warn")
+            sink.result(False, error_code="E_NO_REPORT", message=_m, retryable=True)
             return None
         missing = [d for d in dates if d not in jd_rows]
         if missing:
             if len(missing) == len(dates):
                 sink.result(False, error_code="E_NO_REPORT",
-                            message=f"京东报表内缺少这些日期: {', '.join(missing)}(收入数据每日10点更新, 可稍后重试)",
+                            message=f"京东报表内缺少这些日期: {', '.join(missing)}"
+                                    f"(文档 {_jd_src}; 收入数据每日10点更新, 可稍后重试)",
                             retryable=True)
                 return None
             # 2026-10-09 用户口径(照写): 只缺部分日期时不再整单作废 —— 已有日期先写入, 缺失留空, 重跑覆写。
@@ -1396,14 +1746,17 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                      f"缺失留空(收入数据每日10点更新, 重跑补齐)", level="warn")
             dates = [d for d in dates if d in jd_rows]
 
-        # 3. 天气(京东报表无营业时段, 传空)
+        # 3. 天气(京东报表无营业时段, 传空); 逐店(T01): 每店按自己的门店地址取
         wmap = timed("weather", "天气获取",
                      lambda: _take_weather_map(wx_holder, dates, store, sink)) or {}
+        wx_by_sheet, _ = _take_weather_by_sheet(wx_holder, dates, store, sink, targets=wx_targets)
         for d in dates:
             if wmap.get(d) and wmap[d][0]:
                 sink.log(f"[天气] {d} → {wmap[d][0]} {wmap[d][1]}")
+        if wx_by_sheet:
+            sink.log(f"🌤 天气逐店取: {len(wx_by_sheet)} 家门店 × {len(dates)} 天")
 
-        # 4. 填表(HI~HK) + 一店一 Sheet(与淘宝/美团同口径: Sheet 名=地名关键字, 缺则新建)
+        # 4. 填表(HH~HJ) + 一店一 Sheet(与淘宝/美团同口径: Sheet 名=地名关键字, 缺则新建)
         mode = cfg.get("defaults", {}).get("fill_mode", "auto")
         filled_rows, fill_errs = [], []
         per_store_filled = []
@@ -1413,7 +1766,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                                             _store_names_from_rows(jd_rows_store, dates), cfg,
                                             ids_by_name=_store_ids_from_rows(jd_rows_store, dates,
                                                                              id_key="门店id"))
-        sink.step_start("fill", "填入模板", f"区间 {dates[0]}~{dates[-1]} 共{len(dates)}天 (京东 HI~HK)")
+        sink.step_start("fill", "填入模板", f"区间 {dates[0]}~{dates[-1]} 共{len(dates)}天 (京东 HH~HJ)")
         # 先算 write_set, 最后批量写入一次(逐日逐店直接写 = 每店一轮读+写+存+回读)
         # 主数据表 = 默认解析(第 3 个 sheet; 可用 config defaults.main_sheet 覆盖),
         # 且若解析结果**同时是本次要写的门店 Sheet** → 撞车保护回退 Sheet2(汇总绝不能冲门店数据)
@@ -1426,8 +1779,18 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             # 真会写主表时才提示(单店模式压根不写主表, 不说); 信息级 —— 这是避让, 不是错误
             sink.log("  ℹ️ " + main_fallback_note(_fell_main, _fell_why), level="info")
         fill_jobs = []
+        _warned = set()
+        _row_errs = []      # D4/T10: 逐店行取不到/多候选 → 显式告警并进 summary, 不静默
+        # 京东编号来源(规格书 铁律 11): 真实《门店明细》没有京东组 → {}; 将来配了就用编号优先锁行
+        # (by_name_id: 规范化店名→编号, 与报表第 2 列「门店id」同口径)。
+        _jd_ids = _switch_id_map(store, "jd")
+        try:
+            from . import sheet_match as _sm
+        except Exception:
+            _sm = None
         for d in sorted(dates):
-            ws = jd_mapping.build_write_set(jd_rows.get(d), weather=wmap.get(d))
+            ws = jd_mapping.build_write_set(jd_rows.get(d),
+                                            weather=_wx_of(wx_by_sheet, wmap, _one_sheet or _main, d))
             blank = sorted(k for k, v in ws.items() if v is None)
             if blank:
                 sink.log(f"  · {d} 无数据留空 {len(blank)} 列: {','.join(blank)}", level="warn")
@@ -1437,12 +1800,24 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 _srows = jd_rows_store.get(d) or []
                 _srows = _srows if isinstance(_srows, list) else [_srows]
                 for _nm, _sn, _why in store_plan["matched"]:
-                    _row = next((r for r in _srows
-                                 if isinstance(r, dict)
-                                 and str(r.get("门店名称") or "").strip() == _nm), None)
+                    _sid = _jd_ids.get(_sm._tidy(_nm)) if (_jd_ids and _sm) else None
+                    _row, _rmatch = _match_store_row(_srows, _nm, store_id=_sid)
                     if _row is None:
+                        # 规格书 铁律 7/11: 取不到目标门店行 → **报错不得静默留空**
+                        _msg = f"[{_sn}] {d} 取不到京东门店行「{_nm}」: {_rmatch}"
+                        sink.log("⚠️ " + _msg, level="warn")
+                        _row_errs.append(_msg)
                         continue
-                    fill_jobs.append((_sn, d, jd_mapping.build_write_set(_row, weather=wmap.get(d))))
+                    _warn_no_store_weather(sink, _sn, wx_targets, _warned)
+                    _ws_row = jd_mapping.build_write_set(
+                        _row, weather=_wx_of(wx_by_sheet, wmap, _sn, d))
+                    if not any(_ws_row.get(c) is not None for c in ("HH", "HI", "HJ")):
+                        # 行内自校验不成立(或收入/营业额/支出全空) → 该行不写, 由 jd_mapping 已记告警
+                        _msg = f"[{_sn}] {d} 京东门店行「{_nm}」未通过行内自校验 → 该行不写入"
+                        sink.log("⚠️ " + _msg + "(见 [京东行内校验] 原始值)", level="warn")
+                        _row_errs.append(_msg)
+                        continue
+                    fill_jobs.append((_sn, d, _ws_row))
         _main_names = {SHEET} | {str(m) for m in ((cfg.get("defaults") or {}).get("main_sheets") or [])}
         try:
             _results = fill_many(store["template"], fill_jobs, mode=mode,
@@ -1480,9 +1855,18 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         elif store_plan:
             summary["一店一Sheet"] = (f"未写入（匹配到 {len(store_plan.get('matched') or [])} 家，"
                                       f"检查模板 Sheet 名）")
+        if _row_errs:
+            # D4/T10: 取不到目标门店行 → 汇总计数进 summary(逐条 warn 已在上面打过)
+            summary["取不到门店行(已跳过)"] = f"{len(_row_errs)} 条: " + "; ".join(_row_errs[:3])
         _skip_txt = _strict_summary(store_plan, _plan_scope(store_plan))
         if _skip_txt:
             summary["不在门店明细中(已跳过)"] = _skip_txt
+        # D4/T10: 行内自校验(收入=营业额−支出)+ 取不到门店行 → **进 summary**(不只躺在日志里)
+        for _w in jd_mapping.identity_report():
+            sink.log("⚠️ " + _w, level="warn")
+            summary.setdefault("行内自校验未过", []).append(_w)
+        if _row_errs:
+            summary["失败明细"] = "; ".join(_row_errs[:5])
         outputs.append(store["template"])
 
         # 5. LLM 解读(京东区数据少, 只喂实有字段)
@@ -1490,10 +1874,11 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             try:
                 from .llm import daily_report
                 last = dates[-1]
-                wl = jd_mapping.build_write_set(jd_rows.get(last), weather=wmap.get(last))
+                wl = jd_mapping.build_write_set(jd_rows.get(last),
+                                                weather=_wx_of(wx_by_sheet, wmap, _one_sheet or _main, last))
                 data = {"商家": store["name"], "日期": last, "平台": "京东到家",
-                        "营业额": wl.get("HI"), "营业收入": wl.get("HJ"), "订单量": wl.get("HK"),
-                        "天气": (wmap.get(last) or (None, None))[0]}
+                        "营业额": wl.get("HH"), "营业收入": wl.get("HI"), "订单量": wl.get("HJ"),
+                        "天气": (_wx_of(wx_by_sheet, wmap, _one_sheet or _main, last) or (None, None))[0]}
                 text = daily_report(llm_client, data, on_delta=lambda t: sink.llm_delta("daily_report", t))
                 sink.llm_done("daily_report")
                 summary["llm_report"] = text
@@ -1529,6 +1914,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
 
         wmap = timed("weather", "天气获取",
                      lambda: _take_weather_map(wx_holder, dates, store, sink)) or {}
+        # 逐店(T01): 每店按自己的门店地址取; 温度按**该店自己的营业时段**? 管家报表只有当天
+        # 一份数据(不带营业时段) → 传空(全天口径, 与旧行为一致)
+        wx_by_sheet, _ = _take_weather_by_sheet(wx_holder, dates, store, sink, targets=wx_targets)
 
         mode = cfg.get("defaults", {}).get("fill_mode", "auto")
         # 门店 ↔ Sheet 计划: 模板是权威(一店一 Sheet, Sheet 名=地名关键词), 按关键词匹配;
@@ -1599,7 +1987,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         fill_jobs = []
         for name, sn, _why in plan["matched"]:
             try:
-                ws = gj_mapping.build_write_set(stores[name], weather=wmap.get(dates[-1]))
+                ws = gj_mapping.build_write_set(stores[name],
+                                               weather=_wx_of(wx_by_sheet, wmap, sn, dates[-1]))
                 for d in sorted(dates):      # 升序: top 模式下最新一天落在表头下第一行(与其它支路一致)
                     fill_jobs.append((sn, d, ws))
             except Exception as e:
@@ -1743,7 +2132,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             discovered = [{"id": str(r.get("门店编号", "")), "name": str(r.get("门店名称", ""))}
                           for r in rows if r.get("门店名称")]
 
-    # 3. 天气(区间逐日)
+    # 3. 天气(区间逐日) —— 主表口径(账号默认坐标)
     def do_weather():
         out = {}
         for d in dates:
@@ -1751,12 +2140,37 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             first = (av if isinstance(av, list) else [av])[0]
             biz = first.get("设置营业时间段")
             biz = biz if isinstance(biz, str) and "-" in biz else None
-            out[d] = weather_mod.fetch(d, store.get("lat", 28.187), store.get("lon", 112.921), biz)
+            out[d] = weather_mod.fetch_cached(d, store.get("lat", 28.187), store.get("lon", 112.921), biz)
         return out
-    wmap = timed("weather", "天气获取", do_weather) or {}
+
+    # 单门店模式的目标表(要在天气之前定: 逐店取数要把它算进 targets)
+    _one_sheet = _single_store_sheet(store, cfg, store["template"]) if scope == "store" else None
+    # 数值校验容器清零(D5/T11 诊断: 本次运行从零开始, 收尾统一打印)
+    from .platforms import taobao_mapping as _tb_map
+    _tb_map.VALIDATE_WARNINGS.clear()
+    _tb_map.VALIDATE_NOTES.clear()
+    # 3.5 逐店天气(T01/铁律 9): 每店按**自己的门店地址**取(长沙/湘潭分别取值, 不再全表共用);
+    # 温度按该店**当天**的「设置营业时间段」窗口统计(淘宝报表带这一列)。
+    _wx_targets = _weather_targets(store, extra=[_one_sheet] if _one_sheet else [])
+    _biz_by = _biz_hours_by_sheet(
+        store, "taobao", all_rows_store, dates,
+        pick=lambda r: (str(r.get("设置营业时间段") or "")
+                        if "-" in str(r.get("设置营业时间段") or "") else None))
+
+    def do_weather_all():
+        base = do_weather()
+        if not _wx_targets:
+            return base, {}
+        by_sheet, warns = weather_mod.fetch_map(_wx_targets, dates, _biz_by, label="淘宝门店")
+        _log_weather_warns(sink, warns)
+        return base, by_sheet
+
+    wmap, wx_by_sheet = timed("weather", "天气获取", do_weather_all) or ({}, {})
     for d in dates:
         if wmap.get(d) and wmap[d][0]:
             sink.log(f"[天气] {d} → {wmap[d][0]} {wmap[d][1]}")
+    if wx_by_sheet:
+        sink.log(f"🌤 天气逐店取: {len(wx_by_sheet)} 家门店 × {len(dates)} 天")
 
     # 注: 逐店抓取已移到**抓取步骤内部**(do_capture) —— 放这里时浏览器已被关掉。
 
@@ -1780,11 +2194,12 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     _main, _fell_main, _fell_why = resolve_main(store["template"], cfg,
                                                 [m[1] for m in ((store_plan or {}).get("matched") or [])])
     # 单门店模式: **必须**写关键词匹配到的门店表(匹配不到就按关键词新建), 绝不写主表(用户口径)
-    _one_sheet = _single_store_sheet(store, cfg, store["template"]) if scope == "store" else None
+    # (_one_sheet 在上面「逐店天气」之前就解析了 —— 取数要把它算进 targets)
     if _fell_main and _one_sheet is None:
         # 真会写主表时才提示(单店模式压根不写主表, 不说); 信息级 —— 这是避让, 不是错误
         sink.log("  ℹ️ " + main_fallback_note(_fell_main, _fell_why), level="info")
     fill_jobs = []
+    _warned = set()
     for d in sorted(dates):
         A, B = pick_rows(d)
         if A is None or B is None:
@@ -1796,7 +2211,8 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         day_stats = {k: v for k, v in (stats_day or {}).items() if k != "promo"} if isinstance(stats_day, dict) else {}
         # 区间模式: 推广累计值只落在末日, 其他天用当天抓取的推广(逐日模式 promo 在 out["promo"] 为累计, 天级不拆)
         ws_promo = (promo_day, )
-        write_set = build_write_set(A, B, day_stats if day_stats else stats, weather=wmap.get(d))
+        write_set = build_write_set(A, B, day_stats if day_stats else stats,
+                                    weather=_wx_of(wx_by_sheet, wmap, _one_sheet or _main, d))
         for name, ok in cross_checks(write_set):
             if ok is False:
                 sink.log(f"⚠️ {d} 交叉校验未过: {name}", level="warn")
@@ -1815,8 +2231,10 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 _brow = next((r for r in _brows if str(r.get("门店名称") or "").strip() == _nm), None)
                 try:
                     # 逐店 capture(该店自己的外卖本店列 + 商圈同行前10%基准列) → 写它自己的 Sheet
+                    _warn_no_store_weather(sink, _sn, _wx_targets, _warned)
                     _cap = (ad_holder.get("per_store_caps") or {}).get(_nm) if d == dates[-1] else None
-                    fill_jobs.append((_sn, d, build_write_set(_row, _brow, _cap, weather=wmap.get(d))))
+                    fill_jobs.append((_sn, d, build_write_set(
+                        _row, _brow, _cap, weather=_wx_of(wx_by_sheet, wmap, _sn, d))))
                 except Exception as e:
                     fill_errs.append(f"[{_sn}] {d}: {str(e)[:70]}")
     _main_names = {SHEET} | {str(m) for m in ((cfg.get("defaults") or {}).get("main_sheets") or [])}
@@ -1864,6 +2282,14 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     _skip_txt = _strict_summary(store_plan, _plan_scope(store_plan))
     if _skip_txt:
         summary["不在门店明细中(已跳过)"] = _skip_txt
+    # 数值合理性校验(规格书 铁律 8 / T11)结果收尾统一打印: 三态通过 → debug 取证;
+    # 超界/三态不通过 → warn + 进 summary(超界值已由 build_write_set 拦下未写入)。
+    from .platforms import taobao_mapping as _tb_map
+    for _w in _tb_map.validate_notes():
+        sink.log(_w, level="debug")
+    for _w in _tb_map.validate_report():
+        sink.log(_w, level="warn")
+        summary.setdefault("数值校验", []).append(_w)
     if discovered:
         summary["discovered_stores"] = discovered
     outputs.append(store["template"])
@@ -1874,12 +2300,13 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             from .llm import daily_report
             last = dates[-1]
             A_last = pick_rows(last)[0]
-            write_last = build_write_set(A_last, pick_rows(last)[1] or {}, stats or {}, weather=wmap.get(last))
+            write_last = build_write_set(A_last, pick_rows(last)[1] or {}, stats or {},
+                                         weather=_wx_of(wx_by_sheet, wmap, _one_sheet or _main, last))
             data = {"商家": store["name"], "日期": last,
                     "营业额": write_last.get("DG"), "订单": write_last.get("DI"),
-                    "主站曝光": write_last.get("DN"), "TOP曝光": write_last.get("DO"),
-                    "主站进店": write_last.get("DQ"), "TOP进店": write_last.get("DR"),
-                    "天气": wmap.get(last, (None, None))[0]}
+                    "主站曝光": write_last.get("DM"), "TOP曝光": write_last.get("DN"),
+                    "主站进店": write_last.get("DP"), "TOP进店": write_last.get("DQ"),
+                    "天气": (_wx_of(wx_by_sheet, wmap, _one_sheet or _main, last) or (None, None))[0]}
             text = daily_report(llm_client, data, on_delta=lambda t: sink.llm_delta("daily_report", t))
             sink.llm_done("daily_report")
             summary["llm_report"] = text

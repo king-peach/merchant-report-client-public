@@ -287,7 +287,9 @@ class MeituanGjAdapter:
             time.sleep(4)
             if self._is_logged_in(page):
                 self.sink.log("✅ 美团管家登录成功")
+                self.sink.browser_hide()         # 后台模式: 人工登录结束 → 窗口收回
                 return True
+        self.sink.browser_hide()                 # 超时退出同样收回
         self.sink.step_fail("login", "登录", "美团管家登录超时", "E_LOGIN_TIMEOUT")
         return False
 
@@ -416,7 +418,9 @@ class MeituanGjAdapter:
         while time.time() < end:
             time.sleep(4)
             if not sms_present():
+                self.sink.browser_hide()         # 后台模式: 人工输码结束 → 窗口收回
                 return True
+        self.sink.browser_hide()
         return False
 
     # ---------- 报表下载+抓取(2026-09-21 实测链路) ----------

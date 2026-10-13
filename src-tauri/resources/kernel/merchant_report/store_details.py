@@ -65,6 +65,14 @@ def load_store_details(path):
         if sheet_col is None:
             return {}
 
+        # 「门店地址」列(需求 T01 天气逐店化): 表头含「地址」二字即认(h1 或 h2 任一命中)。
+        # 老表没有这一列 → addr_col = None, 下面的 addr_* 一律为空, 调用方回退旧行为(整表共用天气)。
+        addr_col = None
+        for i in range(ncol):
+            if "地址" in get(h1, i) or "地址" in get(h2, i):
+                addr_col = i
+                break
+
         # 逐列: 组名(向前携带) + 列角色
         col_group, name_cols, id_cols = {}, [], []
         cur = ""
@@ -80,6 +88,7 @@ def load_store_details(path):
                 id_cols.append(i)
 
         out = {}
+        addr_by_sheet = {}
         for i in name_cols:
             p = _platform_of(col_group[i])
             if not p:
@@ -92,6 +101,12 @@ def load_store_details(path):
                 if not nm or not sheet:
                     continue
                 d["by_name"].setdefault(_tidy(nm), sheet)
+                if addr_col is not None:
+                    addr = get(r, addr_col)
+                    # 读不到地址的行: 只跳过该行的**地址**(不猜), 名称/编号映射照旧
+                    if addr:
+                        d.setdefault("addr_by_name", {}).setdefault(_tidy(nm), addr)
+                        addr_by_sheet.setdefault(sheet, addr)
                 if id_col is not None:
                     vid = get(r, id_col).split(".")[0]   # 防 Excel 转 float 丢精度样式 "33333333.0"
                     if vid:
@@ -100,6 +115,13 @@ def load_store_details(path):
                         # 与 by_name/ 同一条数据行, 只是多留一份**行内**关联 —— 不经 Sheet 中转,
                         # 避免"同 Sheet 多编号"时张冠李戴。
                         d["by_name_id"].setdefault(_tidy(nm), vid)
+        # addr_by_sheet: 顶层汇总 + 各平台各留一份(与「运营报表模板Sheet名」同一数据行取地址)。
+        # 顶层那份是 orchestrator 天气逐店取数的主入口(它按 Sheet 名查地址, 不关心平台分组);
+        # 注意它**不是**平台键 —— platforms_in() 按 PLATFORM_ORDER 过滤, 不会被带进队列。
+        for p in out:
+            out[p]["addr_by_sheet"] = dict(addr_by_sheet)
+        if out:
+            out["addr_by_sheet"] = dict(addr_by_sheet)
         return out
     finally:
         try:

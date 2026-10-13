@@ -31,7 +31,9 @@ def main():
     tmp = os.path.join(tempfile.gettempdir(), "test_store_details_sample.xlsx")
     build_sample(tmp)
     d = load_store_details(tmp)
-    assert set(d.keys()) == {"taobao", "meituan", "meituan_gj"}, d.keys()
+    # 顶层多一个 "addr_by_sheet"(需求 T01 天气逐店化: Sheet→地址), 它不是平台键 ——
+    # platforms_in() 按 PLATFORM_ORDER 过滤, 不会被当成平台带进「一键跑」队列。
+    assert set(d.keys()) == {"taobao", "meituan", "meituan_gj", "addr_by_sheet"}, d.keys()
 
     tb = d["taobao"]
     assert tb["by_id"].get("4444444444") == "岚霞路", tb

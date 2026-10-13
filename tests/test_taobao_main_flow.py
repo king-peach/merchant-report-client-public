@@ -24,9 +24,15 @@ ALL = {"曝光人数": 4414, "进店人数": 180, "下单人数": 55,
 BOM = {"曝光人数": 2541, "进店人数": 65, "下单人数": 15,
        "新客曝光人数": 1800, "新客进店人数": 45, "新客下单人数": 10,
        "老客曝光人数": 741, "老客进店人数": 20, "老客下单人数": 5}
-MAIN = ("DN", "DQ", "DT", "DW", "DZ", "EC", "EF", "EI", "EL", "EO", "ER")
-TOP_COLS = ("DO", "DR", "DU", "DX", "EA", "ED", "EG", "EJ", "EM", "EP", "ES",
-            "FA", "FD", "FG", "FJ", "FM", "FP", "FS", "FV", "FY", "GB", "GE")
+# 修复后模板列位(2026-10-13 换版, 旧 DJ 往右全部 -1 列):
+#   主站本店 = DM/DP/DS/DV/DY + 新客 EB/EE/EH + 老客 EK/EN/EQ
+#   TOP(对比) = DN/DQ/DT/DW/DZ + EC/EF/EI + EL/EO/ER
+MAIN = ("DM", "DP", "DS", "DV", "DY", "EB", "EE", "EH", "EK", "EN", "EQ")
+TOP_COLS = ("DN", "DQ", "DT", "DW", "DZ", "EC", "EF", "EI", "EL", "EO", "ER",
+            "EZ", "FC", "FF", "FI", "FL", "FO", "FR", "FU", "FX", "GA", "GD")
+# 模板公式列(差异) —— 任何情况下都不该被写
+DIFF_COLS = ("DO", "DR", "DU", "DX", "EA", "ED", "EG", "EJ", "EM", "EP", "ES",
+             "FA", "FD", "FG", "FJ", "FM", "FP", "FS", "FV", "FY", "GB", "GE")
 
 
 def _sh(exp, ent, ord_):
@@ -38,13 +44,14 @@ def _sh(exp, ent, ord_):
 def test_main_flow_from_reports_without_capture():
     """逐店写入(门店 Sheet)不传网页抓取 → 主站 11 列必须由报表减法给出。"""
     ws = tm.build_write_set(ALL, BOM, None)
-    assert ws["DN"] == 1873 and ws["DQ"] == 115 and ws["DW"] == 40, {k: ws[k] for k in ("DN", "DQ", "DW")}
-    assert ws["DT"] == round(115 / 1873, 6) and ws["DZ"] == round(40 / 115, 6)
-    assert ws["EC"] == 1200 and ws["EL"] == 673
-    assert ws["EF"] == round(85 / 1200, 6) and ws["EI"] == round(30 / 85, 6)
-    assert ws["EO"] == round(30 / 673, 6) and ws["ER"] == round(10 / 30, 6)
+    assert ws["DM"] == 1873 and ws["DP"] == 115 and ws["DV"] == 40, {k: ws[k] for k in ("DM", "DP", "DV")}
+    assert ws["DS"] == round(115 / 1873, 6) and ws["DY"] == round(40 / 115, 6)
+    assert ws["EB"] == 1200 and ws["EK"] == 673
+    assert ws["EE"] == 85 and ws["EH"] == round(30 / 85, 6)   # 新客进店列=人数, 第3列=下单转化率
+    assert ws["EN"] == 30 and ws["EQ"] == round(10 / 30, 6)   # 老客同上
     assert all(ws.get(k) is not None for k in MAIN), {k: ws.get(k) for k in MAIN}
     assert not any(ws.get(k) for k in TOP_COLS), "TOP 列不该有值(页面取不到商圈同行)"
+    assert not any(ws.get(k) is not None for k in DIFF_COLS), "差异列=模板公式, 一格都不许写"
     print("✅ 不依赖网页: 主站流量 11 列由「全部−爆品团」逐店算出(含转化率), TOP 列留空")
 
 
@@ -62,14 +69,14 @@ def test_perstore_capture_writes_top10():
         "ftype_ok": True, "shop_id": "555555555",
     }
     ws = tm.build_write_set(ALL, BOM, cap)
-    assert ws["DN"] == 3409 and ws["DQ"] == 158 and ws["DW"] == 45, (ws["DN"], ws["DQ"], ws["DW"])
-    assert ws["DT"] == round(158 / 3409, 6) and ws["DZ"] == round(45 / 158, 6)
-    assert ws["DO"] == 5231 and ws["DR"] == 547 and ws["DX"] == 110, (ws["DO"], ws["DR"], ws["DX"])
-    assert ws["DU"] == round(547 / 5231, 6) and ws["EA"] == round(110 / 547, 6)
-    assert ws["FA"] == 731 and ws["FD"] == 32 and ws["FJ"] == 8, (ws["FA"], ws["FD"], ws["FJ"])
-    assert ws["FG"] == round(32 / 731, 6) and ws["FM"] == round(8 / 32, 6)
+    assert ws["DM"] == 3409 and ws["DP"] == 158 and ws["DV"] == 45, (ws["DM"], ws["DP"], ws["DV"])
+    assert ws["DS"] == round(158 / 3409, 6) and ws["DY"] == round(45 / 158, 6)
+    assert ws["DN"] == 5231 and ws["DQ"] == 547 and ws["DW"] == 110, (ws["DN"], ws["DQ"], ws["DW"])
+    assert ws["DT"] == round(547 / 5231, 6) and ws["DZ"] == round(110 / 547, 6)
+    assert ws["EZ"] == 731 and ws["FC"] == 32 and ws["FI"] == 8, (ws["EZ"], ws["FC"], ws["FI"])
+    assert ws["FF"] == round(32 / 731, 6) and ws["FL"] == round(8 / 32, 6)
     # 新客/老客没抓(单店页本次没取顾客维度) → 保持报表逐店口径
-    assert ws["EC"] == 1200 and ws["EF"] == round(85 / 1200, 6)
+    assert ws["EB"] == 1200 and ws["EE"] == 85
     print("✅ 逐店 capture: 主站整体列 + 商圈TOP(前10%)列齐全, 新客/老客回退报表口径")
 
 
@@ -79,7 +86,7 @@ def test_bench_not_top10_leaves_top_empty():
            "爆品团_全部顾客": {"shop": {}, "top10": {}},
            "customer_dims_ok": False, "bench": "商圈同行均值", "bench_ok": False, "ftype_ok": True}
     ws = tm.build_write_set(ALL, BOM, cap)
-    assert ws["DN"] == 3409, "本店列仍可写"
+    assert ws["DM"] == 3409, "本店列仍可写"
     assert not any(ws.get(k) is not None for k in TOP_COLS), \
         f"TOP列不该有值: {[(k, ws.get(k)) for k in TOP_COLS if ws.get(k) is not None]}"
     print("✅ 基准非前10%: TOP列留空(只写本店列)")
@@ -92,9 +99,9 @@ def test_dim_not_switched_falls_back_to_reports():
     cap.update({f"爆品团_{c}": {"shop": dict(same), "top10": {}} for c in ("全部顾客", "新客", "老客")})
     cap["customer_dims_ok"] = False
     ws = tm.build_write_set(ALL, BOM, cap)
-    assert ws["EC"] == 1200 and ws["EF"] == round(85 / 1200, 6), (ws["EC"], ws["EF"])
-    assert ws["EL"] == 673 and ws["ER"] == round(10 / 30, 6), (ws["EL"], ws["ER"])
-    assert ws["DN"] == 50660, "整体三列仍可用网页值(与顾客维度无关)"
+    assert ws["EB"] == 1200 and ws["EE"] == 85, (ws["EB"], ws["EE"])
+    assert ws["EK"] == 673 and ws["EQ"] == round(10 / 30, 6), (ws["EK"], ws["EQ"])
+    assert ws["DM"] == 50660, "整体三列仍可用网页值(与顾客维度无关)"
     assert not any(ws.get(k) for k in TOP_COLS)
     print("✅ 顾客维度没生效: 新客/老客回退报表口径(不把整体值当新客写)")
 
@@ -107,12 +114,12 @@ def test_missing_bom_row_and_zero_rates():
     only_all = {"曝光人数": 14, "进店人数": 1, "下单人数": "0", "新客曝光人数": 5, "老客曝光人数": 9,
                 "新客进店人数": "1", "老客进店人数": "0", "新客下单人数": "0", "老客下单人数": "0"}
     ws = tm.build_write_set(only_all, None, None)          # bom_row=None 不再崩
-    assert ws["DN"] == 14 and ws["DQ"] == 1 and ws["DW"] == 0, (ws["DN"], ws["DQ"], ws["DW"])
-    assert ws["DZ"] == 0.0, f"下单=0 应写 0(不是空): {ws['DZ']}"
-    assert ws["EC"] == 5 and ws["EL"] == 9
-    assert ws["EF"] == round(1 / 5, 6) and ws["EI"] == 0.0, (ws["EF"], ws["EI"])   # 1/5 ; 0/1=0
-    assert ws["EO"] == 0.0 and ws["ER"] is None, (ws["EO"], ws["ER"])              # 0/9=0 ; 0/0 不写
-    assert ws["DT"] == round(1 / 14, 6)
+    assert ws["DM"] == 14 and ws["DP"] == 1 and ws["DV"] == 0, (ws["DM"], ws["DP"], ws["DV"])
+    assert ws["DY"] == 0.0, f"下单=0 应写 0(不是空): {ws['DY']}"
+    assert ws["EB"] == 5 and ws["EK"] == 9
+    assert ws["EE"] == 1 and ws["EH"] == 0.0, (ws["EE"], ws["EH"])   # 新客进店=1人 ; 0/1=0
+    assert ws["EN"] == 0 and ws["EQ"] is None, (ws["EN"], ws["EQ"])              # 老客进店=0人 ; 0/0 不写
+    assert ws["DS"] == round(1 / 14, 6)
     print("✅ 爆品团缺店按 0 算(不整店丢), 分子为 0 的转化率写 0")
 
 
@@ -137,9 +144,9 @@ def test_real_report_files_if_present():
     ws = tm.build_write_set(ra, rb, None)
     exp = float(ra["曝光人数"]) - float(rb["曝光人数"])
     ent = float(ra["进店人数"]) - float(rb["进店人数"])
-    assert ws["DN"] == round(exp, 4) and ws["DQ"] == round(ent, 4), (ws["DN"], ws["DQ"], exp, ent)
-    assert ws["DT"] == round(ent / exp, 6), ws["DT"]
-    print(f"✅ 真机核对({name}): 主站曝光 {ws['DN']:.0f} = 全部 {ra['曝光人数']} − 爆品团 {rb['曝光人数']}")
+    assert ws["DM"] == round(exp, 4) and ws["DP"] == round(ent, 4), (ws["DM"], ws["DP"], exp, ent)
+    assert ws["DS"] == round(ent / exp, 6), ws["DS"]
+    print(f"✅ 真机核对({name}): 主站曝光 {ws['DM']:.0f} = 全部 {ra['曝光人数']} − 爆品团 {rb['曝光人数']}")
 
 
 def test_partial_capture_shop_empty_falls_back():
@@ -149,11 +156,11 @@ def test_partial_capture_shop_empty_falls_back():
            "爆品团_全部顾客": {"shop": {}, "top10": {}},
            "customer_dims_ok": False, "bench_ok": False, "ftype_ok": False}
     ws = tm.build_write_set(ALL, BOM, cap)                   # 之前 KeyError('exp') → 整店失败
-    assert ws["DN"] == 1873 and ws["DQ"] == 115 and ws["DW"] == 40, (ws["DN"], ws["DQ"], ws["DW"])
-    assert ws["EC"] == 1200 and ws["EL"] == 673
+    assert ws["DM"] == 1873 and ws["DP"] == 115 and ws["DV"] == 40, (ws["DM"], ws["DP"], ws["DV"])
+    assert ws["EB"] == 1200 and ws["EK"] == 673
     # "外卖_全部顾客"/"外卖_新客" 键整体缺失(半截 capture)也要安全
     ws2 = tm.build_write_set(ALL, BOM, {"promo": {}})
-    assert ws2["DN"] == 1873, ws2["DN"]
+    assert ws2["DM"] == 1873, ws2["DM"]
     print("✅ 半缺 capture(shop={} / 键缺失): 安全回落报表值, 不再 KeyError 废掉整店写入")
 
 

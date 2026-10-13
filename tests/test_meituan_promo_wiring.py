@@ -20,10 +20,14 @@ def main():
     assert 'getattr(_ad, "capture_promo_ledger", None)' in src, \
         "必须做平台判断(淘宝适配器没有该方法, 直接调会每店抛属性错误)"
     assert "_ledger_fn(_sid, _d)" in src, "要按店按天取流水"
-    assert "promo_by_sheet.setdefault(_sn, {})[_d] = _pl" in src, "结果要按 Sheet+日期 存"
-    assert '_ws2["CE"] = _pl["consume"]' in src, "CE(推广消耗) 要写入"
-    assert '_ws2["CJ"] = _pl["recharge"]' in src, "CJ(推广充值) 要写入"
+    assert "promo_by_sheet.setdefault(" in src, "结果要按 Sheet+日期 存"
+    # 2026-10-14 (B1): 门店表与主表**两个写入点**都必须走 _promo_vals(新口径), 不许各自拼 CE/CJ
+    assert "_ws2.update(mt_map.validate_write_set(_promo_vals(d, _sn)))" in src, "门店 Sheet 的推广列要按店按日写"
+    assert "ws.update(mt_map.validate_write_set(_promo_vals(d)))" in src, "主表同样要写推广列(同一口径)"
+    assert '_ws2["CE"] = _pl["consume"]' not in src, "旧写法(直取 consume 当 CE)必须已删除"
     print("✅ 接线: 按店按天取流水 → promo_by_sheet → CE/CJ 写入(带平台判断)")
+    assert "对账页" in src and "CF/CG" in src, "主表收尾文案要写明 CE 来源与 CF/CG 口径"
+    print("✅ 主表/门店两个写入点共用 _promo_vals(CE/CJ 流水 + CF/CG 概览)")
 
     A = mt.MeituanAdapter
     assert callable(A.parse_ledger) and callable(A.capture_promo_ledger)
@@ -45,26 +49,44 @@ def main():
     ]
     r = A.parse_bill_ledger(BILL, "2026-10-06")
     assert r["recharge"] == 200.0 and r["balance"] == 396.25 and r["n_recharge"] == 1, r
+    # B1 核心口径: CE = 当日「推广订单扣款」**绝对值合计**(负数取正, 不是余额变动净额)
+    assert r["consume"] == 191.39 and r["n_consume"] == 1, r
     r2 = A.parse_bill_ledger(BILL, "2026-10-09")       # 只有扣款的日子 → 充值留空(不拿扣款冒充)
     assert r2["recharge"] is None and r2["n_recharge"] == 0, r2
+    assert r2["consume"] == 140.55, r2                 # 同日无充值也要出 CE
     r3 = A.parse_bill_ledger(BILL + [["2026-10-06 22:00:00", "推广账户自动充值", "+100.00", "￥496.25", "交易成功", "f"]],
                              "2026-10-06")
     assert r3["recharge"] == 300.0 and r3["n_recharge"] == 2, r3
+    # B1 验收基线(规格书 §6): 高桥店 2026-09-19 当日「推广订单扣款」-151.58 → CE=151.58
+    acc = A.parse_bill_ledger(
+        [["日期", "类型", "金额 (元)", "现有余额", "状态", "交易号"],
+         ["2026-09-19 00:20:11", "推广订单扣款", "-151.58", "￥101.00", "交易成功", "z"]],
+        "2026-09-19")
+    assert acc["consume"] == 151.58, acc
+    # 同日多笔扣款 → 绝对值累加(不是互相抵消)
+    acc2 = A.parse_bill_ledger(
+        [["日期", "类型", "金额 (元)", "现有余额", "状态", "交易号"],
+         ["2026-09-19 00:20:11", "推广订单扣款", "-100.00", "￥101.00", "交易成功", "z1"],
+         ["2026-09-19 12:00:00", "推广订单扣款", "-51.58", "￥49.42", "交易成功", "z2"]],
+        "2026-09-19")
+    assert acc2["consume"] == 151.58 and acc2["n_consume"] == 2, acc2
     assert A.parse_bill_ledger(None, "2026-10-06")["recharge"] is None
     assert A.parse_bill_ledger([None, [], ["x"], ["2026-10-06", "充值", "abc"]], "2026-10-06")["recharge"] is None
     assert "billReconciliation.html#/account-flow" in A.BILL_RECON_URL and "wmPoiId=" in A.BILL_RECON_URL
-    print("✅ 对账页解析: 充值累加 / 扣款不混入 / 无行留空 / 脏数据不崩")
+    print("✅ 对账页解析: CE=扣款绝对值合计(9/19=-151.58→151.58, 多笔累加) / 充值累加 / 脏数据不崩")
 
     # ── 对账页接线守卫(2026-10-10: 历史日期不再翻页找) ──
-    src_bill = (inspect.getsource(A._read_recharge_bill) + inspect.getsource(A._set_bill_inputs)
+    src_bill = (inspect.getsource(A._read_bill_ledger) + inspect.getsource(A._set_bill_inputs)
                 + inspect.getsource(A.capture_promo_ledger))
     assert "BILL_RECON_URL" in src_bill, "对账页 URL 要接上"
     assert "推广费流水记录" in src_bill and "自定义" in src_bill, "要走对账页的推广费流水 tab + 自定义时间"
     assert "ControlOrMeta" in src_bill, "日期用键盘全选替换(受控输入不能只赋 value)"
     assert "交易号" in src_bill, "tab 就绪校验要盯「交易号」表头(余额 tab 末列是「操作」一行)"
     assert "失焦" in src_bill, "必须保留失焦提交(仅回车不刷新表格)"
-    assert "对账页" in inspect.getsource(A.capture_promo_ledger), "旧页充值取不到时要回退对账页"
-    print("✅ 对账页接线: URL / tab / 自定义 / 键盘替换 / 失焦提交 / 回退链 守卫通过")
+    assert "对账页" in inspect.getsource(A.capture_promo_ledger), "日志要写明来源=对账页(可 grep 复验)"
+    assert "仅供参考" in inspect.getsource(A.capture_promo_ledger), \
+        "旧账户页「推广消费」必须标注仅供参考(规格书坑清单 8: 不得再作 CE)"
+    print("✅ 对账页接线: URL / tab / 自定义 / 键盘替换 / 失焦提交 / 来源标注 守卫通过")
 
     print("✅ 推广流水接线单测全部通过")
 

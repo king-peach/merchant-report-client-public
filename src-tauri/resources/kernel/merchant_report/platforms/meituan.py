@@ -3,7 +3,9 @@
 登录: e.waimai 账号密码表单(平台: 美团统一登录)。
 报表: 脑图记录 营业分析→报表下载(全部业务+拼好饭); 经营数据→流量; 推广→消费记录。
 状态: 登录已实现并实测入口; 报表/抓取待用真实账号实测页面结构后完善(M5)。"""
+import csv
 import datetime
+import io
 import json
 import os
 import re
@@ -125,7 +127,9 @@ class MeituanAdapter:
             time.sleep(4)
             if _state() == "in":
                 self.sink.log("✅ 美团登录成功")
+                self.sink.browser_hide()         # 后台模式: 人工登录结束 → 窗口收回
                 return True
+        self.sink.browser_hide()                 # 超时退出同样收回
         self.sink.step_fail("login", "登录", "美团登录超时(含人工等待)", "E_LOGIN_TIMEOUT")
         return False
 
@@ -212,9 +216,11 @@ class MeituanAdapter:
             try:
                 t = page.evaluate("() => document.body.innerText.slice(0, 500)") or ""
                 if "账号登录" not in t:
+                    self.sink.browser_hide()     # 后台模式: 人工输码结束 → 窗口收回
                     return True
             except Exception:
                 pass
+        self.sink.browser_hide()
         return False
 
     def _find_logged_in(self):
@@ -252,7 +258,13 @@ class MeituanAdapter:
             # 带着「全部」的选点去下拼好饭, 会拿到与全部业务逐字节相同的文件(2026-09-18 实测)
             page = self._report_page()
             self._set_date_range(page, date_from, date_to)
-            self._select_business(page, biz)
+            # ⚠️ 2026-10-14 规格书 §4.5/T05: 「业务=全部」必须**在勾选指标之前**完成, 且**强验收**
+            #    (读回选中态)。历史上 DE/DF 两列空就是因为业务没落在「全部」—— 静默沿用别的业务
+            #    下出来的文件不含「基础营业时长得分/基础营业时长」两列。
+            biz_ok = self._select_business(page, biz)
+            if not biz_ok:
+                self.sink.log(f"⚠️ 业务未确认={biz}（读回选中态失败）→ 本次下载内容将做列级校验; "
+                              f"若缺「基础营业时长」两列请重跑", level="warn")
             self._select_all_metrics(page)
             before = self._history_names(page)
             self._click_download(page)
@@ -262,6 +274,7 @@ class MeituanAdapter:
                 continue
             path = os.path.join(str(ddir), tpl.format(f=f, t=t))
             if not self._fetch_file(entry, path):
+                self.sink.log(f"⚠️ {biz} 报表取文件失败 → 该业务跳过(不静默留空)", level="warn")
                 continue
             n = self._csv_cols(path)
             if biz == BIZ_BAO:
@@ -276,6 +289,11 @@ class MeituanAdapter:
                     self.sink.log(f"⚠️ 拼好饭报表列数异常({n} 列, 实测应约 31 列), 弃用以免错列", level="warn")
                     os.remove(path)
                     continue
+            else:
+                # 下载完成后的**内容级校验**(规格书 §4.5 + T10): 「全部业务」文件必须含
+                # 「基础营业时长得分」「基础营业时长」两列(DE/DF 的来源)。缺了说明"业务≠全部"
+                # 或指标没勾全 → **明确告警**, 绝不静默留空(上次 DE/DF 缺失就是这么被漏掉的)。
+                self._check_biz_all_columns(path, biz_ok)
             saved[biz] = path
             cols[biz] = n
         if not saved.get(BIZ_ALL):
@@ -286,8 +304,8 @@ class MeituanAdapter:
         return True
 
     @staticmethod
-    def _csv_cols(path):
-        """读 CSV 表头列数(美团导出 gb18030; 全部业务 83 列 / 拼好饭 31 列)"""
+    def _csv_headers(path):
+        """读 CSV 表头(美团导出 gb18030) → [列名,...]; 读不到返回 []。"""
         try:
             with open(path, "rb") as fh:
                 raw = fh.read(65536)
@@ -296,9 +314,39 @@ class MeituanAdapter:
             except UnicodeDecodeError:
                 text = raw.decode("gb18030", "ignore")
             first = next((l for l in text.splitlines() if l.strip()), "")
-            return len(first.split(","))
+            return [h.strip() for h in next(csv.reader(io.StringIO(first)), [])]
         except Exception:
-            return 0
+            return []
+
+    @staticmethod
+    def _csv_cols(path):
+        """读 CSV 表头列数(美团导出 gb18030; 全部业务 83 列 / 拼好饭 31 列)"""
+        return len(MeituanAdapter._csv_headers(path))
+
+    def _check_biz_all_columns(self, path, biz_ok=True):
+        """下载完成后的**内容级校验**(规格书 §4.5/T05 + T10): 「全部业务」文件里必须有
+        「基础营业时长得分」「基础营业时长」两列(模板 DE/DF 的唯一来源)。
+
+        为什么必须做: DE/DF 曾经整列空且**毫无提示** —— 根因是下载时「业务」没选「全部」,
+        下出来的文件根本不含这两列。现在: 业务选择读回失败 → 这里兜住, 明确告警(禁止静默留空)。
+        列名以真机文件为准: 按"含「基础营业时长」字样"匹配, 命中即记实际列名。
+        """
+        heads = self._csv_headers(path)
+        if not heads:
+            self.sink.log(f"⚠️ DE/DF 未在下载文件中找到：无法读取表头({os.path.basename(path)})"
+                          f"（可能下载失败或文件损坏）", level="warn")
+            return False
+        # 列名以真机文件为准: 先按「含『基础营业时长』字样」收集, 再区分得分/时长两列
+        cands = [h for h in heads if "基础营业时长" in h]
+        hit_score = next((h for h in cands if "得分" in h), None)
+        hit_hours = next((h for h in cands if "得分" not in h), None)
+        if not hit_score and not hit_hours:
+            self.sink.log("⚠️ DE/DF 未在下载文件中找到：可能业务≠全部或指标未勾选"
+                          "（含「基础营业时长」字样的列一列都没有）→ DE/DF 将留空", level="warn")
+            return False
+        self.sink.log(f"✅ 下载内容校验通过: 得分列={hit_score!r} / 时长列={hit_hours!r}"
+                      f"（业务{'已确认' if biz_ok else '未确认'}=全部, 共 {len(heads)} 列）")
+        return True
 
     # ---- acctId(账号ID) ----
     # 裸链 /igate/bizdata/report/download 在部分账号上返回 {"code":30000,"msg":"acctId不存在"}
@@ -652,8 +700,49 @@ class MeituanAdapter:
         time.sleep(0.9)
         return True
 
-    def _select_business(self, page, biz):
+    # 业务 tab 的**选中态取证**(规格书 §4.5/T05): 与流量页 _set_flow_biz 同一纪律 ——
+    # 点完必须能**读回**"当前选中的是哪个业务", 读不回来就不算确认。
+    _BIZ_STATE_JS = """() => {
+      const group = ['全部','外卖','拼好饭'];
+      const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const out = {active: '', seen: []};
+      for (const el of document.querySelectorAll('span,li,label,div,a')) {
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3)
+          .map(n => n.textContent).join('').trim();
+        if (!group.includes(own) || !vis(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 90 || r.height > 40) continue;          // 只认小 tab, 不是大面板
+        if (!out.seen.includes(own)) out.seen.push(own);
+        // 选中态: 元素自身或其 3 层祖先带 active/selected/checked/current 类名
+        let p = el, act = false;
+        for (let i = 0; i < 3 && p; i++, p = p.parentElement) {
+          if (/active|selected|checked|current/i.test(String(p.className || ''))) { act = true; break; }
+        }
+        if (act && !out.active) out.active = own;
+      }
+      return out;
+    }"""
+
+    def _read_business(self, page):
+        """读回当前选中的业务 tab 文本; 读不到返回 ''(未知)。"""
         try:
+            st = page.evaluate(self._BIZ_STATE_JS) or {}
+        except Exception:
+            return ""
+        return str(st.get("active") or "")
+
+    def _select_business(self, page, biz):
+        """把报表页「业务」切到 全部/外卖/拼好饭, 并**读回选中态验收**(规格书 §4.5 唯一改动点)。
+
+        验收纪律(与 _set_flow_biz 一致): 切完直读选中态 == 目标业务才算 True;
+        页面根本没有选中标记(读回为空)或读回是别的业务 → False, 调用方记
+        「业务未确认=…」并靠下载后的**列级校验**兜底(禁止静默沿用别的业务)。
+        """
+        try:
+            cur = self._read_business(page)
+            if cur == biz:
+                self.sink.log(f"✔ 业务已是「{biz}」(选中态已确认, 跳过点击)")
+                return True
             box = page.evaluate("""(biz) => {
               const group = ['全部','外卖','拼好饭'], hits = {};
               for (const el of document.querySelectorAll('span,li,label,div,a')) {
@@ -672,12 +761,16 @@ class MeituanAdapter:
               return null;
             }""", biz)
             if not box:
-                self.sink.log(f"⚠️ 未找到业务选择「{biz}」(沿用当前业务)", level="warn")
+                self.sink.log(f"⚠️ 未找到业务选择「{biz}」(沿用当前业务, 选中态={cur or '未知'})", level="warn")
                 return False
             page.mouse.click(box["x"], box["y"])
             time.sleep(1.5)
-            self.sink.log(f"✔ 业务选择 → {biz}")
-            return True
+            got = self._read_business(page)
+            ok = (got == biz)
+            self.sink.log(f"{'✔' if ok else '⚠️'} 业务选择 → {biz}"
+                          f"（读回选中态={got or '未知'}·{'已确认' if ok else '未确认'}）",
+                          level="info" if ok else "warn")
+            return ok
         except Exception as e:
             self.sink.log(f"⚠️ 业务选择失败({biz}): {str(e)[:60]}", level="warn")
             return False
@@ -932,24 +1025,160 @@ class MeituanAdapter:
             self.sink.log(f"⚠️ 推广数据抓取失败(列留空): {str(e)[:90]}", level="warn")
         return out
 
-    # ---------- 推广(经营数据→推广页, 跨域iframe独立直开) ----------
+    # ---------- 推广概览(CF/CG): 必须先切「昨日」并拿到硬证据 ----------
+    # 经营数据 → 顶部 tab「推广」→ 推广概览(内容在跨域 iframe, 独立直开该 iframe URL 最稳)
     PROMO_URL = ("https://waimaieapp.meituan.com/ad/v1/rpc?jumpAuthorize=true"
                  "#/subapp/isomor_commonpage/pages/mulEffectData/index")
-
+    # ⚠️ 2026-10-14 (规格书 §4.4 / 坑清单 7): 本页快捷组 = 今日/昨日/近7日/近30日, **无自定义日期**。
+    #    「今日」页签上的 3690/113 是**实时值不可取** → 必须切「昨日」并验收; 拿不到证据就不写。
+    #    CE **不从这里取**(本页「总推广花费」≠ CE, 规格书坑清单 8): 只打印"仅供参考"。
     _PROMO_READ_JS = """() => {
-      const t = document.body.innerText;
-      if (t.indexOf('总推广花费') < 0) return null;
+      const t = document.body.innerText || '';
+      if (t.indexOf('总曝光量') < 0 && t.indexOf('总推广花费') < 0) return null;
       const pick = (label) => {
         const i = t.indexOf(label);
+        if (i < 0) return null;
         const seg = t.slice(i + label.length, i + label.length + 60).replace(/\\n/g, ' ');
         const m = seg.match(/[\\d,.]+/);
         return m ? parseFloat(m[0].replace(/,/g, '')) : null;
       };
-      const date = (t.match(/2026[.\\-]\\d{2}[.\\-]\\d{2}/) || [null])[0];
-      if (!date) return null;
-      return {date: date.replace(/\\./g, '-'), spend: pick('总推广花费'),
-              expose: pick('总曝光量'), visit: pick('总进店量')};
+      const date = (t.match(/20\\d{2}[.\\-\\/]\\d{1,2}[.\\-\\/]\\d{1,2}/) || [null])[0];
+      return {date: date ? date.replace(/[.\\/]/g, '-') : null,
+              spend: pick('总推广花费'), expose: pick('总曝光量'), visit: pick('总进店量')};
     }"""
+
+    # 页签状态取证: 候选(今日/昨日/近7日/近30日) + 哪个带选中类名(硬证据)
+    _PROMO_TAB_JS = """() => {
+      const norm = s => (s || '').replace(/\\s+/g, '');
+      const names = ['今日', '昨日', '近7日', '近30日'];
+      const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const out = {active: '', cands: []};
+      for (const el of document.querySelectorAll('*')) {
+        const t = norm(el.innerText || el.textContent || '');
+        if (names.indexOf(t) < 0 || !vis(el)) continue;
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3)
+          .map(n => norm(n.textContent)).join('');
+        if (own !== t) continue;                      // 只取"自己持有该文本"的最内层节点
+        const cls = String(el.className || '');
+        const act = /active|selected|checked|current/i.test(cls);
+        out.cands.push({t: t, cls: cls.slice(0, 48), act: act});
+        if (act && !out.active) out.active = t;
+      }
+      return out;
+    }"""
+
+    def _click_promo_tab(self, page, name):
+        """点概览页快捷时间页签(今日/昨日/…): JS 打标记(最内层) + locator 点击(坐标点击会落错)。"""
+        try:
+            n = page.evaluate("""(v) => {
+                const norm = s => (s || '').replace(/\\s+/g, '');
+                const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+                const els = [...document.querySelectorAll('*')].filter(el => {
+                  const t = norm(el.innerText || el.textContent || '');
+                  if (t !== v || !vis(el)) return false;
+                  const own = Array.from(el.childNodes).filter(x => x.nodeType === 3)
+                    .map(x => norm(x.textContent)).join('');
+                  return own === t; });
+                document.querySelectorAll('[data-hm-promo-tab]')
+                  .forEach(e => e.removeAttribute('data-hm-promo-tab'));
+                if (!els.length) return 0;
+                els[0].setAttribute('data-hm-promo-tab', '1');
+                return els.length; }""", name)
+            if not n:
+                return False
+            page.locator('[data-hm-promo-tab="1"]').first.click(timeout=6000)
+            return True
+        except Exception:
+            return False
+
+    def capture_promo(self, store_id=None, timeout_s=90):
+        """推广概览「昨日」口径 → {date, expose, visit, tab}（**CF/CG 的唯一来源**）。
+
+        硬验收(规格书 §4.4 易错点 2): 读取后必须证明页面处于**昨日态** —— 证据 = ①页签选中态 == 昨日,
+        或 ②页面日期文本 == 昨天 且选中页签不是「今日」。两条都拿不到 → 返回 None(调用方留空),
+        绝不用「今日」的实时值冒充(真机「今日」= 3690/113, 与昨日 4843/133 差很远)。
+
+        不含 CE: CE 必须走对账页「推广订单扣款」流水(见 parse_bill_ledger/capture_promo_ledger);
+        本页「总推广花费」只打印出来标注**仅供参考**(规格书坑清单 8: 昨日 212.28 ≠ CE 151.58)。
+        """
+        saved = [(c["domain"], c["path"], c["value"]) for c in self.ctx.cookies()
+                 if c["name"] == self._POI_COOKIE]
+        page = None
+        try:
+            if store_id:
+                self._set_poi_cookie(str(store_id))
+            page = self.ctx.new_page()
+            page.goto(self.PROMO_URL, wait_until="domcontentloaded", timeout=90000)
+            data, tabs = None, {}
+            end = time.time() + timeout_s
+            while time.time() < end:
+                time.sleep(2.5)
+                try:
+                    data = page.evaluate(self._PROMO_READ_JS)
+                except Exception:
+                    data = None
+                if data:
+                    break
+            if not data:
+                self.sink.log(f"⚠️ 推广概览({store_id or '账号级'}): 页面未渲染出数据 → CF/CG 留空",
+                              level="warn")
+                return None
+            # ① 先切「昨日」(默认可能是「今日」=实时值, 不可取)
+            try:
+                tabs = page.evaluate(self._PROMO_TAB_JS) or {}
+            except Exception:
+                tabs = {}
+            yday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+            if (tabs.get("active") or "") != "昨日":
+                if self._click_promo_tab(page, "昨日"):
+                    time.sleep(3)
+                    try:
+                        data = page.evaluate(self._PROMO_READ_JS) or data
+                    except Exception:
+                        pass
+                    try:
+                        tabs = page.evaluate(self._PROMO_TAB_JS) or tabs
+                    except Exception:
+                        pass
+            # ② 硬证据验收(页签选中态 / 日期文本)
+            act = tabs.get("active") or ""
+            d_txt = str(data.get("date") or "")
+            if not ((act == "昨日") or (d_txt == yday and act != "今日")):
+                cand = [c.get("t") for c in (tabs.get("cands") or [])]
+                self.sink.log(
+                    f"⚠️ 推广概览({store_id or '账号级'}): 「昨日」页签未得证"
+                    f"(选中={act or '未知'} 候选={cand} 页面日期={d_txt or '未知'})"
+                    f" → CF/CG 不写(不用「今日」实时值冒充)", level="warn")
+                return None
+            if data.get("spend") is not None:
+                self.sink.log(f"   ℹ️ 概览页「总推广花费」{data['spend']} 仅供参考 —— "
+                              f"CE 走对账页「推广订单扣款」, 不用此值")
+            out = {"date": d_txt or yday, "expose": data.get("expose"), "visit": data.get("visit"),
+                   "tab": act or "昨日"}
+            self.sink.log(f"📢 推广概览({store_id or '账号级'}·{out['tab']} {out['date']}): "
+                          f"总曝光量 {out['expose']} / 总进店量 {out['visit']}")
+            return out
+        except Exception as e:
+            self.sink.log(f"⚠️ 推广概览抓取失败(CF/CG 留空): {str(e)[:80]}", level="warn")
+            return None
+        finally:
+            try:
+                if saved:
+                    self.ctx.add_cookies([{"name": self._POI_COOKIE, "value": v, "domain": d, "path": p}
+                                          for d, p, v in saved])
+            except Exception:
+                pass
+            try:
+                if page is not None:
+                    alive = [p for p in self.ctx.pages if not p.is_closed()]
+                    if len(alive) > 1:
+                        page.close()
+                    else:
+                        # 关掉最后一个页面会连带关闭整个 persistent context(后续全部操作报
+                        # "Target page, context or browser has been closed") → 只导航走, 不关
+                        page.goto("about:blank")
+            except Exception:
+                pass
 
     # ---- 商圈Top(仅单门店视角可得) ----
     # 实测路径(用户截图确认): 报表页右上角切单店 → 经营数据/流量 → 「流量转化」漏斗
@@ -1563,16 +1792,21 @@ class MeituanAdapter:
 
     @staticmethod
     def parse_bill_ledger(rows, date):
-        """对账页「推广费流水记录」表 → 当日充值(CJ)合计 + 余额。
+        """对账页「推广费流水记录」表 → 当日 CE(推广订单扣款) + CJ(推广账户自动充值) + 余额。
 
         真机表(2026-10-10, 高桥 55555555): 表头 日期|类型|金额(元)|现有余额|状态|交易号
             ["2026-10-06 20:51:05", "推广账户自动充值", "+200.00", "￥396.25", "交易成功", "..."]
-        口径: 只认「类型含充值」且金额带 '+' 的行; 同日多笔累加; 该日无行 → None(留空, 不臆造 0)。
-        ⚠️ 消耗行「推广订单扣款」**不并入**: 其实测归属日与旧账户页口径相差一天(2026-10-10 三组
-           对账: 旧页"10-06 推广消费 -250" = 对账页"10-07 00:22:29 推广订单扣款 -250"),
-           消耗(CE)仍走旧页 parse_ledger —— 此处不读、也不做换算, 防口径漂移。
+            ["2026-10-07 00:22:29", "推广订单扣款",     "-250.00", "￥146.25", "交易成功", "..."]
+        口径(2026-10-14 按《修复规格书》§4.4/T04 修正):
+          · CE = 当日「**推广订单扣款**」行的金额**绝对值合计**(9/19 为 -151.58 → **151.58**);
+            同日多笔**累加**。CE **不是**「推广概览→总花费」(昨日 212.28)✗, 也不是旧账户页的
+            「推广消费」✗ —— 两者都不再作为 CE。
+          · CJ = 当日「推广账户自动充值」合计(带 '+' 的行, 正值)。
+          · 只认真实存在的行类型: 「扣款」才计入 CE(不把「消费」等别名混入, 防口径漂移/重复计)。
+          · 该日无行 → 对应字段 None(**不臆造 0**; 0 是"确实没扣款"的真实值, 读不到是另一回事)。
         """
-        total, hits, bal = None, 0, None
+        rec, con, bal, n_rec, n_con = 0.0, 0.0, None, 0, 0
+        types = []
         for r in (rows or []):
             if not isinstance(r, (list, tuple)) or len(r) < 3:
                 continue
@@ -1580,21 +1814,32 @@ class MeituanAdapter:
             if not t.startswith(str(date)):
                 continue
             typ = str(r[1]).replace("\n", " ").strip()
+            if typ and typ not in types:
+                types.append(typ)
             amt = str(r[2]).strip().replace(",", "").replace("￥", "")
-            if "充值" in typ and amt.startswith("+"):
+            v = None
+            try:
+                v = abs(float(amt.replace("+", "", 1)))       # "+200.00" / "-151.58" / "预扣款"后缀
+            except ValueError:
+                m = re.search(r"[-+]?\d+(?:\.\d+)?", amt)
+                v = abs(float(m.group())) if m else None
+            if v is None:
+                continue
+            if "充值" in typ:
+                rec += v
+                n_rec += 1
+            elif "扣款" in typ:
+                con += v
+                n_con += 1
+            if len(r) > 3 and str(r[3]).strip() and bal is None:
                 try:
-                    v = float(amt[1:])
+                    bal = float(str(r[3]).replace(",", "").replace("￥", ""))
                 except ValueError:
-                    continue
-                total = (total or 0.0) + v
-                hits += 1
-                if len(r) > 3 and str(r[3]).strip():
-                    try:
-                        bal = float(str(r[3]).replace(",", "").replace("￥", ""))
-                    except ValueError:
-                        pass
-        return {"recharge": round(total, 2) if (hits and total is not None) else None,
-                "balance": bal, "n_recharge": hits}
+                    pass
+        return {"consume": round(con, 2) if n_con else None,
+                "recharge": round(rec, 2) if n_rec else None,
+                "balance": bal, "n_consume": n_con, "n_recharge": n_rec,
+                "types": types}
 
     def _click_by_text(self, page, text, timeout_ms=6000):
         """精确文本点击(打标记 + locator, 只取最内层)。成功返回 True。"""
@@ -1666,8 +1911,13 @@ class MeituanAdapter:
             return False
         return sum(1 for v in (vals or []) if v == date) >= 2
 
-    def _read_recharge_bill(self, store_id, date):
-        """对账页(推广费财务对账)按日期过滤 → 当日充值(CJ) + 余额。失败返回 None(调用方留空)。
+    def _read_bill_ledger(self, store_id, date):
+        """对账页(推广费财务对账)按日期过滤 → 当日 **CE(推广订单扣款绝对值合计)** +
+        **CJ(推广账户自动充值合计)** + 余额。失败返回 None(调用方留空, 绝不拿旧口径顶替)。
+
+        2026-10-14 升级(修复规格书 §4.4/T04): 本页**同时**是 CE 与 CJ 的唯一正确来源 ——
+        CE = 「推广订单扣款」当日合计取绝对值(9/19 为 -151.58 → 151.58); CJ = 「推广账户自动充值」合计。
+        旧的「推广概览→总花费」与旧账户页「推广消费」都**不再**作为 CE(规格书坑清单 8)。
 
         2026-10-10 真机配方: 开页 → 「推广费流水记录」tab → 「自定义」 → 两个输入框
         Ctrl+A 全选替换 + 回车×2 → 点空白失焦 → 轮询校验(**所有数据行==目标日 或 「暂无数据」**
@@ -1687,7 +1937,7 @@ class MeituanAdapter:
                 except Exception:
                     pass
             if not ready:
-                self.sink.log("   ⚠️ 对账页未就绪 → 充值留空", level="warn")
+                self.sink.log("   ⚠️ 对账页未就绪 → CE/CJ 留空", level="warn")
                 return None
             # 切「推广费流水记录」tab: 首点可能因页面未渲染好落空 → 校验表头(交易号)重试。
             # 2026-10-10 实测: tab 没切过去时会误读「余额流水记录」的表 → 必须验证, 否则宁可不写
@@ -1699,14 +1949,14 @@ class MeituanAdapter:
                     tab_ok = True
                     break
             if not tab_ok:
-                self.sink.log("   ⚠️ 对账页「推广费流水记录」tab 未能就绪 → 充值留空", level="warn")
+                self.sink.log("   ⚠️ 对账页「推广费流水记录」tab 未能就绪 → CE/CJ 留空", level="warn")
                 return None
             if not self._click_by_text(page, "自定义"):
-                self.sink.log("   ⚠️ 对账页未找到「自定义」→ 充值留空", level="warn")
+                self.sink.log("   ⚠️ 对账页未找到「自定义」→ CE/CJ 留空", level="warn")
                 return None
             time.sleep(1.0)
             if not self._set_bill_inputs(page, date):
-                self.sink.log("   ⚠️ 对账页日期设置未生效 → 充值留空", level="warn")
+                self.sink.log("   ⚠️ 对账页日期设置未生效 → CE/CJ 留空", level="warn")
                 return None
             # 轮询等过滤生效(上限 ~10s):
             #   · 数据行全==date → 立即接受;
@@ -1725,13 +1975,14 @@ class MeituanAdapter:
                 if (not body) and ("暂无数据" in t):
                     empty_since = empty_since or time.time()
                     if time.time() - empty_since >= 2.5:
-                        return {"recharge": None, "balance": None, "n_recharge": 0}
+                        return {"consume": None, "recharge": None, "balance": None,
+                                "n_consume": 0, "n_recharge": 0, "types": []}
                 else:
                     empty_since = None
-            self.sink.log("   ⚠️ 对账页日期过滤未能验证(行既非目标日也非持续为空) → 充值留空", level="warn")
+            self.sink.log("   ⚠️ 对账页日期过滤未能验证(行既非目标日也非持续为空) → CE/CJ 留空", level="warn")
             return None
         except Exception as e:
-            self.sink.log(f"   ⚠️ 对账页读取失败: {str(e)[:70]} → 充值留空", level="warn")
+            self.sink.log(f"   ⚠️ 对账页读取失败: {str(e)[:70]} → CE/CJ 留空", level="warn")
             return None
         finally:
             if page is not None:
@@ -1741,65 +1992,58 @@ class MeituanAdapter:
                     pass
 
     def capture_promo_ledger(self, store_id, date):
-        """抓该店(单门店视角)推广账户流水 → CJ/CE/余额。失败返回 None(调用方留空)。
+        """抓该店(单门店视角)推广流水 → **CE(当日「推广订单扣款」绝对值合计)** /
+        **CJ(当日「推广账户自动充值」合计)** / 余额。失败返回 None(调用方留空)。
 
-        2026-10-10 升级: 旧页对历史日期要翻页找(用户痛点) → 充值(CJ)在旧页没读到时
-        回退「对账页」按自定义时间直取(见 _read_recharge_bill); 消耗(CE)仍以旧页为准
-        (两源归属日口径差一天, 不换算)。
+        2026-10-14 口径修正(规格书 §4.4/T04 + 坑清单 8/9):
+          · CE ← **对账页**按自定义日期过滤后的「推广订单扣款」合计(取绝对值, 9/19 = 151.58)。
+          · CJ ← 同页「推广账户自动充值」合计。
+          · 旧账户页(/ad/v1/pc#/account)的「推广消费」**不再作为 CE** —— 它只作 CJ 的兜底来源,
+            其消费值仅打印出来"仅供参考"(归属日与对账页差一天, 拿它当 CE 会写错)。
         """
         saved = [(c["domain"], c["path"], c["value"]) for c in self.ctx.cookies()
                  if c["name"] == self._POI_COOKIE]
-        page = None
         try:
             self._set_poi_cookie(str(store_id))
-            page = self.ctx.new_page()
-            page.goto(self.PROMO_LEDGER_URL, wait_until="domcontentloaded", timeout=90000)
-            rows = None
-            for _ in range(40):                         # 1s 轮询(原 4s×10): 行出现即走, 上限同为 ~40s
-                time.sleep(1)
-                rows = page.evaluate("""() => {
-                    const tb = document.querySelector('table');
-                    if (!tb) return null;
-                    return [...tb.querySelectorAll('tr')].map(tr =>
-                        [...tr.querySelectorAll('td,th')].map(td => (td.innerText||'').trim())); }""")
-                if rows and len(rows) > 1:
-                    break
-            if not rows or len(rows) <= 1:
-                self.sink.log("⚠️ 推广流水: 表格未渲染出来(账户页结构可能变化) → 尝试对账页补充值", level="warn")
-                out = None
-            else:
-                out = self.parse_ledger(rows[1:], date)       # 去掉表头
-            # 充值没读到(历史日期在旧页被翻页挡住/表未渲染) → 对账页按自定义时间直取
-            src = "账户页" if out is not None else "对账页"
+            # ① 主源: 对账页(唯一正确的 CE 来源; CJ 也从这里取)
+            bill = self._bill_cached(str(store_id), date)
+            out = None
+            if bill is not None:
+                out = {"consume": bill.get("consume"), "recharge": bill.get("recharge"),
+                       "balance": bill.get("balance"),
+                       "n_consume": bill.get("n_consume", 0), "n_recharge": bill.get("n_recharge", 0)}
+                self.sink.log(
+                    f"📒 对账页流水({store_id}·{date}): 扣款 {out['n_consume']} 笔"
+                    f" 合计 {('-%.2f' % out['consume']) if out['consume'] is not None else '无'}"
+                    f" → CE={out['consume']}；充值 {out['n_recharge']} 笔"
+                    f" 合计 {('+%.2f' % out['recharge']) if out['recharge'] is not None else '无'}"
+                    f" → CJ={out['recharge']}（来源: 对账页·推广费流水记录·自定义日期{date}）")
+            # ② 旧账户页: 只在 CJ 没拿到时兜底(它的「推广消费」不再当 CE)
             if out is None or out.get("recharge") is None:
-                try:
-                    bill = self._read_recharge_bill(str(store_id), date)
-                except Exception:
-                    bill = None
-                if bill is not None:
+                acct = self._read_account_ledger(str(store_id), date)
+                if acct is not None:
                     if out is None:
-                        out = {"recharge": None, "consume": None, "balance": None,
-                               "n_recharge": 0, "n_consume": 0}
-                    if bill.get("recharge") is not None:
-                        out["recharge"] = bill["recharge"]
-                        out["n_recharge"] = bill.get("n_recharge", 0)
-                        src = ("对账页" if out.get("consume") is None else "账户页+对账页")
+                        out = {"consume": None, "recharge": None, "balance": None,
+                               "n_consume": 0, "n_recharge": 0}
                     if out.get("balance") is None:
-                        out["balance"] = bill.get("balance")
+                        out["balance"] = acct.get("balance")
+                    if out.get("recharge") is None and acct.get("recharge") is not None:
+                        out["recharge"] = acct["recharge"]
+                        out["n_recharge"] = acct.get("n_recharge", 0)
+                        self.sink.log(f"📒 对账页充值未取到 → 回退旧账户页: 充值 "
+                                      f"{out['recharge']}({out['n_recharge']} 笔) → CJ")
+                    if acct.get("consume") is not None:
+                        # 诊断便利: 旧页「推广消费」与对账页「扣款」归属日差一天 → 仅供参考, 绝不写
+                        self.sink.log(f"   ℹ️ 旧账户页「推广消费」{acct['consume']} 仅供参考(不作 CE)")
             if out is None:
+                self.sink.log(f"⚠️ 推广流水({store_id}·{date}): 对账页与账户页都没取到 → CE/CJ 留空",
+                              level="warn")
                 return None
-            self.sink.log(f"📒 推广账户({store_id}) {date}: 充值 {out['recharge']} / 消耗 {out['consume']}"
-                          f" / 余额 {out['balance']}（充值{out['n_recharge']}笔 消费{out['n_consume']}笔·{src}）")
             return out
         except Exception as e:
             self.sink.log(f"⚠️ 推广流水抓取失败(该店 CE/CJ 留空): {str(e)[:80]}", level="warn")
             return None
         finally:
-            try:
-                if page is not None:
-                    page.close()
-            except Exception:
-                pass
             try:
                 if saved:
                     self.ctx.add_cookies([{"name": self._POI_COOKIE, "value": v, "domain": d, "path": p}
@@ -1809,37 +2053,48 @@ class MeituanAdapter:
             except Exception:
                 pass
 
-    def capture_promo(self):
-        """推广三大数值(昨日口径)。要点:
-        - 内容在跨域 iframe, 直接独立打开 iframe URL(外壳页 iframe 懒加载极不稳)
-        - 日期仅 昨日/近7日/近30日 快捷组, 无自定义区间 → 只支持昨日口径
-        - 抓不到时抛异常由调用方降级(列留空), 不阻塞主流程
+    def _read_account_ledger(self, store_id, date):
+        """旧账户页(/ad/v1/pc#/account?scrollConsume=true) 流水 → 充值/消费/余额(兜底用)。
+
+        ⚠️ 该页「推广消费」**不是** CE(规格书坑清单 8): 其归属日与对账页「推广订单扣款」相差一天,
+        调用方只拿它的 **recharge** 作 CJ 兜底, consume 仅打印"仅供参考"。
         """
-        page = self.ctx.new_page()
+        page = None
         try:
-            page.goto(self.PROMO_URL, wait_until="domcontentloaded", timeout=90000)
-            data = None
-            for _ in range(15):
-                time.sleep(4)
-                try:
-                    data = page.evaluate(self._PROMO_READ_JS)
-                except Exception:
-                    data = None
-                if data:
+            page = self.ctx.new_page()
+            page.goto(self.PROMO_LEDGER_URL, wait_until="domcontentloaded", timeout=90000)
+            rows = None
+            for _ in range(40):                         # 1s 轮询: 行出现即走, 上限 ~40s
+                time.sleep(1)
+                rows = page.evaluate("""() => {
+                    const tb = document.querySelector('table');
+                    if (!tb) return null;
+                    return [...tb.querySelectorAll('tr')].map(tr =>
+                        [...tr.querySelectorAll('td,th')].map(td => (td.innerText||'').trim())); }""")
+                if rows and len(rows) > 1:
                     break
-            if not data:
-                raise RuntimeError("推广页未渲染出数据(iframe内容加载超时)")
-            self.sink.log(f"📢 推广(昨日 {data['date']}): 花费 {data['spend']} / "
-                          f"曝光 {data['expose']} / 进店 {data['visit']}")
-            return data
+            if not rows or len(rows) <= 1:
+                return None
+            return self.parse_ledger(rows[1:], date)       # 去掉表头
+        except Exception:
+            return None
         finally:
-            try:
-                alive = [p for p in self.ctx.pages if not p.is_closed()]
-                if len(alive) > 1:
+            if page is not None:
+                try:
                     page.close()
-                else:
-                    # 关掉最后一个页面会连带关闭整个 persistent context(后续全部操作报
-                    # "Target page, context or browser has been closed") → 只导航走, 不关
-                    page.goto("about:blank")
-            except Exception:
-                pass
+                except Exception:
+                    pass
+
+    def _bill_cached(self, store_id, date):
+        """对账页结果按 (门店,日期) 缓存 —— 主表(账号级)与逐店写入两处要同一份数据, 免得同一页读两遍。
+        只缓存**成功**的结果(None=读不到, 允许后续重试)。"""
+        cache = getattr(self, "_bill_cache", None)
+        if cache is None:
+            cache = self._bill_cache = {}
+        key = (str(store_id), str(date))
+        if key in cache:
+            return cache[key]
+        val = self._read_bill_ledger(str(store_id), str(date))
+        if val is not None:
+            cache[key] = val
+        return val

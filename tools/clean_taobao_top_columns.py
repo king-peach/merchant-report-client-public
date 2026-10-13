@@ -8,8 +8,9 @@
     现在代码已改成 TOP 列不写(fill 对 None 是"跳过", 所以历史错值不会被自动覆盖掉)。
 
 本脚本只清「已知错误」的单元格, 不动其它数据:
-  · 淘宝TOP静态列: DO/DR/DU/DX/EA、ED/EG/EJ/EM/EP/ES、FA/FD/FG/FJ/FM/FP/FS/FV/FY/GB/GE
-  · 淘宝整体口径被写进新客/老客列的三处: EC/EF/EI、EL/EO/ER(旧 bug: 三态同值)
+  · 淘宝TOP静态列(修复后模板列位, 2026-10-13 换版后旧列位全部 -1):
+    DN/DQ/DT/DW/DZ、EC/EF/EI/EL/EO/ER、EZ/FC/FF/FI/FL、FO/FR/FU、FX/GA/GD
+  · 淘宝整体口径被写进新客/老客列的三处: EB/EE/EH、EK/EN/EQ(旧 bug: 三态同值)
     —— 清零后由下次运行按报表逐店口径重写(不写比写错好)。
 用法:
     python3 tools/clean_taobao_top_columns.py            # 演练(只打印, 不改)
@@ -24,9 +25,9 @@ import time
 import openpyxl
 
 XL = os.path.expanduser("~/Downloads/商家报表整理/运营报表模板.xlsx")
-TOP_COLS = ["DO", "DR", "DU", "DX", "EA", "ED", "EG", "EJ", "EM", "EP", "ES",
-            "FA", "FD", "FG", "FJ", "FM", "FP", "FS", "FV", "FY", "GB", "GE"]
-SEG_COLS = ["EC", "EF", "EI", "EL", "EO", "ER"]   # 淘宝主站新客/老客(旧代码写的是整体值)
+TOP_COLS = ["DN", "DQ", "DT", "DW", "DZ", "EC", "EF", "EI", "EL", "EO", "ER",
+            "EZ", "FC", "FF", "FI", "FL", "FO", "FR", "FU", "FX", "GA", "GD"]
+SEG_COLS = ["EB", "EE", "EH", "EK", "EN", "EQ"]   # 淘宝主站新客/老客(旧代码写的是整体值)
 HEADER_ROWS = (1, 2, 3, 4, 5)                     # 表头区不动
 
 

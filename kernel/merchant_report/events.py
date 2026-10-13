@@ -81,6 +81,12 @@ class EventSink:
         return self._emit({"type": "task_start", "store": store, "date": date, "platforms": platforms})
 
     def result(self, ok, outputs=None, summary=None, error_code=None, message=None, retryable=False):
+        # 后台模式兜底: 任务收尾无论走到哪条路, 都把窗口收回屏幕外(幂等)
+        try:
+            from . import browser_window as _bw
+            _bw.hide()
+        except Exception:
+            pass
         return self._emit({"type": "result", "ok": ok, "outputs": outputs or [],
                            "summary": summary or {}, "error_code": error_code,
                            "message": message, "retryable": retryable,
@@ -114,6 +120,13 @@ class EventSink:
                    context=None, free_text=False):
         """context: 卡点详情(platform/store/date/step/error_code/title/hint/error/shot/attempt),
         供客户端渲染失败面板; free_text: 是否允许用户补充描述(P1 用)。"""
+        # 2026-10-13 后台模式: 登录/短信这类"要人在浏览器里操作"的请求 → 自动把窗口弹回主屏
+        if action in ("login", "sms_code"):
+            try:
+                from . import browser_window as _bw
+                _bw.show(self, reason=("登录/滑块验证" if action == "login" else "短信验证码"))
+            except Exception:
+                pass
         obj = {"type": "need_human", "action": action, "message": message, "timeout_s": timeout_s}
         if platform:
             obj["platform"] = platform
@@ -124,6 +137,14 @@ class EventSink:
         if free_text:
             obj["free_text"] = True
         return self._emit(obj)
+
+    def browser_hide(self):
+        """后台模式: 把浏览器窗口收回屏幕外(登录/人工环节结束时调用; 幂等, 无后台时为空操作)。"""
+        try:
+            from . import browser_window as _bw
+            _bw.hide(self)
+        except Exception:
+            pass
 
     # ---- 日志/进度 ----
     def log(self, msg, level="info"):

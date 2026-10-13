@@ -113,9 +113,54 @@ def ensure_sheet(template_path, name, base_sheet=None, main_sheets=None):
         except Exception:
             pass
 DATE_COL = "A"
-ROW_START = 6
+ROW_START = 6          # 默认数据起始行(常规门店表); 结构不同的表用 data_start_row(ws) 现算
 SCAN_MAX_COL = 220
 SCAN_ROWS = 45
+
+
+def data_start_row(ws):
+    """该 Sheet 的**首个数据行**行号 —— 模板里各表结构并非完全一致。
+
+    为什么必须现算(2026-10-14 核实): 模板 19 个门店表里「天麓」是**旧结构** —— 表头(含「日期」)
+    在第 4 行、数据从第 5 行开始(其余 18 张是表头第 5 行、数据第 6 行, 首行日期 2026-04-01)。
+    写死 ROW_START=6 会让天麓:
+      · auto 模式扫不到第 5 行那个已有日期 → 同一天被**追加成第二行**(重复日期);
+      · top 模式把新行插到第 6 行 → 第 5 行的旧日期反而留在"最新在第一行"的位置之上。
+    做法: 在 A 列找「日期」表头行 h, 且 h+1 行的 A 列**确实是日期**(序列号/datetime/字符串),
+    取 h+1; 数据区被清空的表(表头下一行还没日期)用「找到的第一个日期表头 + 1」兜底;
+    两个线索都没有就退回 ROW_START(老行为, 其它调用方/合成夹具完全不受影响)。
+    """
+    hdr = None
+    try:
+        max_r = min(int(ws.max_row or 0), 20)
+        for h in range(1, max_r):
+            if str(ws.cell(row=h, column=1).value or "").strip() != "日期":
+                continue
+            nxt = ws.cell(row=h + 1, column=1).value
+            if isinstance(nxt, (int, float, datetime)) or _parse_date(nxt):
+                return h + 1
+            if hdr is None:
+                hdr = h
+    except Exception:
+        pass
+    return (hdr + 1) if hdr else ROW_START
+
+
+def _parse_date(v):
+    """A 列值 → 'YYYY-MM-DD'; 认不出 → None(Excel 序列号/datetime/字符串三吃)。"""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d")
+    if isinstance(v, (int, float)):
+        try:
+            return (EPOCH + timedelta(days=int(v))).strftime("%Y-%m-%d")
+        except (OverflowError, ValueError):
+            return None
+    if isinstance(v, str):
+        try:
+            return datetime.strptime(v.strip()[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
 
 
 def num(v):
@@ -445,7 +490,7 @@ def evaluate_mapping(mapping, all_row, bom_row):
 
 def cross_checks(vals):
     """交叉校验(淘宝口径): 营收/订单类(精确0.02); 流量类不在 write_set 时不校验(浏览器跳过场景)。
-    DK/DL/DM(主站营收)是模板公式列(=全部-爆品团), write_set 恒为 None → 不能当数据校验,
+    DJ/DK/DL(主站营收, 修复后模板列位)是模板公式列(=全部-爆品团), write_set 恒为 None → 不能当数据校验,
     改校验恒等变形: 全部 − 爆品团 ≥ 0 且 爆品团 ≤ 全部(爆品团是全部的子集, 2026-09-20)。"""
     def ck(name, a, b, c, tol=0.02):
         if a is None:
@@ -460,17 +505,18 @@ def cross_checks(vals):
         return (name, ok)
 
     return [
-        subset("营业额: 爆品团⊆全部", vals.get("DG"), vals.get("EU")),
-        subset("收入: 爆品团⊆全部", vals.get("DH"), vals.get("EV")),
-        subset("订单: 爆品团⊆全部", vals.get("DI"), vals.get("EW")),
+        subset("营业额: 爆品团⊆全部", vals.get("DG"), vals.get("ET")),
+        subset("收入: 爆品团⊆全部", vals.get("DH"), vals.get("EU")),
+        subset("订单: 爆品团⊆全部", vals.get("DI"), vals.get("EV")),
     ]
 
 
 # ---------------- 模板写入 ----------------
 def scan_formula_cols(ws):
     fmap = {}
+    start = data_start_row(ws)
     for c in range(1, SCAN_MAX_COL):
-        for r in range(ROW_START, ROW_START + SCAN_ROWS):
+        for r in range(start, start + SCAN_ROWS):
             v = ws.cell(row=r, column=c).value
             if isinstance(v, str) and v.startswith("="):
                 fmap[GL(c)] = (r, v)
@@ -496,28 +542,23 @@ def shift_formula_by(formula, delta):
 
 
 def resolve_row(ws, target, mode="top"):
-    """top=第6行上方插入新行(最新在第一行); 同日重跑原地更新。auto=按日期找行否则尾部追加。"""
+    """top=数据区首行上方插入新行(最新在第一行); 同日重跑原地更新。auto=按日期找行否则尾部追加。
+
+    数据区首行 = data_start_row(ws) —— 常规门店表 6, 「天麓」这种旧结构表 5(见 data_start_row)。
+    """
+    start = data_start_row(ws)
     if mode == "top":
-        anchor = ws[f"{DATE_COL}{ROW_START}"]
+        anchor = ws[f"{DATE_COL}{start}"]
         old = anchor.value
-        same_day = False
-        if isinstance(old, (int, float)):
-            same_day = (EPOCH + timedelta(days=int(old))).strftime("%Y-%m-%d") == target
-        elif isinstance(old, datetime):
-            same_day = old.strftime("%Y-%m-%d") == target
-        elif isinstance(old, str):
-            try:
-                same_day = datetime.strptime(old[:10], "%Y-%m-%d").strftime("%Y-%m-%d") == target
-            except ValueError:
-                same_day = False
+        same_day = _parse_date(old) == target
         if not same_day:
             fmap_old = {}
             for c in range(1, SCAN_MAX_COL):
-                v = ws.cell(row=ROW_START, column=c).value
+                v = ws.cell(row=start, column=c).value
                 if isinstance(v, str) and v.startswith("="):
                     fmap_old[c] = v
-            ws.insert_rows(ROW_START)
-            new = ROW_START
+            ws.insert_rows(start)
+            new = start
             ws[f"{DATE_COL}{new}"] = datetime.strptime(target, "%Y-%m-%d")
             ws[f"{DATE_COL}{new}"].number_format = DATE_FMT
             nxt = ws[f"B{new + 1}"].value
@@ -544,24 +585,12 @@ def resolve_row(ws, target, mode="top"):
                 if s.has_style:
                     ws.cell(row=new, column=c)._style = _copy(s._style)
             return new, f"top-inserted(引用平移{shifted}格)"
-        return ROW_START, "top-overwrite(同日重跑)"
-    for r in range(ROW_START, ws.max_row + 1):
-        v = ws[f"{DATE_COL}{r}"].value
-        if v is None:
-            continue
-        if isinstance(v, (int, float)):
-            d = EPOCH + timedelta(days=int(v))
-        elif isinstance(v, datetime):
-            d = v
-        else:
-            try:
-                d = datetime.strptime(str(v)[:10], "%Y-%m-%d")
-            except ValueError:
-                continue
-        if d.strftime("%Y-%m-%d") == target:
+        return start, "top-overwrite(同日重跑)"
+    for r in range(start, ws.max_row + 1):
+        if _parse_date(ws[f"{DATE_COL}{r}"].value) == target:
             return r, "existing"
-    last = ROW_START
-    for r in range(ROW_START, ws.max_row + 1):
+    last = start
+    for r in range(start, ws.max_row + 1):
         if ws[f"{DATE_COL}{r}"].value is not None:
             last = r
     r = last + 1
@@ -592,16 +621,18 @@ def apply_row_borders(ws, row, max_col=SCAN_MAX_COL):
 
 
 def _clear_data_area(ws, max_col=260, min_row=None):
-    """复刻样板表后**清空数据区**(行 6+, 除 A 列日期脚手架), 只留表头/公式/列宽。
+    """复刻样板表后**清空数据区**(数据首行起, 除 A 列日期脚手架), 只留表头/公式/列宽。
 
     为什么必须清(2026-09-30 真机事故): 样板表 = 第 3 个起的真门店表, 任务跑到建新表时它
     **已经被本任务写过数据** → `copy_worksheet` 把那些数字一起复刻过去 →
     新建的 4 张门店表(坡子街/天马公寓/杜甫江阁/浏城桥)一开出来就带着「铁道」当天的
     营业额/收入/单量, 用户看到的是"这不是我这家店的数"。
 
-    保留: 第 1~5 行表头、所有公式列(结构)、A 列日期(日期行脚手架, 写入要靠它定位行号)。
+    保留: 表头行(数据首行之上)、所有公式列(结构)、A 列日期(日期行脚手架, 写入要靠它定位行号)。
+    数据首行 = data_start_row(ws): 常规门店表 6, 「天麓」那种旧结构表 5 —— 写死 6 的话
+    天麓的第 5 行旧数据会被复刻进新表(正是这里要防的事)。
     """
-    start = min_row or ROW_START
+    start = min_row or data_start_row(ws)
     last = max(int(getattr(ws, "max_row", 0) or 0), start)
     for row in ws.iter_rows(min_row=start, max_row=last, max_col=max_col):
         for c in row:
@@ -764,19 +795,12 @@ def _find_row_by_date(ws, date, max_rows=60):
     """在 Sheet 的日期列里按日期找行号(Excel 序列号/日期对象/字符串都认)。找不到返回 None。
 
     批量写入必须用它校验: top 模式后一次写入会把先写的行**往下顶**, 写入时记的行号已失效。
+    扫描自该表的**数据首行**起(data_start_row; 天麓=5, 常规=6) —— 否则天麓第 5 行的日期
+    永远找不到, 回读校验会把"写对了"判成没写。
     """
-    for r in range(ROW_START, min(ws.max_row, ROW_START + max_rows) + 1):
-        v = ws[f"{DATE_COL}{r}"].value
-        if isinstance(v, datetime):
-            if v.strftime("%Y-%m-%d") == date:
-                return r
-        elif isinstance(v, (int, float)):
-            try:
-                if (EPOCH + timedelta(days=int(v))).strftime("%Y-%m-%d") == date:
-                    return r
-            except (ValueError, OverflowError):
-                pass
-        elif isinstance(v, str) and v[:10] == date:
+    start = data_start_row(ws)
+    for r in range(start, min(ws.max_row, start + max_rows) + 1):
+        if _parse_date(ws[f"{DATE_COL}{r}"].value) == date:
             return r
     return None
 

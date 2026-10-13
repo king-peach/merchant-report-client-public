@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-"""淘宝推广 4 列(GG/GH/GI/GL)写入: 数据来自**单店** capture["promo"]。
+"""淘宝推广 4 列(GF/GG/GH/GK)写入: 数据来自**单店** capture["promo"]。
 
-2026-10-08 四平台诊断: 推广以前只在**品牌级**抓 → 逐店 vals 拿不到 → 模板 GG/GH/GI/GL 永远空。
+列位(2026-10-13 修复后模板): 旧 GG/GH/GI/GL → 新 **GF 消耗 / GG 曝光量 / GH 进店量 / GK 充值**
+(GI 推广进店率 / GJ 推广ROI 是模板公式列, 禁写)。
+
+2026-10-08 四平台诊断: 推广以前只在**品牌级**抓 → 逐店 vals 拿不到 → 模板这 4 列永远空。
 修复 = capture_per_store 逐店读推广页(带日期验收)放进 cap["promo"], mapping 照收这 4 列。
 """
 import inspect
@@ -26,19 +29,21 @@ def _cap(promo=None, dims_ok=False):
 
 def main():
     # ① 有 promo → 4 列全写
-    v = build_write_set({}, {}, _cap({"GG": 3397.47, "GH": 120000, "GI": 3400, "GL": 500.0}))
-    assert (v.get("GG"), v.get("GH"), v.get("GI"), v.get("GL")) == (3397.47, 120000, 3400, 500.0), v
-    print("① 有 promo → GG/GH/GI/GL 全写 ✓", {k: v.get(k) for k in ('GG', 'GH', 'GI', 'GL')})
+    v = build_write_set({}, {}, _cap({"GF": 3397.47, "GG": 120000, "GH": 3400, "GK": 500.0}))
+    assert (v.get("GF"), v.get("GG"), v.get("GH"), v.get("GK")) == (3397.47, 120000, 3400, 500.0), v
+    print("① 有 promo → GF/GG/GH/GK 全写 ✓", {k: v.get(k) for k in ('GF', 'GG', 'GH', 'GK')})
 
     # ② 没有 promo → 4 列都不写(不臆造)
     v2 = build_write_set({}, {}, _cap(None))
-    for k in ("GG", "GH", "GI", "GL"):
+    for k in ("GF", "GG", "GH", "GK"):
         assert v2.get(k) is None, f"没抓到就不该写 {k}={v2.get(k)!r}"
-    print("② 无 promo → 4 列留空 ✓")
+    # 公式列(GI 进店率 / GJ ROI)任何情况下都不许有值
+    assert v2.get("GI") is None and v2.get("GJ") is None, "推广公式列 GI/GJ 不得有值"
+    print("② 无 promo → 4 列留空 ✓ (公式列 GI/GJ 恒空)")
 
     # ③ 只有部分字段 → 只写有的
-    v3 = build_write_set({}, {}, _cap({"GG": 88.8, "GH": None, "GI": None, "GL": None}))
-    assert v3.get("GG") == 88.8 and v3.get("GH") is None and v3.get("GL") is None, v3
+    v3 = build_write_set({}, {}, _cap({"GF": 88.8, "GG": None, "GH": None, "GK": None}))
+    assert v3.get("GF") == 88.8 and v3.get("GG") is None and v3.get("GK") is None, v3
     print("③ 只有部分字段 → 写有的, 其余留空 ✓")
 
     # ④ 源码守卫: 逐店读推广页 + 日期验收 + promo 必须进每店结果

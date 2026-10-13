@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""淘宝充值(GL): 增值服务页「消费记录」→ 当日充值金额。
+"""淘宝充值(GK): 增值服务页「消费记录」→ 当日充值金额(2026-10-13 修复后模板列位: 旧 GL → GK)。
 
 真机表结构(2026-10-08, shop 555555555, 用户指路 /app/shop/<id>/vas → 消费记录):
     表头: 时间 | 消费类型 | 消费金额 | 余额 | 操作
@@ -27,22 +27,22 @@ def main():
     p = T.parse_vas_ledger
     # ① 有充值 → 取到 + 余额
     r = p(ROWS, "2026-10-05")
-    assert r["GL"] == 400.0 and r["balance"] == 1390.13 and r["hits"] == 1, r
-    print("① 有充值 → GL=400.0, 余额=1390.13 ✓")
+    assert r["GK"] == 400.0 and r["balance"] == 1390.13 and r["hits"] == 1, r
+    print("① 有充值 → GK=400.0, 余额=1390.13 ✓")
 
     # ② 只有消费的日子 → 留空(关键: 不能把 -246.49 当充值)
     r2 = p(ROWS, "2026-10-07")
-    assert r2["GL"] is None and r2["hits"] == 0, f"只有消费必须留空, 实得 {r2}"
-    print("② 只有推广消费 → GL=None(不臆造, 不拿消费额冒充) ✓")
+    assert r2["GK"] is None and r2["hits"] == 0, f"只有消费必须留空, 实得 {r2}"
+    print("② 只有推广消费 → GK=None(不臆造, 不拿消费额冒充) ✓")
 
     # ③ 同日多笔充值 → 累加
     r3 = p(ROWS + [['2026-10-05 18:00:00', '现金充值', '+100.00', '1490.13', '_']], "2026-10-05")
-    assert r3["GL"] == 500.0 and r3["hits"] == 2, r3
+    assert r3["GK"] == 500.0 and r3["hits"] == 2, r3
     print("③ 同日两笔充值 → 400+100=500 累加 ✓")
 
     # ④ 脏数据不崩
-    assert p(None, "2026-10-05")["GL"] is None
-    assert p([None, [], ['x'], ['2026-10-05', '充值', 'abc']], "2026-10-05")["GL"] is None
+    assert p(None, "2026-10-05")["GK"] is None
+    assert p([None, [], ['x'], ['2026-10-05', '充值', 'abc']], "2026-10-05")["GK"] is None
     print("④ 空表/脏行不崩 ✓")
 
     # ⑤ 源码守卫: 充值来自 vas 页 + 用独立标签页(不破坏 stats frame) + 调用点在逐店流程里
@@ -55,7 +55,7 @@ def main():
     assert "[充值]" in cps, "要有充值日志(便于真机核对)"
     assert T.VAS_URL.endswith("/vas#app.shop.vas"), T.VAS_URL
     print("⑤ 源码守卫: vas 页 + 独立标签页 + 逐店调用 ✓")
-    print("\n✅ 淘宝充值(GL) 全绿")
+    print("\n✅ 淘宝充值(GK) 全绿")
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ def parse_vas_ledger(rows, date):
                     bal = float(str(r[3]).replace(",", ""))
                 except ValueError:
                     pass
-    return {"GL": round(total, 2) if (hits and total is not None) else None,
+    return {"GK": round(total, 2) if (hits and total is not None) else None,
             "balance": bal, "hits": hits}
 
 
@@ -443,6 +443,21 @@ def _cleanup_stale_browser(profile_dir, sink=None):
 DOWNLOAD_STAGE = ""
 
 
+def _browser_launch_args(background=False):
+    """浏览器启动参数。background=True: 窗口**出生就在屏幕外**(用户不可见, 需要人工时再弹回);
+    否则最大化起始(前台展示, 用于调试/需要盯过程的场景)。"""
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if background:
+        args += ["--window-position=-32000,-32000", "--window-size=1500,950"]
+    else:
+        args.append("--start-maximized")
+    return args
+
+
 def _launch_persistent(pw, profile_dir, args, exclude, channel=None, timeout_ms=LAUNCH_TIMEOUT_MS):
     kw: dict = dict(headless=False, args=args, ignore_default_args=exclude,
                     viewport=None, accept_downloads=True, timeout=timeout_ms)
@@ -638,7 +653,7 @@ FALLBACK_MARKS = ("executable doesn't exist", "failed to launch", "channel", "no
                   "cannot find", "没有", "timeout", "timed out", "target closed")
 
 
-def launch_browser(pw, profile_dir, prefer=None, sink=None):
+def launch_browser(pw, profile_dir, prefer=None, sink=None, background=None):
     """Playwright 启动 Chromium 系浏览器(持久 profile + 剔除自动化痕迹参数)。
     候选顺序 = 默认序列 + **本机记忆**优先(见 browser_pref):
       - 2026-10-13 起 Windows 默认 = **系统浏览器优先**(chrome → msedge → 自带 Chromium,
@@ -648,12 +663,12 @@ def launch_browser(pw, profile_dir, prefer=None, sink=None):
     也支持环境变量 MRC_BROWSER_CHANNEL=chrome|msedge 强制指定。
     sink: 可选事件出口 —— 清理被跳过(双开/探测不可用)时把提示给用户看到(见 _cleanup_stale_browser)。"""
     _cleanup_stale_browser(profile_dir, sink=sink)
-    args = [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--start-maximized",
-    ]
+    # 后台模式(2026-10-13): 窗口默认藏到主屏之外, 需要人工(登录/验证码)时自动弹回。
+    # background=None → 按 配置/环境变量/平台默认(Windows 开) 解析。
+    from .. import browser_window as _bw
+    if background is None:
+        background = _bw.resolve_default()
+    args = _browser_launch_args(background)
     exclude = [
         "--enable-automation",
         "--enable-blink-features=IdleDetection",
@@ -670,6 +685,13 @@ def launch_browser(pw, profile_dir, prefer=None, sink=None):
     for ch in order:
         try:
             ctx = _launch_persistent(pw, profile_dir, args, exclude, ch)
+            _bw.bind(ctx, background)    # 后台模式: 登记窗口控制(重开浏览器会再次登记并重置状态)
+            if background and sink is not None:
+                try:
+                    sink.log("🫥 浏览器后台模式: 窗口在主屏之外, 不打扰你用电脑"
+                             "(需要登录/验证码时自动弹出, 处理完自动收回)")
+                except Exception:
+                    pass
             if not forced:
                 remember_ok(ch)      # 记住"这台机器上能用哪个", 下次直接用
             return ctx
@@ -747,7 +769,9 @@ class TaobaoAdapter:
                 time.sleep(2)
                 self._dismiss_popups()
                 self._discover_shop_id()
+                self.sink.browser_hide()         # 后台模式: 人工登录结束 → 窗口收回
                 return True
+        self.sink.browser_hide()                 # 超时退出同样收回
         self.sink.step_fail("login", "登录", "超时未检测到登录", "E_LOGIN_TIMEOUT")
         return False
 
@@ -1753,7 +1777,7 @@ class TaobaoAdapter:
                 out[d] = dict(_st, customer_dims_ok=_dims_ok)
                 self.sink.progress("capture", 15 + int(70 * (i + 1) / len(days)))
             # 推广(区间): 推广页有总消费区间口径, 取最后设置的单日逐日累计
-            promo_sum = {"GG": 0.0, "GH": 0, "GI": 0}
+            promo_sum = {"GF": 0.0, "GG": 0, "GH": 0}
             for d in days:
                 assert self._click_nav(f, "推广"), "推广导航失败"
                 self._wait_text(f, "推广概览")
@@ -1763,9 +1787,9 @@ class TaobaoAdapter:
                 pr = self._read_promo(f)
                 for k in promo_sum:
                     promo_sum[k] += pr.get(k) or 0
-            out["promo"] = {k: (round(v, 2) if k == "GG" else v) for k, v in promo_sum.items()}
+            out["promo"] = {k: (round(v, 2) if k == "GF" else v) for k, v in promo_sum.items()}
             self.sink.step_ok("capture", "网页抓取",
-                              f"区间逐日 {len(days)} 天 + 推广累计(消费{out['promo']['GG']})")
+                              f"区间逐日 {len(days)} 天 + 推广累计(消费{out['promo']['GF']})")
             return out
         # 单日模式(原有逻辑)
         assert self._click_nav(f, "流量"), "流量导航失败"
@@ -1787,18 +1811,18 @@ class TaobaoAdapter:
             self._pick_single_day(f, date_from)
         else:
             self._pick_yesterday(f)
-        promo = {"GG": None, "GH": None, "GI": None}
+        promo = {"GF": None, "GG": None, "GH": None}
         for _ in range(6):
             time.sleep(2.5)
             promo = f.evaluate("""() => {
               const t=document.body.innerText;
               const g=(kw)=>{const m=t.match(new RegExp(kw+'\\\\n([\\\\d,.]+)')); return m? +m[1].replace(/,/g,''):null;};
-              return {"GG":g('总推广消费'),"GH":g('总曝光次数'),"GI":g('总进店次数')};
+              return {"GF":g('总推广消费'),"GG":g('总曝光次数'),"GH":g('总进店次数')};
             }""")
-            if promo.get("GG") is not None:
+            if promo.get("GF") is not None:
                 break
         out["promo"] = promo
-        self.sink.step_ok("capture", "网页抓取", f"6态+推广(消费{promo['GG']})")
+        self.sink.step_ok("capture", "网页抓取", f"6态+推广(消费{promo['GF']})")
         return out
 
     # ================= 单店(逐店)抓取 =================
@@ -2169,17 +2193,24 @@ class TaobaoAdapter:
 
         真机(2026-10-01): 基准是个 ant-dropdown-trigger, 点开后选项
         ['商圈同行均值', '商圈同行前10%均值']。
+
+        D6 取证(2026-10-14, 只加日志不改抓取主逻辑): 每次切换打印「当前基准 / 切换尝试序列 /
+        成功或失败证据」—— 真机排查「TOP 列为什么空」时能一眼看出是"没切成"还是"页面没有该控件"。
         """
         cur = (self._parse_funnel(f).get("cust") or "").strip()
         if want in cur:
+            self.sink.log(f"📊 商圈口径 → {want}（当前已是, 基准列照读）")
             return True
+        tried = []
         for label in (cur, "商圈同行均值", "比上周同时段"):
             if not label:
                 continue
             try:
                 loc = f.locator(f'text="{label}"')
                 if not loc.count():
+                    tried.append(f"{label}(未找到入口)")
                     continue
+                tried.append(label)
                 loc.first.click(timeout=5000)
                 time.sleep(1.5)
                 opt = f.locator(f'.ant-select-dropdown:not(.ant-select-dropdown-hidden) >> text="{want}"')
@@ -2188,11 +2219,20 @@ class TaobaoAdapter:
                 if opt.count():
                     opt.first.click(timeout=5000)
                     time.sleep(2.5)
-                    return want in (self._parse_funnel(f).get("cust") or "")
+                    gf = (self._parse_funnel(f).get("cust") or "").strip()
+                    if want in gf:
+                        self.sink.log(f"📊 商圈口径 → {want}（从「{label}」切成功; 尝试序列 {tried}）")
+                        return True
+                    tried.append(f"「{label}」→ 点后基准变成「{gf or '?'}」")
+                    continue
                 f.keyboard.press("Escape")
                 time.sleep(0.6)
+                tried.append(f"「{label}」→ 下拉里没有「{want}」")
             except Exception as e:
+                tried.append(f"「{label}」异常 {str(e)[:40]}")
                 self.sink.log(f"⚠️ 切基准「{want}」失败({label}): {str(e)[:60]}", level="warn")
+        self.sink.log(f"⚠️ 商圈口径切换失败: 当前「{cur or '?'}」≠「{want}」→ TOP(前10%)列本次留空"
+                      f"（尝试序列: {'; '.join(tried) or '无可用入口'}）", level="warn")
         return False
 
     def _set_store_date(self, f, date):
@@ -2282,7 +2322,7 @@ class TaobaoAdapter:
                         top10 = tk if ok else {}
                     else:
                         zb_top = tk if ok else {}
-                    # 顾客维度(新客/老客) + 同一基准 → 模板的「新客/老客 TOP」列(ED/EG/EJ/EM/EP/ES、FP/FS/FV/FY/GB/GE)
+                    # 顾客维度(新客/老客) + 同一基准 → 模板的「新客/老客 TOP」列(EC/EF/EI、EL/EO/ER、FO/FR/FU、FX/GA/GD)
                     if ok:
                         for cname in ("新客", "老客"):
                             try:
@@ -2314,8 +2354,8 @@ class TaobaoAdapter:
                         except Exception:
                             pass
                 # 推广(单店): 该店自己的推广页 —— 以前推广只在**品牌级**抓, 逐店 vals 拿不到
-                # → 模板 GG/GH/GI/GL 永远空(2026-10-08 诊断实锤: 抓取步抓到 3397.47 却没写进模板)。
-                promo = {"GG": None, "GH": None, "GI": None, "GL": None}
+                # → 模板 GF/GG/GH/GK 永远空(2026-10-08 诊断实锤: 抓取步抓到 3397.47 却没写进模板)。
+                promo = {"GF": None, "GG": None, "GH": None, "GK": None}
                 pr = {}
                 try:
                     if self._click_nav(f, "推广"):
@@ -2327,10 +2367,10 @@ class TaobaoAdapter:
                         for _ in range(5):
                             time.sleep(2.0)
                             pr = self._read_promo_store(f, date)
-                            if pr.get("GG") is not None and pr.get("date_ok"):
-                                promo = {k: pr.get(k) for k in ("GG", "GH", "GI", "GL")}
+                            if pr.get("GF") is not None and pr.get("date_ok"):
+                                promo = {k: pr.get(k) for k in ("GF", "GG", "GH", "GK")}
                                 break
-                            if pr.get("GG") is not None and not pr.get("date_ok"):
+                            if pr.get("GF") is not None and not pr.get("date_ok"):
                                 self.sink.log(f"   ⚠️ {name}: 推广页有数值但**未确认日期**={date}"
                                               f" → 推广列留空(取证: {'/'.join(pr.get('hits') or []) or '无关键词'})",
                                               level="warn")
@@ -2339,20 +2379,20 @@ class TaobaoAdapter:
                             self.sink.log(f"   ⚠️ {name}: 推广页没读到数值 → 推广列留空"
                                           f"(取证: {'/'.join(pr.get('hits') or []) or '无关键词'})",
                                           level="warn")
-                        self.sink.log(f"   ↳ {name} [推广] 消费{promo.get('GG')} 曝光{promo.get('GH')}"
-                                      f" 进店{promo.get('GI')} 充值{promo.get('GL')}")
+                        self.sink.log(f"   ↳ {name} [推广] 消费{promo.get('GF')} 曝光{promo.get('GG')}"
+                                      f" 进店{promo.get('GH')} 充值{promo.get('GK')}")
                     else:
                         self.sink.log(f"   ⚠️ {name}: 推广导航失败 → 推广列留空", level="warn")
                 except Exception as e:
                     self.sink.log(f"   ⚠️ {name}: 推广读取异常 {str(e)[:60]} → 推广列留空", level="warn")
-                # 充值(GL): 推广页**没有**充值额 → 去增值服务页「消费记录」读当日充值
+                # 充值(GK): 推广页**没有**充值额 → 去增值服务页「消费记录」读当日充值
                 # (2026-10-08 用户指路 + 探针 dump 表结构: 表头 时间|消费类型|消费金额|余额|操作;
                 #  充值行 = 类型含"充值" 且金额带 '+' 号; 该日没有充值行 → 留空, 不臆造 0)
                 try:
                     _v = self._read_vas_ledger(sid, date)
-                    if _v.get("GL") is not None:
-                        promo["GL"] = _v["GL"]
-                        self.sink.log(f"   ↳ {name} [充值] 当日充值 {_v['GL']} 元"
+                    if _v.get("GK") is not None:
+                        promo["GK"] = _v["GK"]
+                        self.sink.log(f"   ↳ {name} [充值] 当日充值 {_v['GK']} 元"
                                       f"(账户余额 {_v.get('balance')})")
                     elif _v.get("table_found"):
                         self.sink.log(f"   ↳ {name} [充值] 该日消费记录里没有充值行 → 留空")
@@ -2541,13 +2581,13 @@ class TaobaoAdapter:
             return f.evaluate("""() => {
               const t = document.body.innerText;
               const g = (kw) => { const m = t.match(new RegExp(kw + '\\n([\\d,.]+)')); return m ? +m[1].replace(/,/g, '') : null; };
-              return {"GG": g('总推广消费'), "GH": g('总曝光次数'), "GI": g('总进店次数')};
+              return {"GF": g('总推广消费'), "GG": g('总曝光次数'), "GH": g('总进店次数')};
             }""")
         except Exception:
-            return {"GG": None, "GH": None, "GI": None}
+            return {"GF": None, "GG": None, "GH": None}
 
     def _read_promo_store(self, f, date):
-        """单店推广页读数: GG 消耗 / GH 曝光 / GI 进店 / GL 充值(有则取)。
+        """单店推广页读数: GF 消耗 / GG 曝光 / GH 进店 / GK 充值(有则取)。
 
         ⚠️ 只在页面**确实显示着目标日期**时才采信(宁可不写, 不写错) —— 推广页有自己的
         日期控件, 没切成功就会读到别的日期的数, 那种错比留空危险。解析放 Python 侧。
@@ -2555,7 +2595,7 @@ class TaobaoAdapter:
         try:
             txt = f.evaluate("() => (document.body ? document.body.innerText : '')") or ""
         except Exception:
-            return {"GG": None, "GH": None, "GI": None, "GL": None,
+            return {"GF": None, "GG": None, "GH": None, "GK": None,
                     "date_ok": False, "hits": []}
 
         def num_next_line(kw):
@@ -2570,28 +2610,28 @@ class TaobaoAdapter:
         date_ok = any(s in txt for s in (date, d2, date.replace("-", "/"),
                                          d2.replace("-", "/"), d2.replace("-", "月") + "日"))
         return {
-            "GG": num_next_line("总推广消费") or num_near("总推广消费"),
-            "GH": num_next_line("总曝光次数") or num_near("总曝光次数"),
-            "GI": num_next_line("总进店次数") or num_near("总进店次数"),
-            # GL 充值: **只认「充值」字样**。真机核实(2026-10-08, 探针 dump 推广页全文):
+            "GF": num_next_line("总推广消费") or num_near("总推广消费"),
+            "GG": num_next_line("总曝光次数") or num_near("总曝光次数"),
+            "GH": num_next_line("总进店次数") or num_near("总进店次数"),
+            # GK 充值: **只认「充值」字样**。真机核实(2026-10-08, 探针 dump 推广页全文):
             # 淘宝推广页上**没有充值额** —— 只有 消费/曝光/进店/进店率; 「单店计划-分店资金」是
             # **数据源标签**(钱从哪扣), 不是充值额 → 该页面取不到, 留空。
             # 收紧理由(防**同行**误匹配): 页面同一行可能出现 "数据源：单店计划-分店资金 3,397.47"
             # 这种排布, 旧写法把 分店资金/账户余额 也当关键词就会把消费额读成充值额。
             # 注: 换行文本下正则不跨行, 所以旧写法在**当前**页面上本来也没命中(没写错过); 这是加固, 不是修复。
-            "GL": num_near("充值金额") or num_next_line("充值"),
+            "GK": num_near("充值金额") or num_next_line("充值"),
             "date_ok": date_ok,
             "hits": [k for k in ("充值", "分店资金", "余额", "总推广消费", "推广概览") if k in txt],
         }
 
     def _read_vas_ledger(self, shop_id, date):
-        """增值服务页 → 消费记录 → 当日充值金额(GL)。
+        """增值服务页 → 消费记录 → 当日充值金额(GK)。
 
         用户指路(2026-10-08): 推广充值在 /app/shop/<id>/vas 的「消费记录」里 —— 经营分析→推广
         那个页面上只有 消费/曝光/进店, **没有充值额**(探针 dump 全文核实过)。
         用**独立标签页**打开, 不动当前 stats frame(导航会把 frame 弄失效, 后续步骤还要用)。
         """
-        out = {"GL": None, "balance": None, "hits": 0}
+        out = {"GK": None, "balance": None, "hits": 0}
         if not shop_id:
             return out
         vp = None
@@ -3374,7 +3414,7 @@ class TaobaoAdapter:
 
         2026-09-30 真机核实(把整页控件逐个点开抄选项):
             流量类型 = 全部/外卖/爆品团; 统计方式 = 门店累计/门店均值; 顾客 = 新客/老客; 对比 = 比上周二/比前一日。
-            没有任何「商圈同行/前10%」入口 → 本页取不到商圈TOP(模板 FA..GE/DO..EA 那些列)。
+            没有任何「商圈同行/前10%」入口 → 本页取不到商圈TOP(模板 DN/DQ/DT/DW/DZ、EZ/FC/FF/FI/FL 那些列)。
         以前这里打的是"沿用页面基准: 新客", 实际是把「顾客维度」当成了基准名 → 混淆了售后诊断。
         现在如实说明, 并把 TOP 列留空(宁可不写, 也不写错)。"""
         d = self._parse_funnel(f)
