@@ -2145,7 +2145,7 @@ class TaobaoAdapter:
         tgt = None
         for _ in range(3):
             self._open_switcher(page)
-            for probe in (name, name.strip("示例柠檬茶()"), name[4:8]):
+            for probe in (name, name.strip("示例·柠檬茶()"), name[4:8]):
                 if not probe:
                     continue
                 loc = page.locator(f"{self.SHOP_SWITCHER} >> text={probe}")

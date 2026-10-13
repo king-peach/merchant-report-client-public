@@ -22,9 +22,9 @@ def mk_template(path):
     mp["A2"], mp["B2"] = "区域", "门店"
     mp["C2"], mp["D2"], mp["E2"], mp["F2"] = "淘宝闪购门店名称", "京东门店名称", "美团门店名称", "门店id"
     mp["A3"], mp["B3"], mp["C3"] = "示例员工", "铁道", "示例柠檬茶(铁道学院店)"
-    mp["D3"], mp["E3"], mp["F3"] = "示例柠檬茶(长沙铁道学院店)", "示例柠檬茶专门店（铁道学院店）", 22222222
+    mp["D3"], mp["E3"], mp["F3"] = "示例·柠檬茶(长沙铁道学院店)", "示例?柠檬茶专门店（铁道学院店）", 22222222
     mp["B4"], mp["C4"] = "高桥", "示例柠檬茶(长沙高桥店)"
-    mp["D4"], mp["E4"], mp["F4"] = "示例柠檬茶(长沙高桥店)", "示例柠檬茶（长沙高桥店）", 55555555
+    mp["D4"], mp["E4"], mp["F4"] = "示例·柠檬茶(长沙高桥店)", "示例?柠檬茶（长沙高桥店）", 55555555
     for nm in ("铁道", "高桥"):
         ws = wb.create_sheet(nm)
         ws["A5"] = "日期"
@@ -39,9 +39,9 @@ def main():
     for plat, want in (("meituan", "高桥"), ("taobao", "高桥"), ("jd", "高桥")):
         m = SM.load_store_map(tpl, plat)
         assert len(m) == 2, (plat, m)
-        assert SM.lookup_store_map(m, {"meituan": "示例柠檬茶（长沙高桥店）",
+        assert SM.lookup_store_map(m, {"meituan": "示例?柠檬茶（长沙高桥店）",
                                        "taobao": "示例柠檬茶(长沙高桥店)",
-                                       "jd": "示例柠檬茶(长沙高桥店)"}[plat]) == want, (plat, m)
+                                       "jd": "示例·柠檬茶(长沙高桥店)"}[plat]) == want, (plat, m)
         print(f"✅ [{plat}] 映射 {len(m)} 条, 该平台门店名 → 「{want}」")
 
     # 全角/半角、·/? 之类的差异不影响(规范化后匹配)
@@ -61,13 +61,13 @@ def main():
 
     # plan_matches 走映射表, 说明里写明来源
     sheets = ["营业指标达成", "数据反馈看板", "Sheet1", "铁道", "高桥", "兰亭"]
-    plan = SM.plan_matches(sheets, ["示例柠檬茶（长沙高桥店）"], ["高桥"], store_map=m)
-    assert plan["matched"] == [("示例柠檬茶（长沙高桥店）", "高桥", "映射表(模板里的平台门店名)")], plan
+    plan = SM.plan_matches(sheets, ["示例?柠檬茶（长沙高桥店）"], ["高桥"], store_map=m)
+    assert plan["matched"] == [("示例?柠檬茶（长沙高桥店）", "高桥", "映射表(模板里的平台门店名)")], plan
     assert plan["unmatched"] == [] and "兰亭" in plan["idle"]
     print(f"✅ plan_matches 直接用映射表命中: {plan['matched'][0][1]}（{plan['matched'][0][2]}）")
 
     # 映射表缺失/失效 → 回退关键词匹配
-    plan2 = SM.plan_matches(sheets, ["示例柠檬茶（长沙高桥店）"], ["高桥"], store_map={})
+    plan2 = SM.plan_matches(sheets, ["示例?柠檬茶（长沙高桥店）"], ["高桥"], store_map={})
     assert plan2["matched"] and plan2["matched"][0][1] == "高桥", plan2
     assert "映射表" not in plan2["matched"][0][2]
     print(f"✅ 无映射表时回退关键词匹配: {plan2['matched'][0][2]}")

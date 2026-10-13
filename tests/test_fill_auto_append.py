@@ -119,7 +119,7 @@ def main():
     wb0.create_sheet("Sheet3")
     mp = wb0.create_sheet("Sheet1")
     mp["B2"], mp["E2"] = "门店", "美团门店名称"      # 映射表特征
-    mp["B3"], mp["E3"] = "高桥", "示例柠檬茶（长沙高桥店）"
+    mp["B3"], mp["E3"] = "高桥", "示例?柠檬茶（长沙高桥店）"
     wb0.create_sheet("高桥"); wb0.save(p7)
     got = resolve_main(p7, None, ["高桥"])
     assert got == ("Sheet2", "Sheet1", "map"), got
