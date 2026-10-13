@@ -8,6 +8,7 @@ import re
 import time
 
 from ..events import EventSink, HumanBridge
+from .base import ShopSwitchTimer
 
 GJ_LOGIN = "https://pos.meituan.com/web/rms-account?redirect=https%3A%2F%2Fpos.meituan.com%2Fweb%23%2Flogin"
 # 报表中心「营业概览」直连路由(2026-09-28 实测可直接渲染, 绕开侧边栏菜单)
@@ -157,6 +158,12 @@ class MeituanGjAdapter:
         self.allow_name = [str(n) for n in (allow_name or []) if str(n).strip()]
         self.allow_id = [str(i).strip() for i in (allow_id or []) if str(i).strip()]
         self.skipped_by_sheet = []
+        # 切店「搜索机构编码直选」快路径: 店名→12 位机构编码(门店明细 by_name_id)。orchestrator
+        # 接线注入; 拿不到 → {} → 回退旧「按店名搜索」路径(行为不变)。
+        self.id_by_name = {}
+        self.store_ids = {}      # 门店选择页卡片读到的 {店名: 机构编码}(编号兜底来源)
+        # 切店耗时打点(速度对比抓手): 见 base.ShopSwitchTimer; 收尾汇总在 download_reports 末
+        self.switch_timer = ShopSwitchTimer("管家")
 
     def _allowed_store(self, card, name_norm):
         """门店选择页卡片是否在《门店明细》允许集合里 —— 编号优先、名称兜底。
@@ -511,11 +518,18 @@ class MeituanGjAdapter:
           return el ? (el.innerText || '').trim().split('\\n')[0] : '';
         }""") or "").strip()
 
-    def _switch_store(self, page, name, timeout_s=45):
+    def _switch_store(self, page, name, sid="", timeout_s=45):
         """右上角弹窗切店(不必退回门店选择页)。返回 True=已切到 name。
 
-        步骤: 开弹窗 → 搜索框输门店全名 → 表格里点该行(跳过标着「当前」的行) →
+        步骤: 开弹窗 → 搜索框输搜索词 → 表格里点该行(跳过标着「当前」的行) →
         等弹窗关闭且表头店名变成目标店。
+
+        2026-10-13 新增「搜索机构编码直选」快路径(任务: 用门店明细编号加速切店):
+          · 有 12 位机构编码(门店明细编号) → 先输编码(纯数字, 唯一)把列表过滤到目标行;
+          · 定位/点击仍走原「复核坐标」机制, **验证仍是表头全名**(2026-10-11 既定纪律,
+            防「长沙西服务区南区店/北区店」前缀陷阱);
+          · 拿不到编码 / 编码搜不出目标行 / 点了表头不变 → **完整回退**按店名搜索(行为同旧版);
+          · 没配编码 → 直接走按店名搜索。
 
         ⚠️ 2026-10-11 真机修复(探针 v3/v5+e2e 钉死切店失败/切错店的根因):
           ① 列表异步加载: 行进 DOM 时上面还盖着 `saas-ui-spin` 遮罩, 盲点坐标会点在
@@ -531,6 +545,60 @@ class MeituanGjAdapter:
         if not self._open_store_switch(page):
             self.sink.log("⚠️ 未找到右上角门店切换入口(.perspective-switch)", level="warn")
             return False
+        t0 = time.time()
+        if getattr(self, "switch_timer", None) is None:
+            self.switch_timer = ShopSwitchTimer("管家")   # 兜底: 老测试用 __new__ 造适配器
+        # 快路径: 有 12 位机构编码(门店明细编号) → 先按编码搜索(纯数字, 唯一)
+        code = str(sid or self._id_for(name) or "").strip()
+        if code.isdigit() and len(code) >= 6:
+            if self._search_and_pick(page, name, [code], attempts=1, row_use_name=True):
+                self.switch_timer.log_line(self.sink, name, time.time() - t0, "搜索编码")
+                return True
+            self.sink.log(f"ℹ️ 门店「{name}」按机构编码 {code} 搜索未成 → 回退按店名搜索")
+        # 旧路径(完整保留): 按店名搜索; 搜索词退化: 全名 → 地名关键字
+        from .. import sheet_match as _sm          # 注意: platforms 子包内是 `..`(曾误写 `.` → ImportError)
+        cands = [name]
+        _short = _sm.extract_place(name)
+        if _short and _short != name:
+            cands.append(_short)
+        ok = self._search_and_pick(page, name, cands, attempts=3)
+        self.switch_timer.log_line(self.sink, name, time.time() - t0,
+                                   "搜索编码回退" if code else "搜索按名")
+        return ok
+
+    def _id_for(self, name):
+        """店名 → 12 位机构编码(切店「搜索编码直选」用); 拿不到 → ''。
+
+        两级: ① 门店明细 by_name_id(orchestrator 注入 id_by_name, 权威)
+             ② 门店选择页卡片读到的 sid(store_ids, 同一账号口径的兜底)。
+        明细键与卡片名都走 _gj_norm_name 归一化后比(与 _allowed_store 同口径),
+        装饰后缀差异(如「(装修中)」)不影响命中。都没有 → '' → 回退按店名搜索。
+        宁可慢, 不猜编码(猜错=切错店)。
+        """
+        nm = _gj_norm_name(name)
+        if not nm:
+            return ""
+        try:
+            for k, v in (self.id_by_name or {}).items():
+                if _gj_norm_name(k) == nm and v:
+                    return str(v).strip()
+        except Exception:
+            pass
+        try:
+            for k, v in (self.store_ids or {}).items():
+                if _gj_norm_name(k) == nm and v:
+                    return str(v).strip()
+        except Exception:
+            pass
+        return ""
+
+    def _search_and_pick(self, page, name, cands, attempts=3, row_use_name=False):
+        """在切店弹窗里: 输搜索词 → 定位点目标行 → 表头全名验收。返回 True=已切到 name。
+
+        cands: 依次尝试的搜索词(编码快路径=[编码]; 按名路径=[全名, 地名关键字])。
+        row_use_name=True(编码路径): 行匹配/坐标复核用**店名** —— 输的是编码但行文本是店名,
+        用编码去匹配行会找不到。
+        """
         # 搜索: 必须用**真键盘输入** —— React 受控输入直接赋 value 不触发 onChange,
         # 表格不会过滤, 目标行不在首屏就找不到(2026-09-23 真机踩到)。
         typed = False
@@ -538,7 +606,7 @@ class MeituanGjAdapter:
             inp = page.locator("input[placeholder*='机构名称']").first
             inp.click(timeout=6000)
             inp.fill("")
-            inp.type(name, delay=25)
+            inp.type(cands[0], delay=25)
             typed = True
         except Exception as e:
             self.sink.log(f"⚠️ 切换弹窗搜索框输入失败(试 JS 兜底): {str(e)[:60]}", level="warn")
@@ -555,19 +623,14 @@ class MeituanGjAdapter:
               el.dispatchEvent(new Event('input', {bubbles: true}));
               el.dispatchEvent(new Event('change', {bubbles: true}));
               return true;
-            }""", name)
+            }""", cands[0])
         if not typed:
             self.sink.log("⚠️ 门店切换弹窗里没找到搜索框", level="warn")
             return False
-        # 点该行(真鼠标; 带「当前」的那行不点)。搜索词退化: 全名 → 地名关键字
-        from .. import sheet_match as _sm          # 注意: platforms 子包内是 `..`(曾误写 `.` → ImportError)
-        cands = [name]
-        _short = _sm.extract_place(name)
-        if _short and _short != name:
-            cands.append(_short)
+        # 点该行(真鼠标; 带「当前」的那行不点)。
         t_all0 = time.time()
         last_txt = ""
-        for attempt in range(3):
+        for attempt in range(max(1, attempts)):
             if attempt:
                 # 上一轮疑似已生效只是慢? 先看表头; 弹窗被点关了 → 重开(开前会自检)
                 try:
@@ -593,9 +656,10 @@ class MeituanGjAdapter:
                         inp.type(kw, delay=25)
                     except Exception:
                         pass
-                hit = self._wait_row_clickable(page, kw, wait_s=10 if attempt == 0 else 6)
+                rk = name if row_use_name else kw
+                hit = self._wait_row_clickable(page, rk, wait_s=10 if attempt == 0 else 6)
                 if hit:
-                    kw_used = kw
+                    kw_used = rk
                     break
             if not hit:
                 if attempt == 0:
@@ -1122,7 +1186,7 @@ class MeituanGjAdapter:
                     # 其余走**后台右上角「选择机构」弹窗**直接切 —— 不必退回上一页再进来
                     if entered:
                         try:
-                            ok_enter = self._switch_store(page, s["name"])
+                            ok_enter = self._switch_store(page, s["name"], s.get("sid") or "")
                         except Exception as e:
                             # 切店环节任何异常都不该弄死整个门店循环(实测: SPA 导航期间 evaluate 抛错)
                             self.sink.log(f"⚠️ 右上角切店异常({str(e)[:60]})，回退旧路径", level="warn")
@@ -1162,7 +1226,7 @@ class MeituanGjAdapter:
                         data = None
                         break
                     # retry: 已在后台就直接再切一次同店; 否则下一轮会从选择页重进
-                    if entered and self._switch_store(page, s["name"]):
+                    if entered and self._switch_store(page, s["name"], s.get("sid") or ""):
                         continue
                     entered = False
                 if aborted:
@@ -1188,6 +1252,8 @@ class MeituanGjAdapter:
         if not ran:
             raise RuntimeError("美团管家: 无任何门店抓到数据")
         self.sink.step_ok("download", "页面抓取", f"美团管家 DOM 直读 {ran} 店")
+        # 切店耗时汇总(本次运行结束) — 速度对比抓手, 幂等只打一次
+        self.switch_timer.summary(self.sink)
         return True
 
     # ---------- 敏感操作(IA/IB) ----------

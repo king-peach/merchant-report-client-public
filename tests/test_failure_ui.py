@@ -25,7 +25,7 @@ class FakeHuman:
     def __init__(self, resp):
         self.resp = resp
 
-    def wait(self, obj):
+    def wait(self, obj, timeout_s=None):
         return self.resp
 
 

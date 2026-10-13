@@ -34,7 +34,7 @@ class FakeHuman:
     def __init__(self, answers):
         self.answers, self.calls = list(answers), 0
 
-    def wait(self, obj):
+    def wait(self, obj, timeout_s=None):
         self.calls += 1
         if not self.answers:
             return None

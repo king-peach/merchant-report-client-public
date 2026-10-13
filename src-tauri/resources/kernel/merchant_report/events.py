@@ -148,20 +148,47 @@ class EventSink:
             self._echo_fp.close()
 
 
+# 人工等待的默认上限(秒): 无人应答时的兜底。调用方已有各自的"无人值守"回退语义
+# (继续/跳过/结束), 此前问题是 readline 永不返回、那些兜底永远到不了, 于是内核卡死。
+DEFAULT_WAIT_TIMEOUT_S = 900          # 15 分钟
+
+
 class HumanBridge:
-    """need_human 的响应来源。壳模式: 从 stdin 读; CLI 模式: 从 callback/终端读。"""
+    """need_human 的响应来源。壳模式: 从 stdin 读(**带超时兜底**); CLI 模式: 从 callback/终端读。"""
 
     def __init__(self, from_stdin=False, cli_callback=None):
         self.from_stdin = from_stdin
         self.cli_callback = cli_callback
 
-    def wait(self, need_human_obj):
-        """阻塞等待人工响应, 返回 dict 或 None(超时/不可用)"""
+    def wait(self, need_human_obj, timeout_s=None):
+        """等待人工响应, 返回 dict 或 None(超时/通道不可用)。
+
+        2026-10-13 修复"卡死内核"缺口(客户机残留内核事故的机制根因): 此前 from_stdin 是
+        **裸 readline 无限阻塞**(注释写"壳负责超时", 但壳层从未实现) —— 用户不点面板时,
+        内核永久卡在等待里 = 残留内核 + 后续全被"另一个任务在运行"挡住。
+        现在: 读行放 daemon 线程 + 队列超时(Windows 管道没有 select, 只能这么等);
+        超时 → 返回 None → 调用方既有的"无人值守"回退逻辑接管(要么跳继续、要么保守结束,
+        绝不是永远卡着)。内核侧默认上限 900s; 壳侧另按事件的 timeout_s 自动应答(更快)。
+        """
         if self.cli_callback:
             return self.cli_callback(need_human_obj)
         if self.from_stdin:
-            # 壳模式: 等 stdin 行（壳负责超时与用户交互）
-            line = sys.stdin.readline()
+            import queue
+            import threading
+            limit = DEFAULT_WAIT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+            q = queue.Queue()
+
+            def _reader():
+                try:
+                    q.put(sys.stdin.readline())
+                except Exception:
+                    q.put("")
+
+            threading.Thread(target=_reader, daemon=True).start()
+            try:
+                line = q.get(timeout=limit) if limit and limit > 0 else q.get(block=False)
+            except queue.Empty:
+                return None                     # 超时 → 与"通道不可用"同语义, 调用方兜底
             if not line:
                 return None
             try:

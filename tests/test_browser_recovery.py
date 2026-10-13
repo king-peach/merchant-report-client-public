@@ -162,6 +162,28 @@ def test_orphan_sweep():
     print("✅ 残留链: 升级清扫(按路径全量, 不碰用户浏览器) + 残留点名(pid+命令行) 都在位")
 
 
+def test_selfmatch_and_survivor_filter():
+    # ① 进程表/取证查询必须排除"探针自己"(否则每次探测都把自己快照进去 → 等释放永远等不满)
+    ps = T._build_proc_table_ps("C:\\Users\\x\\AppData\\Roaming\\MerchantReportClient\\browser-profile")
+    assert "-ne $PID" in ps, "进程表查询未排除自身(自伤: '仍有1个未退出'永远清不掉)"
+    assert "browser-profile" in ps and "__TBL_OK__" in ps, ps
+    assert "-ne $PID" in T._build_proc_table_ps(), "无 profile 时同样要排除自身"
+    assert "-ne $PID" in inspect.getsource(T.browser_death_forensics), "死亡取证查询也要排除自身"
+    # ② 残留点名只列真占本 profile 的行(别家 WebView/别的目录不许出现)
+    prof = "C:\\Users\\x\\AppData\\Roaming\\MerchantReportClient\\browser-profile"
+    rows = [(1, 0, r'"C:\x\chrome.exe" --user-data-dir="C:\Users\x\AppData\Roaming\MerchantReportClient\browser-profile"'),
+            (2, 0, r'"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154\msedgewebview2.exe" --embedded-browser-webview=1'),
+            (3, 0, "C:\\x\\other.exe --user-data-dir=C:\\Other\\browser-profile"),
+            (4, 0, r'"chrome.exe" --type=renderer --user-data-dir="C:\Users\x\AppData\Roaming\MerchantReportClient\browser-profile\Default"')]
+    got = T.pick_profile_rows(rows, prof)
+    assert [r[0] for r in got] == [1, 4], got
+    assert T.pick_profile_rows(rows, prof, limit=1) == [rows[0]]
+    assert T.pick_profile_rows(rows, "") == [], "空 profile → 一律不列(防御)"
+    # ③ 接线: 清理流程点名走过滤函数
+    assert "pick_profile_rows" in inspect.getsource(T._cleanup_stale_browser), "点名前必须按 profile 过滤"
+    print("✅ 自伤防护: 探测排除自身 + 残留点名只列真占 profile 的进程")
+
+
 def test_wiring_source():
     src_cl = inspect.getsource(T._cleanup_stale_browser)
     assert "_other_live_task_pids" in src_cl, "双开防护闸不许丢(CI 冒烟同查)"
@@ -186,6 +208,7 @@ def main():
     test_parse_proc_table()
     test_cleanup_note()
     test_orphan_sweep()
+    test_selfmatch_and_survivor_filter()
     test_wiring_source()
     print("\n✅ 浏览器恢复路径(Windows 竞态修复+取证+探测加固)全绿")
 

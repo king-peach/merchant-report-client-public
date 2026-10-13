@@ -31,7 +31,7 @@ class Human:
     def __init__(self, answer):
         self.answer = answer
 
-    def wait(self, obj):
+    def wait(self, obj, timeout_s=None):
         return {"choice": self.answer} if self.answer else None
 
 

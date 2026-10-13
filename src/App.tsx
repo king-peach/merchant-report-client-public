@@ -136,6 +136,13 @@ export default function App() {
   const allCurrent = useRef<string>("");      // 当前正在跑的平台(给 result 回调用)
   const [steps, setSteps] = useState<Record<string, Step>>({});
   const [banner, setBanner] = useState<Banner | null>(null);
+  // need_human 超时兜底(2026-10-13): 面板超时未点 → 自动按"超时"应答, 内核走其既有的
+  // 无人值守语义(继续/跳过/结束)。此前"壳负责超时"从未实现, 用户不点面板会让内核无限
+  // 等待(=卡死内核/残留进程)。内核侧另有 900s 默认上限做第二保险。
+  const humanTimer = useRef<number | null>(null);
+  const clearHumanTimer = () => {
+    if (humanTimer.current !== null) { window.clearTimeout(humanTimer.current); humanTimer.current = null; }
+  };
   const [logs, setLogs] = useState<string[]>([]);
   const [llmText, setLlmText] = useState("");
   const [result, setResult] = useState<any>(null);
@@ -181,7 +188,7 @@ export default function App() {
 
   useTaskEvents((e) => {
     if (e.type === "task_start") {
-      setRunning(true); setSteps({}); setLogs([]); setLlmText(""); setResult(null);
+      setRunning(true); setSteps({}); setLogs([]); setLlmText(""); setResult(null); clearHumanTimer();
     } else if (e.type === "step") {
       setSteps((s) => ({ ...s, [e.id]: e }));
     } else if (e.type === "log") {
@@ -189,10 +196,20 @@ export default function App() {
     } else if (e.type === "need_human") {
       setBanner({ message: e.message, action: e.action, choices: e.choices,
                   context: e.context, free_text: e.free_text });
+      // 超时自动应答(壳侧): 到点未点 → 发"超时"回执, 内核按无人值守语义继续, 绝不干等
+      clearHumanTimer();
+      const _ts = Number(e.timeout_s || 0);
+      if (_ts > 0) {
+        humanTimer.current = window.setTimeout(() => {
+          humanTimer.current = null;
+          setBanner(null);
+          void invoke("send_to_kernel", { payload: { type: "human_response", timeout: true } });
+        }, _ts * 1000);
+      }
     } else if (e.type === "llm_delta") {
       setLlmText((t) => t + e.text);
     } else if (e.type === "result") {
-      setResult(e); setRunning(false); setBanner(null);
+      setResult(e); setRunning(false); setBanner(null); clearHumanTimer();
       if (e.ok) {
         const item: HistoryItem = {
           date: `${scopeLabel}${dateFrom === dateTo ? "" : `(${dateFrom}~${dateTo})`}`,
@@ -230,7 +247,7 @@ export default function App() {
         }
       }
     } else if (e.type === "task_exit") {
-      setRunning(false);
+      setRunning(false); clearHumanTimer();
       if (e.stderr_tail?.length) {
         setLogs((l) => [...l, "── 内核诊断输出 ──", ...e.stderr_tail]);
       }
@@ -326,8 +343,8 @@ export default function App() {
     await launch(order[0], false);
   }
 
-  async function respond(payload: any) { setBanner(null); await invoke("send_to_kernel", { payload }); }
-  async function abort() { setBanner(null); setRunning(false); await invoke("abort_task", {}); }
+  async function respond(payload: any) { clearHumanTimer(); setBanner(null); await invoke("send_to_kernel", { payload }); }
+  async function abort() { clearHumanTimer(); setBanner(null); setRunning(false); await invoke("abort_task", {}); }
 
   const stepIcon = (s?: StepState) =>
     s === "ok" ? "✅" : s === "running" ? "⏳" : s === "failed" ? "❌" : s === "skipped" ? "⏭️" : "⬜";

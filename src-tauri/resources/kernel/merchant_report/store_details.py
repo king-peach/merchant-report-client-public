@@ -6,8 +6,10 @@
     京东组允许留空 —— 用户注明"无法用编号导航+当前数据不需要单个"); 第 2 行 = 组内列头
     「门店名称」「门店唯一编号」; 另有「运营报表模板Sheet名」列(表头在 1 或 2 行, 值在数据行)。
   · 数据行从第 3 行起。
-产出: {platform: {"by_id": {编号: sheet}, "by_name": {规范化名: sheet}}}
+产出: {platform: {"by_id": {编号: sheet}, "by_name": {规范化名: sheet},
+                  "by_name_id": {规范化名: 编号}}}
   platform ∈ taobao / meituan / meituan_gj / jd —— 与 PLATFORM_COL_HINTS 同一套键。
+  by_name_id 供「切店按编号搜索直选」快路径用(orchestrator._switch_id_map → 适配器)。
 匹配纪律: 编号优先、名称兜底、对不上不猜(调用方留空+告警)。
 
 另: `platforms_in(path)` 只回答"表里**有门店数据**的平台有哪些"(字典的键),
@@ -82,7 +84,7 @@ def load_store_details(path):
             p = _platform_of(col_group[i])
             if not p:
                 continue
-            d = out.setdefault(p, {"by_id": {}, "by_name": {}})
+            d = out.setdefault(p, {"by_id": {}, "by_name": {}, "by_name_id": {}})
             id_col = next((j for j in id_cols if col_group.get(j) == col_group[i]), None)
             for r in rows[2:]:
                 nm = get(r, i)
@@ -94,6 +96,10 @@ def load_store_details(path):
                     vid = get(r, id_col).split(".")[0]   # 防 Excel 转 float 丢精度样式 "33333333.0"
                     if vid:
                         d["by_id"].setdefault(vid, sheet)
+                        # 2026-10-13: 名称→编号(切店「搜索编号直选」快路径要用)。
+                        # 与 by_name/ 同一条数据行, 只是多留一份**行内**关联 —— 不经 Sheet 中转,
+                        # 避免"同 Sheet 多编号"时张冠李戴。
+                        d["by_name_id"].setdefault(_tidy(nm), vid)
         return out
     finally:
         try:

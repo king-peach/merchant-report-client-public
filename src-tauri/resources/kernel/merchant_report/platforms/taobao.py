@@ -11,13 +11,38 @@ import subprocess   # 必留: _cleanup_stale_browser 用(曾漏 → 整段清理
 import time
 from pathlib import Path
 
+from .. import sheet_match
 from ..events import EventSink
 from ..fill import canonical_report_name, platform_range_in_name, report_kind
+from .base import ShopSwitchTimer
 
 DOWNLOAD_CENTER = "https://melody.shop.ele.me/app/shop/{shop_id}/downloadCenter#app.shop.downloadCenter"
 STATS_HOME = "https://melody.shop.ele.me/"
 # 增值服务页(充值/消费记录): 单店 URL, shop_id 由 switch_shop 拿到
 VAS_URL = "https://melody.shop.ele.me/app/shop/{shop_id}/vas#app.shop.vas"
+
+# 切店弹层「搜索结果行」读取: 门店叶子行(lv==2) 或 class 含 itemShopName 的行。
+# 2026-10-13 新增「搜索ID直选」快路径用 —— 输编号后按此判定过滤结果里是否锁定到唯一目标店。
+_SHOP_SEARCH_ROWS_JS = r"""() => {
+  const root = document.querySelector('#shopSwitcher');
+  if (!root) return [];
+  const out = [], seen = new Set();
+  const push = (el, lv, st) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
+    const p = el.getAttribute('data-aspm-param') || '';
+    const key = Math.round(r.x) + ',' + Math.round(r.y);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({txt: (el.innerText || '').trim(), lv: lv, st: st, cls: el.className || ''});
+  };
+  for (const el of root.querySelectorAll('[data-aspm-param*="status="]')) {
+    const p = el.getAttribute('data-aspm-param') || '';
+    push(el, (p.match(/level_name=([0-9]+)/) || [])[1] || '', (p.match(/status=([^&^]+)/) || [])[1] || '');
+  }
+  for (const el of root.querySelectorAll('[class*="itemShopName"]')) push(el, '2', '');
+  return out;
+}"""
 
 
 def parse_vas_ledger(rows, date):
@@ -111,11 +136,17 @@ def _build_proc_table_ps(profile=""):
     2026-10-12 客户机实证: **全量** Win32_Process 的 ConvertTo-Json 在中文 Windows 上失败
     (编码/超时/体量) → 日志出现"仍有 -1 个"、等释放断腿。改成:
     只取浏览器家族(chrome/msedge/chromium) + 命令行含 profile 的进程 + 强制 UTF-8 输出;
-    开头打一个哨兵行, 便于区分"没有匹配"与"查询静默失败"。"""
-    flt = "$_.Name -match 'chrome|msedge|chromium'"
+    开头打一个哨兵行, 便于区分"没有匹配"与"查询静默失败"。
+    2026-10-13 客户机实证的**自伤 bug**: 查询串本身带 profile 路径, 而 PowerShell 进程的
+    命令行**就包含这条查询** —— 不排除自身时每次探测都把自己快照进表:
+      · _profile_process_pids 永远看到 1 个"未退出" → 等释放每轮白等满超时(12+8s);
+      · 日志每轮出现"仍有 1 个未退出, 已尽量等待"+"未能清掉"告警(实为探针自身幽灵)。
+    修复: 服务端 `-ne $PID` 排除自身(与其他几处探测的 guard 保持一致)。"""
+    flt = "$_.ProcessId -ne $PID -and ($_.Name -match 'chrome|msedge|chromium'"
     if profile:
         esc = str(profile).replace("'", "''")
         flt += f" -or $_.CommandLine -like '*{esc}*'"
+    flt += ")"
     return ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
             "$tbl = @(Get-CimInstance Win32_Process | "
             f"Where-Object {{ {flt} }} | "
@@ -262,6 +293,23 @@ def _survivor_lines(rows, limit=3):
     return out
 
 
+def pick_profile_rows(rows, profile, limit=None):
+    """从进程表挑出**命令行真含该 profile** 的行(纯函数)。
+
+    2026-10-13 客户机日志实证: 进程表按口径含全机浏览器家族(同名 chrome/msedge/chromium 进程
+    都在表里), 直接取前几行点名会把别的程序的 WebView(msedgewebview2) 误列成"仍占用浏览器
+    配置目录" —— 客户看不懂, 还以为是残留清不掉。点名必须只列真占本 profile 的进程。"""
+    prof = str(profile).lower()
+    out = []
+    for r in (rows or []):
+        try:
+            if prof and prof in str(r[2]).lower():
+                out.append(r)
+        except Exception:
+            continue
+    return out[:limit] if limit else out
+
+
 def _cleanup_stale_browser(profile_dir, sink=None):
     """结束仍占用本 profile 的**残留**浏览器(上一轮任务未完全退出)。
     否则新启动的浏览器会把参数转发给旧实例, Playwright 拿不到控制权。
@@ -348,9 +396,11 @@ def _cleanup_stale_browser(profile_dir, sink=None):
                 if note:
                     sink.log(note[0], level=note[1])
                 if os.name == "nt" and not released and isinstance(remaining, int) and remaining > 0:
-                    # 仍杀不掉 → 逐个点名(pid+命令行): 客户/我们一眼看出是谁赖着不走
+                    # 仍杀不掉 → 逐个点名(pid+命令行)。必须按"命令行真含本 profile"过滤后再列:
+                    # 进程表是全机浏览器家族, 不过滤会把别的程序的 WebView(msedgewebview2) 误列
+                    # 成"仍占用"(2026-10-13 客户机日志实证)。
                     try:
-                        rows = _win_process_table(prof) or []
+                        rows = pick_profile_rows(_win_process_table(prof) or [], prof)
                     except Exception:
                         rows = []
                     for ln in _survivor_lines(rows):
@@ -460,7 +510,8 @@ def browser_death_forensics(profile_dir, out_dir, err_text=""):
             esc = str(profile_dir).replace("'", "''")
             ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
                   "Get-CimInstance Win32_Process | "
-                  f"Where-Object {{ $_.Name -match 'chrome|msedge|chromium' -or $_.CommandLine -like '*{esc}*' }} | "
+                  f"Where-Object {{ $_.ProcessId -ne $PID -and "
+                  f"($_.Name -match 'chrome|msedge|chromium' -or $_.CommandLine -like '*{esc}*') }} | "
                   "Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine | ConvertTo-Json -Compress")
             raw = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                                  capture_output=True, timeout=60).stdout
@@ -581,6 +632,11 @@ class TaobaoAdapter:
         self.store_id = store_id or ""
         self.keyword = keyword or ""
         self.shop_id = ""     # 登录后从主页 DOM 提取(链接 /app/shop/<id>/)
+        # 「门店明细」的 店名→门店唯一编号(= shop_id) 映射 —— 有它才能走「搜索ID直选」快路径。
+        # 由 orchestrator 接线注入(orchestrator.set_store_id_map); 拿不到 → 空 → 维持旧"展开+按名"。
+        self.id_by_name = {}
+        # 切店耗时打点(速度对比抓手): 见 base.ShopSwitchTimer; 收尾汇总在简报处打
+        self.switch_timer = ShopSwitchTimer()
         # AI 自愈补丁覆盖项(selfheal.apply_patch_hint 写入)
         self.nav_override = None
         self.wait_override_ms = None
@@ -1526,12 +1582,15 @@ class TaobaoAdapter:
         except Exception:
             return False
 
-    def _open_switcher(self, page):
-        """打开右上角门店下拉并展开所有「运营组织」节点。
+    def _open_switcher(self, page, expand=True):
+        """打开右上角门店下拉; expand=True 时再展开所有「运营组织」节点(旧流程需要)。
 
         坑(2026-10-01 真机): 直接 force 点外层 #shopSwitcher 有时不触发(它在 tabindex=-1 的
         外层上, 真正吃点击的是里面的 [class*=clk-area]); 点空还可能是"点了一下又关掉"。
         → 先看点没点开(门店行是否可见), 没开就换内层 clk-area 点, 最多 4 轮。
+
+        2026-10-13: 新增 expand 开关 —— 「搜索ID直选」快路径只需弹出弹层, **不要**展开全部
+        组织节点(展开正是最大耗时点); 探测不到搜索框时会回退, 回退的老流程再展开。
         """
         for _ in range(5):
             if self._switcher_open(page):
@@ -1554,6 +1613,8 @@ class TaobaoAdapter:
                 except Exception:
                     continue
             time.sleep(1.0)
+        if not expand:
+            return
         for _ in range(5):      # 展开全部「运营组织」节点
             ex = page.locator(f"{self.SHOP_SWITCHER} .cook-cascader-menu-item-expand")
             n = ex.count()
@@ -1589,8 +1650,220 @@ class TaobaoAdapter:
         return [{"name": r["name"], "status": r["status"], "open": r["status"] == "营业中"} for r in rows]
 
     def switch_shop(self, name, page=None):
-        """切到指定门店; 返回 shop_id(URL 里的) 或 ''。"""
+        """切到指定门店; 返回 shop_id(URL 里的) 或 ''。
+
+        2026-10-13 新增「搜索ID直选」快路径(任务: 用门店明细编号加速切店):
+          · 门店明细给了该店的「门店唯一编号」(= shop_id) → 打开弹层后, 优先在**弹层里的搜索框**
+            输编号把列表过滤到唯一一行 → 点击 → 用 URL `/app/shop/<id>/` 严格验收(必须 == 目标 id);
+          · 搜索框探测不到 / 输不进 / 过滤后没有目标行 / 点了但验收不过 → **完整回退**下面的
+            "展开全部运营组织 + 按店名找"老流程(行为与旧版一致, 不会更差);
+          · 没配编号 → 直接走老流程。
+        任何一步失败都记 info 日志(不刷 warn), 失败到也只能是老流程的失败, 不选错店。
+        """
         page = page or self.page
+        if getattr(self, "switch_timer", None) is None:
+            self.switch_timer = ShopSwitchTimer()   # 兜底: 老测试用 __new__ 造适配器
+        t0 = time.time()
+        tid = self._id_for(name)
+        if tid:
+            sid = self._switch_by_id(page, name, tid)
+            if sid:
+                self.switch_timer.log_line(self.sink, name, time.time() - t0, "搜索ID")
+                return sid
+            # 快路径没成 → 完整回退(下面就是老流程); 为什么失败已在 _switch_by_id 内记过 info
+            self.sink.log(f"ℹ️ 门店「{name}」走搜索ID未成 → 回退展开+按名路径")
+        sid = self._switch_by_name(page, name)
+        self.switch_timer.log_line(self.sink, name, time.time() - t0,
+                                   "搜索ID回退" if tid else "展开按名")
+        return sid
+
+    def _id_for(self, name):
+        """店名 → 门店明细里的「门店唯一编号」(= shop_id); 拿不到 → ''(不进搜索快路径)。
+
+        数据来源: orchestrator 接线注入的 id_by_name(`门店明细` 权威, 键=已 _tidy 规范化的店名)。
+        键可能带装饰符/全角 → 同时按多种归一化试(与 store_details._tidy 同口径)。
+        宁可回退按名也不猜。
+        """
+        nm = str(name or "").strip()
+        if not nm:
+            return ""
+        try:
+            d = self.id_by_name or {}
+            rid = d.get(nm) or d.get(sheet_match._tidy(nm))
+            if not rid:
+                for k, v in d.items():
+                    if sheet_match._tidy(k) == sheet_match._tidy(nm):
+                        rid = v
+                        break
+            return str(rid or "").strip()
+        except Exception:
+            return ""
+
+    # ---- 快路径: 搜索 shop_id 直选 ----
+    def _switcher_search_input(self, page):
+        """探测弹层里的搜索输入框; 返回 locator 或 None(探测不到 → 回退, 不硬猜选择器)。
+
+        cook-cascader 的搜索框位置/class 随版本变 → 用"可见 + placeholder 像搜索"判定,
+        先看弹层内, 再退到全页可见框(弹层 class 名也变过)。
+        """
+        cands = [
+            f"{self.SHOP_SWITCHER} input[placeholder*='搜索']",
+            f"{self.SHOP_SWITCHER} input[placeholder*='门店']",
+            f"{self.SHOP_SWITCHER} [class*=search] input",
+            "#shopSwitcher input",
+            "input[placeholder*='搜索门店']",
+            "input[placeholder*='搜索门店名']",
+        ]
+        for sel in cands:
+            try:
+                loc = page.locator(sel)
+                n = loc.count()
+                for i in range(min(n, 4)):
+                    el = loc.nth(i)
+                    if el.is_visible():
+                        return el
+            except Exception:
+                continue
+        return None
+
+    def _search_rows(self, page):
+        """读当前弹层里可见的门店叶子行(门店明细口径: lv==2 或 class 含 itemShopName)。"""
+        try:
+            rows = page.evaluate(_SHOP_SEARCH_ROWS_JS) or []
+        except Exception:
+            return []
+        out = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            if r.get("lv") == "2" or "itemShopName" in str(r.get("cls") or ""):
+                out.append(r)
+        return out
+
+    def _click_search_row(self, page, name):
+        """点搜索结果里的目标行; 返回点击时的行文本(供记日志) 或 ''。
+
+        定位优先级: ① 行文本含店名(最稳) ② 过滤后**唯一一行**且店名/编号可证一致才点。
+        行被 tooltipMask 遮罩拦指针 → force(与老流程同)。
+        """
+        rows = self._search_rows(page)
+        if not rows:
+            return ""
+        hit = None
+        for r in rows:
+            if name in (r.get("txt") or ""):
+                hit = r
+                break
+        if hit is None and len(rows) == 1:
+            hit = rows[0]        # 唯一一行: 由调用方再用 URL 严格验收兜底
+        if hit is None:
+            return ""
+        txt = hit.get("txt") or ""
+        # 用行文本定位 locator 点击(force: tooltipMask)
+        try:
+            loc = page.locator(f"{self.SHOP_SWITCHER} >> text={txt}") if txt else None
+            if loc is not None and loc.count():
+                loc.first.click(timeout=6000, force=True)
+                return txt
+        except Exception:
+            pass
+        return ""
+
+    def _switch_by_id(self, page, name, tid):
+        """搜索 shop_id 直选。返回验收通过的 shop_id 或 ''(失败 → 由调用方回退按名)。
+
+        注意: 本函数**只探测搜索框本身**, 不再展开运营组织 —— 探测不到搜索框就立刻回退
+        (回退的老流程 _switch_by_name 会自己走 _open_switcher 的"展开"逻辑, 不会漏)。
+        """
+        try:
+            self._open_switcher(page, expand=False)   # 快路径不展开组织节点(省掉最大耗时)
+            inp = self._switcher_search_input(page)
+            if inp is None:
+                self.sink.log(f"ℹ️ 淘宝弹层里没探测到搜索框(shop {tid}) → 回退")
+                self._close_switcher(page)
+                return ""
+            # 真键盘输入(React 受控输入直接赋 value 不触发 onChange → 列表不过滤)
+            try:
+                inp.click(timeout=5000)
+                inp.fill("")
+                inp.type(str(tid), delay=25)
+            except Exception as e:
+                self.sink.log(f"ℹ️ 淘宝搜索框输入编号失败({str(e)[:50]}) → 回退")
+                self._close_switcher(page)
+                return ""
+            # 等过滤结果(编号唯一 → 应剩一行); 不给固定 sleep, 轮询读
+            rows = []
+            for _ in range(8):
+                rows = self._search_rows(page)
+                if rows:
+                    break
+                time.sleep(0.4)
+            if not rows:
+                self.sink.log(f"ℹ️ 搜编号 {tid} 没有过滤出任何门店行 → 回退")
+                self._close_switcher(page)
+                return ""
+            txt = self._click_search_row(page, name)
+            if not txt:
+                self.sink.log(f"ℹ️ 搜编号 {tid} 过滤出 {len(rows)} 行但没定位到「{name}」→ 回退")
+                self._close_switcher(page)
+                return ""
+            # 验收(不放松): URL /app/shop/<id>/ 必须 == 目标编号; 右上角店名尽量同时匹配
+            ok, sid = self._verify_shop(page, name, tid)
+            if not ok:
+                self.sink.log(f"ℹ️ 点了「{txt[:24]}」但验收不过(URL/店名未变成目标) → 回退")
+                self._close_switcher(page)
+                return ""
+            return sid
+        except Exception as e:
+            self.sink.log(f"ℹ️ 搜索ID直选异常({str(e)[:60]}) → 回退按名")
+            try:
+                self._close_switcher(page)
+            except Exception:
+                pass
+            return ""
+
+    def _verify_shop(self, page, name, tid="", timeout_s=12.0, poll=0.4):
+        """切店验收 → (ok, sid)。编号优先: URL `/app/shop/<id>/` == tid 即通过(强验证);
+        无 tid 或 URL 还没跟上 (`/app/shop/X/dashboard` 与导航都只认这个) → 用右上角店名兜底。
+
+        12s 上限(而非几秒): 切店是 SPA 导航 + 取数, URL 换 id 实测有 5~7s 的迟滞 —— 上限太短
+        会把"其实切成功了"判成失败而白白回退(回退只会更慢)。超时不算成功, 仍返回 False。
+        返回 sid = URL 里的 shop_id(拿不到则 '')。
+        """
+        end = time.time() + timeout_s
+        sid, cur = "", ""
+        while True:
+            try:
+                m = re.search(r"/app/shop/(\d+)/", page.url or "")
+                sid = m.group(1) if m else ""
+            except Exception:
+                sid = ""
+            try:
+                cur = self._shop_name(page) or ""
+            except Exception:
+                cur = ""
+            if tid:
+                if sid == tid:
+                    return True, sid
+            else:
+                if cur and name in cur:
+                    return True, sid
+            if time.time() >= end:
+                break
+            time.sleep(poll)
+        return False, sid
+
+    def _close_switcher(self, page):
+        """收起弹层(回退前先把搜索态擦掉, 免得老流程读到被过滤后的列表)。"""
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.4)
+        except Exception:
+            pass
+
+    # ---- 旧流程(完整保留): 展开全部运营组织 → 按店名找 → 点击 → 右上角店名验收 ----
+    def _switch_by_name(self, page, name):
+        """老流程(2026-10-01/10-13 行为不变): 返回 shop_id 或 ''。"""
         tgt = None
         for _ in range(3):
             self._open_switcher(page)
@@ -1839,6 +2112,8 @@ class TaobaoAdapter:
                              "bench_ok": bool(top10), "ftype_ok": ftype_ok, "shop_id": sid}
             except Exception as e:
                 self.sink.log(f"⚠️ 门店「{name}」抓取失败: {str(e)[:80]}", level="warn")
+        # 切店耗时汇总(本次运行结束) — 速度对比抓手, 幂等只打一次
+        self.switch_timer.summary(self.sink)
         return out
 
     def _capture_states_checked(self, f):

@@ -104,6 +104,26 @@ def _strict_on(store, platform):
     return _strict_maps(store, platform)[0] is not None
 
 
+def _switch_id_map(store, platform):
+    """门店明细 → {规范化店名: 门店唯一编号} —— 切店「按编号搜索直选」快路径用。
+
+    2026-10-13: 淘宝/管家切店弹层可**直接搜编号**(shop_id / 12 位机构编码)把列表过滤到
+    唯一一行, 省掉"展开全部运营组织逐个找"的最大耗时点。适配器要的是「店名→编号」,
+    门店明细存的是「编号→Sheet」+「名称→Sheet」两张表, 不能按 Sheet 反查(见 store_details
+    里 by_name_id 的注释: 同 Sheet 多编号会张冠李戴)。故这里直接用明细的 by_name_id。
+    未配置/读失败/该平台无数据 → {}(适配器回退旧"按名"路径, 行为不变)。
+    """
+    p = str(store.get("store_details") or "").strip()
+    if not p or not platform:
+        return {}
+    try:
+        from . import store_details as _sd
+        d = (_sd.load_store_details(p) or {}).get(platform) or {}
+    except Exception:
+        return {}
+    return {k: str(v).strip() for k, v in (d.get("by_name_id") or {}).items() if str(v).strip()}
+
+
 def _store_ids_from_rows(rows_by_date, dates, name_key="门店名称", id_key="门店编号"):
     """逐店报表行 → {后台门店名: 门店编号} —— 门店明细的**编号锁定**要靠它。
 
@@ -295,7 +315,7 @@ def _other_task_gate(sink, human):
     try:
         sink.need_human("confirm", msg,
                         choices=["结束本次（只留一个窗口后重跑）", "仍然继续试试"], timeout_s=120)
-        resp = human.wait({"type": "need_human", "action": "confirm"}) or {}
+        resp = human.wait({"type": "need_human", "action": "confirm"}, timeout_s=120) or {}
         choice = str(resp.get("choice") or "").strip()
     except Exception:
         choice = ""
@@ -337,7 +357,7 @@ def _template_date_gate(sink, human, template, date, cfg):
     msg = (f"模板里没有 {date}。继续跑流程 = 填表时会自动新建这个日期的行并填写；"
            f"结束流程 = 本次不打开浏览器、不下载，直接停下。")
     sink.need_human("confirm", msg, choices=["继续跑流程", "结束流程"], timeout_s=600)
-    resp = human.wait({"type": "need_human", "action": "confirm"}) or {}
+    resp = human.wait({"type": "need_human", "action": "confirm"}, timeout_s=600) or {}
     choice = str(resp.get("choice") or "").strip()
     if not choice:
         # 无人值守兜底: 没有交互通道(CLI/超时) → 保持自动化旧行为(继续), 只 warn
@@ -666,6 +686,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
 
             def build_adapter(actx):
                 """建适配器并完成登录。返回 (adapter, ok)。首次启动与重开浏览器都走这里。"""
+                # 切店「搜索编号直选」快路径的接线(2026-10-13): 店名→门店唯一编号, 注入适配器。
+                # 拿不到就是 {} → 适配器回退旧"按名"路径(行为不变)。
+                _sid_map = _switch_id_map(store, platform)
                 if platform in ("meituan", "jd", "meituan_gj"):
                     extra = {}
                     if platform == "meituan_gj":
@@ -701,12 +724,18 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                          "meituan_gj": MeituanGjAdapter}[platform](
                         actx, sink, human, store_id=store.get("id", ""), keyword=store.get("keyword", ""),
                         **extra)
+                    if platform == "meituan_gj" and _sid_map:
+                        a.id_by_name = _sid_map      # 切店按机构编码搜索直选用
+                        sink.log(f"🔢 切店编号映射已接线(管家): {len(_sid_map)} 家门店可用编码搜索直选")
                     cred = store.get("credentials") or {}
                     ok = a.ensure_login(username=cred.get("username", ""),
                                         password=cred.get("password", ""))
                     return a, ok
                 a = TaobaoAdapter(actx, sink, human, store_id=store.get("id", ""),
                                   keyword=store.get("keyword", ""))
+                if _sid_map:
+                    a.id_by_name = _sid_map          # 切店按 shop_id 搜索直选用
+                    sink.log(f"🔢 切店编号映射已接线(淘宝): {len(_sid_map)} 家门店可用编号搜索直选")
                 if not a._logged_in():
                     plat_cfg = (cfg.get("platforms") or {}).get("taobao") or {}
                     u = plat_cfg.get("username") or ""

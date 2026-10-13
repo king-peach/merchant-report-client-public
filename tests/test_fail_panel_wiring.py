@@ -124,7 +124,7 @@ class FakeHuman:
     def __init__(self, answers):
         self.answers, self.objs = list(answers), []
 
-    def wait(self, obj):
+    def wait(self, obj, timeout_s=None):
         self.objs.append(obj)
         a = self.answers.pop(0) if self.answers else None
         return {"choice": a} if a else None

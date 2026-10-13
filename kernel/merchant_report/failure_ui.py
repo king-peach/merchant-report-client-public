@@ -81,7 +81,8 @@ def ask_failure(sink, human, *, platform="", store="", date="", step="",
         parts.append(f"步骤：{step}")
     sink.need_human("confirm", " ｜ ".join(parts), platform=platform or None,
                     choices=choices, context=ctx, timeout_s=DEFAULT_TIMEOUT_S)
-    resp = human.wait({"type": "need_human", "action": "confirm"}) or {}
+    resp = human.wait({"type": "need_human", "action": "confirm"},
+                      timeout_s=DEFAULT_TIMEOUT_S) or {}
     choice = str(resp.get("choice") or "").strip()
 
     if not choice:
