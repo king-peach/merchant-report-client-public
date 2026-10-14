@@ -557,14 +557,22 @@ class MeituanAdapter:
             hint += "｜判定: 报表页缺少门店上下文(wmPoid); 已自动补 wmPoiId=-1(全部门店)仍失败 → 需人工在页面选一次门店"
         raise RuntimeError(f"美团报表页未就绪(可能登录态失效){hint}: {page.url[:80]}")
 
-    # ---- 日期区间(实测 DOM: 2 个可见 input.roo-input, 值形如 2026-09-17; 点开始框→点格→点结束框→点格) ----
-    # 2026-10-14 真机(diag_download_20261014-115841): 要设 09-05, 实际设成 **10-05**。根因 = 双面板
-    # 日历里"日数字"必然重复(邻月尾巴格渲染同一个数字; 九月面板最后一行第 1 列的 10/5 就是最左的 "5"),
-    # 旧实现「收集全部可见格 → 按 x 取最左」于是点中尾巴格 → 写成邻月日期(读回 gate 拦下并中止, 没出错下载)。
-    # 现在: ① 面板感知(表头↔body 配对) ② 目标月可见就**绝不翻月**, 候选限定在该面板 bbox 内
-    # ③ 每个候选**点后读回对应输入框**(开始=第1个/结束=第2个), 不对就换下一个候选
-    # ④ 翻月按全部可见面板的 min/max 判方向 + 点后读回面板月份验证, 不行就换同向另一个 chevron。
-    # 末端的读回 gate 原样保留(最后裁判), 绝不静默降级。
+    # ---- 日期区间(实测 DOM: 2 个可见 input.roo-input, 值形如 2026-09-17) ----
+    # ⚠️ 交互模型(2026-10-14 定性; 流量页 2026-10-08 早已证实, 下载页两次事故再次印证):
+    #   **第 1 击只置"待定起点"(输入框不变); 第 2 击才完成区间、写两个输入框** ——
+    #   区间由"**同一对格子**"的两击完成(原话: "点 1 次后仍 10-07, 点 2 次后变 10-06 且两个输入框都填上")。
+    #   所以"点一下就读回、不对就换候选"这种**每击验证必然误判**: 第 1 击读回不变是**正常**的。
+    # 两次真机事故:
+    #   ① 2026-10-14 diag_download_20261014-115841: 要 09-05 却设成 **10-05** —— 双面板日历里
+    #      "日数字"必然重复(邻月尾巴格渲染同一个数字, 九月面板最后一行第 1 列的 10/5 就是最左的 "5"),
+    #      旧实现「收集全部可见格 → 按 x 取最左」于是点中尾巴格。→ 候选改为**月感知**
+    #      (面板感知 + bbox 限定 + 尾巴降权 + 属性精确优先)。
+    #   ② 2026-10-14 diag_download_20261014-150407: 要 09-08 却设成 **10-08** —— 每击验证的连锁:
+    #      第 1 击(正确格)读回没变 → 误判失败 → 换到**尾巴格** → 这一击凑出跨月区间 [09-08,10-08]
+    #      → 输入框一变化就"通过"了**单框**验证 → 此后在脏区间里反复重凑同一个错对, 45s 耗尽。
+    # 现在的纪律(成对协议): 一次区间必须由**同一对格子**的两击完成 —— 任何一击之后都不许换格;
+    #   序列内**零验证零换格**; 整条序列做完才核对**整对**(read == [df, dt]); 失败则 Esc 清场重来
+    #   (绝不在脏状态里连续试探), 末端读回 gate 原样保留(最后裁判), 绝不静默降级。
     _DATES_JS = """() => {
       const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
       const isd = e => vis(e) && /^\\d{4}-\\d{1,2}-\\d{1,2}$/.test((e.value || '').trim());
@@ -664,37 +672,219 @@ class MeituanAdapter:
         return "%04d-%02d-%02d" % (int(mm.group(1)), int(mm.group(2)), int(mm.group(3))) if mm else ""
 
     def _confirmed(self, page, target, which="start"):
-        """读回**对应那个输入框**(开始=第 1 个 / 结束=第 2 个)是否已是目标日 —— 只有读回一致才算点中。"""
+        """单框读回(仅供契约/诊断用) —— ⚠️ **成对协议里不许用它当裁判**: 第 1 击后输入框本来就不变。
+
+        裁判一律用整对 `_read_dates(page)[:2] == [df, dt]`(见 `_pair_flow` / `_set_date_range`)。
+        """
         got = self._read_dates(page)
         if len(got) < 2:
             return False
         return self._norm_day(got[1] if which == "end" else got[0]) == target
 
+    # 墙钟上限: 整段日期设置(3 大轮 × 3 候选 × 4 步)不许超过它 —— 宁可快速失败, 绝不无限试探。
+    _DATE_WALL_S = 45
+
     def _set_date_range(self, page, df, dt):
-        """设日期区间; 网格点选失败→键盘输入; 都不生效则中止(绝不带错误区间下载)"""
+        """设日期区间(**成对协议**: 同一对格子两击完成 -> 整对读回 -> 失败 Esc 清场重来)。
+
+        网格点选始终不成功 → 键盘兜底 → 末端读回 gate 复核; 仍 != 期望 → 抛错(绝不带错误区间下载)。
+        """
         ins = self._date_inputs(page)
         if len(ins) < 2:
             raise RuntimeError(f"美团报表页未找到日期区间控件(input数={len(ins)})")
-        ok = False
-        try:
-            page.mouse.click(ins[0]["x"], ins[0]["y"])
-            time.sleep(1.5)
-            ok = self._click_day(page, df, "start")
-            if ok:
-                ins = self._date_inputs(page) or ins
-                page.mouse.click(ins[-1]["x"], ins[-1]["y"])
-                time.sleep(1.0)
-                ok = self._click_day(page, dt, "end")
-        except Exception as e:
-            self.sink.log(f"⚠️ 日历点选异常: {str(e)[:70]}", level="warn")
-            ok = False
+        want = [df, dt]
+        ok = self._read_dates(page)[:2] == want
+        deadline = time.time() + self._DATE_WALL_S
+        for rnd in range(1, 4):                                     # 大轮 <=3
+            if ok or time.time() > deadline:
+                break
+            # 面板不可见(新页/上一轮已 Esc 清场) → 点开始框打开。面板**开着**时**不**点输入框:
+            # 再点会把面板关掉(流量页真机实测过这个坑) —— 而"脏态/残留待定"由失败后的
+            # Esc 清场 + _pair_flow 换候选前的清场负责, 不在这里多插一击。
+            if not self._cal_state(page)[0]:
+                self._open_picker(page)
+            if time.time() > deadline:
+                break
+            ok = self._pair_flow(page, df, dt, limit_s=max(0.05, deadline - time.time()))
+            if ok and self._read_dates(page)[:2] == want:           # 整对复核
+                break
+            ok = False                                              # 状态乱/成对失败 → 不许留脏状态往下走
+            self._dismiss_picker(page)
+            time.sleep(0.6)
+            try:
+                self.sink.log(f"🧹 日期: 清场重来 (第{rnd}轮)", level="warn")
+            except Exception:
+                pass
         if not ok:
             self.sink.log("⚠️ 日历网格点选未成功, 改键盘输入日期", level="warn")
             self._type_date(page, df, dt)
         got = self._read_dates(page)
-        if got[:2] != [df, dt]:
+        if got[:2] != want:
             raise RuntimeError(f"日期区间设置未生效: 期望 {df}~{dt}, 实际 {got[:2]} (已中止, 不用错误区间下载)")
         self.sink.log(f"📅 日期区间 = {got[0]} ~ {got[1]}")
+
+    def _open_picker(self, page):
+        """点开始输入框打开日历(面板已开着时**不要**点: 再点会把面板关掉, 流量页真机实测过这个坑)。"""
+        ins = self._date_inputs(page)
+        if len(ins) < 2:
+            return False
+        try:
+            page.mouse.click(ins[0]["x"], ins[0]["y"])
+        except Exception:
+            return False
+        time.sleep(1.2)
+        return True
+
+    def _dismiss_picker(self, page):
+        """Esc 清场: 关掉选择器并**丢掉待定区间**(输入框里已有的值保留)。"""
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    def _click_at(self, page, x, y, what=""):
+        """点一个坐标(可选耗时打点) —— 成对序列里的每一击都走这里, 便于真机按耗时定位卡在哪一击。"""
+        t0 = time.time()
+        try:
+            page.mouse.click(x, y)
+        except Exception as e:
+            self.sink.log(f"⚠️ 日期点击异常({what}): {str(e)[:60]}", level="warn")
+            return False
+        dt_ms = int((time.time() - t0) * 1000)
+        if dt_ms > 1500:
+            self.sink.log(f"⏱ 日期点击较慢({what}): {dt_ms}ms", level="warn")
+        return True
+
+    def _pair_desc(self, cell, y, m):
+        """候选格的人话描述(真机日志定位用): 「2026-09面8」/「2026-09面8(尾)」(尾=邻月尾巴格)。"""
+        panel = cell.get("_panel") or (y, m)
+        return f"{panel[0]}-{panel[1]:02d}面{cell.get('d')}" + ("(尾)" if cell.get("other") else "")
+
+    def _log_attempt(self, n, desc, pair):
+        """一行一次成对尝试(**成败都记**, 含整对读回值) —— 下次远程只看这一行就能定位。"""
+        try:
+            self.sink.log(f"🖱 日期尝试{n}: {desc} → 读回 {list(pair)}")
+        except Exception:
+            pass
+
+    def _pick_day_cell(self, page, y, m, d, cands, idx):
+        """第 2 击前的**重新解析**(坐标不缓存、不复用旧值) —— 必须落回第 1 击那**同一个格**。
+
+        锚点 = 第一击候选的(面板月 + 日 + 尾巴标记); 在击发那一刻的新快照里按锚点找同格
+        (面板重渲染后尾巴偏移/行序变化也能找到); 新快照解析不出 → 同下标 → 最后退回锚点本身,
+        **绝不换到别的格**。Returns: (x, y, desc) 或 None。
+        """
+        if not cands or idx >= len(cands):
+            return None
+        anchor = cands[idx]
+        at = (anchor.get("_panel"), anchor.get("_tail"))
+        try:
+            fresh = self._day_candidates(page, y, m, d)              # ← 重新解析(每次击发前)
+        except Exception:
+            fresh = []
+        for c in fresh:
+            if (c.get("_panel"), c.get("_tail")) == at:
+                return (c["x"], c["y"], self._pair_desc(c, y, m))
+        if idx < len(fresh):
+            return (fresh[idx]["x"], fresh[idx]["y"], self._pair_desc(fresh[idx], y, m))
+        return (anchor["x"], anchor["y"], self._pair_desc(anchor, y, m))
+
+    def _pair_flow(self, page, df, dt, limit_s=None):
+        """一次完整"4 步序列"的执行体; **序列内零验证零换格**; 整条做完才核对整对。
+
+        序列(真机验证过的骨架, 保留): ①（面板已开则跳过）点开始框 → ② 点 df 格(第 1 击=待定起点)
+        → ③ 点结束框(历史作业验证过的配方; 不改变待定) → ④ 重新解析后点"同一格"(第 2 击=完成区间)。
+        df==dt(本工具实际用法): 两击落在**同一格** —— 第 2 击必须落回第 1 击那同一个格。
+        df!=dt(保通用): 第 2 击点 dt 的候选。整对读回 == [df, dt] 才算成功。
+        """
+        y, m, d = (int(x) for x in df.split("-"))
+        dy, dm, dd = (int(x) for x in dt.split("-"))
+        deadline = time.time() + (limit_s or self._DATE_WALL_S)
+        for attempt in range(1, 4):                                  # 每轮大轮候选 <=3
+            if time.time() > deadline:
+                return False
+            panels, _cells = self._cal_state(page)
+            months = [mm for mm in (self._parse_month(p.get("head")) for p in panels) if mm]
+            if not months:
+                return False                                         # 面板快照拿不到/被关 → 交上层清场重来
+            if (y, m) not in months:
+                if not self._nav_month(page, (y, m) > max(months)):   # 方向: 目标更晚→往后翻
+                    return False
+                time.sleep(0.5)
+                continue
+            if not self._cal_state(page)[0]:                          # 翻月把面板翻了/关了 → 点开始框打开
+                self._open_picker(page)
+            cands = self._day_candidates(page, y, m, d)
+            if not cands:
+                self._open_picker(page)
+                cands = self._day_candidates(page, y, m, d)
+            hit = False
+            for idx, c in enumerate(cands[:3]):
+                if time.time() > deadline:
+                    return False
+                if idx:
+                    # 换候选前**必须清场重开**: 上一对曾留下"待定起点"(真机点击未被登记时会这样),
+                    # 而下一候选的**第 1 击**在真机语义下会把这个残留待定**直接补成区间** ——
+                    # 正好凑出现场那个跨月错对 [09-08, 10-08]。Esc 清掉待定 + 重开面板后才开新的一对。
+                    self._dismiss_picker(page)
+                    self._open_picker(page)
+                # ---- 4 步序列(原子): 期间**不读输入框做失败判定、不换格** ----
+                if not self._cal_state(page)[0]:
+                    self._open_picker(page)
+                if not self._click_at(page, c["x"], c["y"], "df格"):
+                    continue
+                time.sleep(0.5)                                       # 沿用 0.4~0.6s 级, 不许加长
+                desc = f"{self._pair_desc(c, y, m)} ×2"
+                # 少数版本的组件**单击即成**(single_click_completes): 整对已达成 → 到此为止, 不补第 2 击。
+                # ⚠️ 这是**只可能确认成功**的短路: 读回没变**绝不**判失败、绝不换候选(那正是 v1 的病根)。
+                try:
+                    pre = self._read_dates(page)[:2]
+                except Exception:
+                    pre = []
+                if pre == [df, dt]:
+                    self._log_attempt(attempt, f"{self._pair_desc(c, y, m)} ×1(单击即成)", pre)
+                    return True
+                self._arm_end(page)                                   # ③ 点结束框(配方)
+                time.sleep(0.4)
+                if dt == df:                                          # ④ 同一格再点一次(第 2 击=终点)
+                    second = self._pick_day_cell(page, y, m, d, cands, idx)
+                else:                                                 # 通用: 第 2 击点 dt 的候选
+                    tc = self._day_candidates(page, dy, dm, dd)
+                    if not tc:
+                        continue
+                    second = (tc[0]["x"], tc[0]["y"], self._pair_desc(tc[0], dy, dm))
+                    desc = f"{self._pair_desc(c, y, m)} → {second[2]}"
+                self._click_at(page, second[0], second[1], "dt格")
+                hit = True
+                time.sleep(0.2)
+                try:                                                  # 成败都记整对读回
+                    got = self._read_dates(page)[:2]
+                except Exception as e:
+                    self.sink.log(f"⚠️ 日期读回异常: {str(e)[:60]}", level="warn")
+                    return False
+                self._log_attempt(attempt, desc, got)
+                if got == [df, dt]:
+                    return True
+                if not self._cal_state(page)[0]:                      # 面板被这次点击关掉且没对上 → 重开
+                    self._open_picker(page)
+            if not hit:
+                break                                                # 静默失败(点不动) → 下一大轮/清场重来
+            # 这一对没对上(含凑出跨月错对 [09-08,10-08] 的情形): 回上层清场重来, 不在脏状态里试探
+            return False
+        return False
+
+    def _arm_end(self, page):
+        """点**结束**输入框(4 步序列的第 3 步, 历史作业验证过的配方)。"""
+        ins = self._date_inputs(page)
+        if len(ins) < 2:
+            return False
+        try:
+            page.mouse.click(ins[-1]["x"], ins[-1]["y"])
+        except Exception:
+            return False
+        return True
 
     def _type_date(self, page, df, dt):
         """键盘直填(roo-input 可编辑): 按"值形如日期"定位输入框 → focus/select → 键入 → Enter。"""
@@ -718,16 +908,6 @@ class MeituanAdapter:
                 time.sleep(0.9)
             except Exception as e:
                 self.sink.log(f"⚠️ 键盘输入日期失败({d}): {str(e)[:60]}", level="warn")
-
-    def _try_day(self, page, d):
-        try:
-            box = page.evaluate(self._DAY_JS, str(d))
-        except Exception:
-            box = None
-        if not box:
-            return False
-        page.mouse.click(box["x"], box["y"])
-        return True
 
     def _cal_state(self, page):
         """(全部可见面板, 全部可见日格) —— 每次循环都要**重新读**(点尾巴格会改变面板显示, 坐标不能缓存)。"""
@@ -852,87 +1032,10 @@ class MeituanAdapter:
             time.sleep(0.4)
         return False
 
-    def _reopen_picker(self, page, which="start"):
-        """重新点开开始/结束输入框(选择器被关掉时用)。"""
-        ins = self._date_inputs(page)
-        if len(ins) < 2:
-            return False
-        el = ins[0] if which != "end" else ins[-1]
-        try:
-            page.mouse.click(el["x"], el["y"])
-            time.sleep(0.6)
-            return True
-        except Exception:
-            return False
-
-    def _reopen_if_closed(self, page, which="start"):
-        """候选点完选择器可能已被关掉(点尾巴格会跳月/收面板) → 只在**确实看不到面板**时重开:
-        面板开着时再点输入框反而会把它关掉(流量页真机实测过这个坑)。"""
-        panels, cells = self._cal_state(page)
-        if panels or cells:
-            return False
-        return self._reopen_picker(page, which)
-
-    def _confirm_after_click(self, page, target, which="start"):
-        """点完立刻读回; 面板重渲染留一点余量(最多读两次), 读回一致才算这次候选点对了。"""
-        for i in range(2):
-            time.sleep(0.5 if i == 0 else 0.4)
-            if self._confirmed(page, target, which):
-                return True
-        return False
-
-    def _click_day(self, page, target, which="start"):
-        """点日历格(which: 正在设"开始"还是"结束", 决定读回哪个输入框验证)。
-
-        双面板 + 日数字重复: 目标月可见 → **绝不翻月**, 只在那个面板里挑候选, 每个候选**点后读回**;
-        目标月不可见 → 按 min/max 判方向翻月(点后读回月份验证)。每次循环重新读面板与候选。
-        全程点不到 → False(交给 _type_date 兜底 + 读回 gate 裁判, 绝不静默降级)。
-        """
-        y, m, d = (int(x) for x in target.split("-"))
-        deadline = time.time() + 45
-        for attempt in range(40):
-            if time.time() > deadline:
-                break
-            panels, _cells = self._cal_state(page)
-            months = [mm for mm in (self._parse_month(p.get("head")) for p in panels) if mm]
-            if months:
-                if (y, m) in months:
-                    cands = self._day_candidates(page, y, m, d)
-                    if not cands:
-                        self._reopen_if_closed(page, which)        # 面板被关了 → 重开再试
-                    for c in cands:                               # 每轮重新读候选(坐标不许缓存)
-                        try:
-                            page.mouse.click(c["x"], c["y"])
-                        except Exception:
-                            continue
-                        if self._confirm_after_click(page, target, which):
-                            return True
-                        self._reopen_if_closed(page, which)            # 面板被关掉才重开
-                    time.sleep(0.4)
-                    continue
-                if self._nav_month(page, (y, m) > max(months)):       # 方向: 目标更晚→往后翻
-                    continue
-                time.sleep(0.5)
-                continue
-            # ---- 旧路径(面板快照拿不到: 未挂载/结构改版): 保留原"耐心重试"行为 ----
-            if attempt % 3 == 2:
-                self._reopen_picker(page, which)
-            cur = self._panel_month(page)
-            if cur is None:
-                time.sleep(0.6)
-                continue
-            if cur == (y, m):
-                if self._try_day(page, d):
-                    got = self._read_dates(page)
-                    if len(got) < 2 or self._confirmed(page, target, which):
-                        return True
-                time.sleep(0.5)
-                continue
-            if not self._nav_month(page, (y, m) > cur):
-                time.sleep(0.5)
-                continue
-            time.sleep(0.9)
-        return False
+    # ⚠️ v1 的 `_click_day` / `_confirm_after_click` / `_reopen_if_closed` / `_reopen_picker` / `_try_day`
+    #    **已删除**: 它们全是"每击即验证 + 不对就换候选"的实现, 在真机语义(第 1 击只置待定、输入框不变)下
+    #    必然把区间凑成跨月错对(2026-10-14 现场 [09-08, 10-08] 就是这么来的)。成对协议见 _pair_flow。
+    #    上面的 `_DAY_JS` 只作为**历史记录/结构改版时的诊断片段**保留(当前协议不再调用它)。
 
     # 业务 tab 的**选中态取证**(规格书 §4.5/T05): 与流量页 _set_flow_biz 同一纪律 ——
     # 点完必须能**读回**"当前选中的是哪个业务", 读不回来就不算确认。
