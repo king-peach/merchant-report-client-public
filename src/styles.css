@@ -58,6 +58,11 @@ button.primary { background: var(--accent); color: #fff; border: 0; border-radiu
 button.primary:disabled { opacity: .5; cursor: default; }
 button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 8px; padding: 8px 14px; cursor: pointer; }
 button.link { background: none; border: 0; color: var(--accent); cursor: pointer; font-size: 13px; padding: 0; }
+/* 「展示过程」开关(2026-10-14): 是 label(不是 button), 外观与 ghost 按钮一致; 开着时高亮 */
+label.toggle { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 14px; cursor: pointer; user-select: none; background: transparent; }
+label.toggle.on { color: var(--accent); border-color: var(--accent); }
+label.toggle input { width: 14px; height: 14px; margin: 0; cursor: pointer; accent-color: var(--accent); }
 
 .steps { display: flex; flex-direction: column; gap: 6px; margin: 16px 0; }
 .step { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 8px; font-size: 14px; background: #fafbfc; }

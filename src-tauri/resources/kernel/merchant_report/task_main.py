@@ -62,6 +62,8 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--store-details", default=None, help="门店明细表路径(设置里配置; 编号优先匹配, 未配置=旧行为)")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--show-browser", action="store_true",
+                    help="「展示过程」开关开启时启动: 浏览器不藏屏外, 开场直接滑入主屏")
     args = ap.parse_args()
 
     sys.stderr.write(f"[kernel] merchant={args.merchant} platform={args.platform} "
@@ -110,11 +112,17 @@ def main():
     if sink.echo_path:
         sys.stderr.write(f"[kernel] 本次运行日志(可复查/可发我): {sink.echo_path}\n")
     human = HumanBridge(from_stdin=True)
+    # 常驻 stdin 分发器(需求 F): 一个读取线程按类型分发 —— 人工响应 → HumanBridge 队列;
+    # 「展示过程」开关 → browser_window.request(只改标志, CDP 仍由主线程安全点执行)。
+    # 必须**早于**任何需要读 stdin 的环节启动(幂等, 重复调用无副作用)。
+    from merchant_report import stdin_router
+    stdin_router.start()
     llm = LLMClient(cfg.get("llm", {}).get("base_url"), cfg.get("llm", {}).get("api_key"),
                     cfg.get("llm", {}).get("model"))
     try:
         run_task(cfg, store, date=args.date, date_from=date_from, sink=sink, human=human,
-                 skip_browser=args.no_browser, llm_client=llm)
+                 skip_browser=args.no_browser, llm_client=llm,
+                 show_browser=args.show_browser)
     except Exception as e:
         sink.result(ok=False, error_code="E_CRASH", message=str(e)[:300], retryable=True)
         sys.stderr.write(f"[kernel] crash: {e}\n")

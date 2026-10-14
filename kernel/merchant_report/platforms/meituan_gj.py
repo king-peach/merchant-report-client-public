@@ -10,6 +10,21 @@ import time
 from ..events import EventSink, HumanBridge
 from .base import ShopSwitchTimer
 
+
+def _poll_window():
+    """「展示过程」开关**安全点**(需求 F): 长等待循环里给主线程执行窗口动作的机会。
+
+    log/step 只在"有事发生"时被调用, 登录等待这类纯轮询可能几十秒不产生日志 → 用户此刻点
+    开关会等太久。这里保证主要等待环节 1~2 秒内响应; 未启用/非主线程是零成本 no-op,
+    poll_safe 保证绝不抛(窗口控制失败绝不影响任务)。
+    """
+    try:
+        from .. import browser_window as _bw
+        _bw.poll_safe()
+    except Exception:
+        pass
+
+
 GJ_LOGIN = "https://pos.meituan.com/web/rms-account?redirect=https%3A%2F%2Fpos.meituan.com%2Fweb%23%2Flogin"
 # 报表中心「营业概览」直连路由(2026-09-28 实测可直接渲染, 绕开侧边栏菜单)
 GJ_BIZ_OVERVIEW = "https://pos.meituan.com/web/report/main#/rms-report/business-report"
@@ -284,6 +299,7 @@ class MeituanGjAdapter:
     def _wait_manual(self, page, timeout_s):
         end = time.time() + timeout_s
         while time.time() < end:
+            _poll_window()                   # 展示过程开关: 等管家登录期间也能随时切
             time.sleep(4)
             if self._is_logged_in(page):
                 self.sink.log("✅ 美团管家登录成功")

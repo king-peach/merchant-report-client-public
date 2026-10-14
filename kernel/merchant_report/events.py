@@ -25,6 +25,15 @@ class EventSink:
             except Exception:
                 self._echo_fp = None
         self.t0 = time.time()
+        # 登记事件出口(需求 F): 各平台**等待循环**里的 browser_window.poll() 不带 sink 时,
+        # 用它把「已弹回主屏 / 已收回屏外」反馈给用户(没有它那些日志会丢)。
+        # 只认**壳模式**的 sink(to_stdout): CLI 的 renderer 出口不该被窗口控制的日志污染。
+        if to_stdout:
+            try:
+                from . import browser_window as _bw
+                _bw.set_sink(self)
+            except Exception:
+                pass
 
     def _fallback_write(self, line, err):
         """stdout 写不进去时的兜底(Windows: 管道读端已关/编码异常 → OSError EINVAL)。
@@ -94,6 +103,7 @@ class EventSink:
 
     # ---- 步骤 ----
     def step(self, sid, name, state, detail=None, error_code=None, elapsed_s=None):
+        self._poll_window()          # 与 log 同款安全点(需求 F: 等待环节也能及时响应开关)
         obj = {"type": "step", "id": sid, "name": name, "state": state}
         if detail:
             obj["detail"] = detail
@@ -147,7 +157,22 @@ class EventSink:
             pass
 
     # ---- 日志/进度 ----
+    def _poll_window(self):
+        """窗口开关**安全点**(需求 F): 「展示过程」的滑入/滑出在这里落地。
+
+        为什么挂 log/step: 这两个是本进程**最密集**的公共调用点 —— 挂在它们身上就等于
+        任务每走一小步都会给主线程一次机会处理窗口动作(响应速度 ~1 秒级), 不用在每个
+        平台循环里各处埋点。未启用/无待办时只是一次属性读取(零成本); 失败静默。
+        ⚠️ 只许在主线程执行(Playwright sync API 绑定主线程) —— poll() 内部自己判定。
+        """
+        try:
+            from . import browser_window as _bw
+            _bw.poll(self)
+        except Exception:
+            pass
+
     def log(self, msg, level="info"):
+        self._poll_window()
         return self._emit({"type": "log", "level": level, "msg": msg})
 
     def progress(self, step, pct):
@@ -175,7 +200,7 @@ DEFAULT_WAIT_TIMEOUT_S = 900          # 15 分钟
 
 
 class HumanBridge:
-    """need_human 的响应来源。壳模式: 从 stdin 读(**带超时兜底**); CLI 模式: 从 callback/终端读。"""
+    """need_human 的响应来源。壳模式: 从**常驻 stdin 分发器**取(带超时兜底); CLI 模式: callback/终端。"""
 
     def __init__(self, from_stdin=False, cli_callback=None):
         self.from_stdin = from_stdin
@@ -187,33 +212,33 @@ class HumanBridge:
         2026-10-13 修复"卡死内核"缺口(客户机残留内核事故的机制根因): 此前 from_stdin 是
         **裸 readline 无限阻塞**(注释写"壳负责超时", 但壳层从未实现) —— 用户不点面板时,
         内核永久卡在等待里 = 残留内核 + 后续全被"另一个任务在运行"挡住。
-        现在: 读行放 daemon 线程 + 队列超时(Windows 管道没有 select, 只能这么等);
         超时 → 返回 None → 调用方既有的"无人值守"回退逻辑接管(要么跳继续、要么保守结束,
         绝不是永远卡着)。内核侧默认上限 900s; 壳侧另按事件的 timeout_s 自动应答(更快)。
+
+        2026-10-14(需求 F): stdin 上现在跑**多路消息**(人工响应 + 「展示过程」开关), 临时
+        readline 线程会跟窗口开关抢行/丢消息 → 改为从**常驻分发器**(stdin_router)的队列取。
+        单读者红线: 本方法**不再自己开 readline 线程**; 超时语义与原实现完全一致
+        (队列 get(timeout=limit), 超时返回 None)。
         """
         if self.cli_callback:
             return self.cli_callback(need_human_obj)
         if self.from_stdin:
             import queue
-            import threading
+            from . import stdin_router
             limit = DEFAULT_WAIT_TIMEOUT_S if timeout_s is None else float(timeout_s)
-            q = queue.Queue()
-
-            def _reader():
-                try:
-                    q.put(sys.stdin.readline())
-                except Exception:
-                    q.put("")
-
-            threading.Thread(target=_reader, daemon=True).start()
+            router = stdin_router.current()
+            if router is None:
+                # 壳模式入口(task_main)必然会启动分发器; 没启动=调用方没走正规入口。
+                # 兜底: 就地启动一个(幂等), 保证"等人工"这条路永远有人在读 stdin。
+                router = stdin_router.start()
+            else:
+                router.start()      # 幂等: 已有活着的读取线程时直接返回
+            q = router.human_queue
             try:
-                line = q.get(timeout=limit) if limit and limit > 0 else q.get(block=False)
+                obj = q.get(timeout=limit) if limit and limit > 0 else q.get(block=False)
             except queue.Empty:
                 return None                     # 超时 → 与"通道不可用"同语义, 调用方兜底
-            if not line:
+            if not isinstance(obj, dict):
                 return None
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                return None
+            return obj
         return None

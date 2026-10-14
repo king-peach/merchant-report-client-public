@@ -9,6 +9,21 @@ import time
 
 from ..events import EventSink, HumanBridge
 
+
+def _poll_window():
+    """「展示过程」开关**安全点**(需求 F): 长等待循环里给主线程执行窗口动作的机会。
+
+    下载列表轮询这类纯等待循环可能连续 2 分钟不产生日志 → 用户此刻点开关要等太久。
+    这里保证主要等待环节 1~2 秒内响应; 未启用/非主线程是零成本 no-op,
+    poll_safe 保证绝不抛(窗口控制失败绝不影响任务)。
+    """
+    try:
+        from .. import browser_window as _bw
+        _bw.poll_safe()
+    except Exception:
+        pass
+
+
 JD_LOGIN = "https://store.jddj.com/base/login?appCode=lsp-store&backUrl=https%3A%2F%2Fstore.jddj.com%2F"
 JD_HOME = "https://store.jddj.com/"
 # 报表下载列表页(用户 2026-10-08 给出); 菜单点不出来时直接导航用。frame 号随账号可能不同,
@@ -173,6 +188,7 @@ class JDAdapter:
             self.sink.need_human("login", "未配置京东账号密码, 请在浏览器手动登录", platform="jd")
         end = time.time() + timeout_s
         while time.time() < end:
+            _poll_window()                   # 展示过程开关: 等登录期间也能随时切
             time.sleep(4)
             if logged():
                 self.sink.log("✅ 京东登录成功")
@@ -401,6 +417,7 @@ class JDAdapter:
         path = None
         last_diag = ""
         for i in range(24):   # 最多 2 分钟
+            _poll_window()                   # 展示过程开关: 下载列表轮询期间也能随时切
             time.sleep(5)
             try:
                 self._tab_click(tgt, "下载列表")

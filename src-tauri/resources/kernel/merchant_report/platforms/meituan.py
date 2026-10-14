@@ -14,6 +14,20 @@ import time
 from ..events import EventSink, HumanBridge
 from .. import packs
 
+
+def _poll_window():
+    """「展示过程」开关**安全点**(需求 F): 长等待循环里给主线程执行窗口动作的机会。
+
+    log/step 只在"有事发生"时被调用, 登录/短信/报表页就绪这类纯等待循环可能几十秒不产生
+    日志 → 用户此刻点开关会等太久。这里保证主要等待环节 1~2 秒内响应; 未启用/非主线程是
+    零成本 no-op, poll_safe 保证绝不抛(窗口控制失败绝不影响任务)。
+    """
+    try:
+        from .. import browser_window as _bw
+        _bw.poll_safe()
+    except Exception:
+        pass
+
 MEITUAN_HOME = "https://e.waimai.meituan.com/"
 # 报表页可独立打开(无需主站外壳); 生成走 UI(裸 fetch 直调被签名/时效挡: code:500), 取文件走 ctx.request
 REPORT_URL = "https://waimaieapp.meituan.com/igate/bizdata/report/download"
@@ -124,6 +138,7 @@ class MeituanAdapter:
         # 轮询登录结果(滑块/短信由人工处理后, 页面进入工作台即成功)
         end = time.time() + timeout_s
         while time.time() < end:
+            _poll_window()                   # 展示过程开关: 登录等待期间也能随时切
             time.sleep(4)
             if _state() == "in":
                 self.sink.log("✅ 美团登录成功")
@@ -212,6 +227,7 @@ class MeituanAdapter:
         # 轮询人工完成(短信流程通常 2 分钟内)
         end = time.time() + timeout_s
         while time.time() < end:
+            _poll_window()                   # 展示过程开关: 等验证码期间也能随时切
             time.sleep(4)
             try:
                 t = page.evaluate("() => document.body.innerText.slice(0, 500)") or ""
@@ -521,6 +537,7 @@ class MeituanAdapter:
                 "｜处理: 请重新登录美团外卖商家后台（已尝试 带账号ID / 裸链 / SPA 三种入口）")
         end = time.time() + timeout_s
         while time.time() < end:
+            _poll_window()                   # 展示过程开关: 等报表页就绪期间也能随时切
             time.sleep(3)
             try:
                 if page.evaluate("() => !!document.querySelector('span.custom-checkbox-label') "
@@ -541,6 +558,13 @@ class MeituanAdapter:
         raise RuntimeError(f"美团报表页未就绪(可能登录态失效){hint}: {page.url[:80]}")
 
     # ---- 日期区间(实测 DOM: 2 个可见 input.roo-input, 值形如 2026-09-17; 点开始框→点格→点结束框→点格) ----
+    # 2026-10-14 真机(diag_download_20261014-115841): 要设 09-05, 实际设成 **10-05**。根因 = 双面板
+    # 日历里"日数字"必然重复(邻月尾巴格渲染同一个数字; 九月面板最后一行第 1 列的 10/5 就是最左的 "5"),
+    # 旧实现「收集全部可见格 → 按 x 取最左」于是点中尾巴格 → 写成邻月日期(读回 gate 拦下并中止, 没出错下载)。
+    # 现在: ① 面板感知(表头↔body 配对) ② 目标月可见就**绝不翻月**, 候选限定在该面板 bbox 内
+    # ③ 每个候选**点后读回对应输入框**(开始=第1个/结束=第2个), 不对就换下一个候选
+    # ④ 翻月按全部可见面板的 min/max 判方向 + 点后读回面板月份验证, 不行就换同向另一个 chevron。
+    # 末端的读回 gate 原样保留(最后裁判), 绝不静默降级。
     _DATES_JS = """() => {
       const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
       const isd = e => vis(e) && /^\\d{4}-\\d{1,2}-\\d{1,2}$/.test((e.value || '').trim());
@@ -549,7 +573,56 @@ class MeituanAdapter:
         return {x: r.x + r.width / 2, y: r.y + r.height / 2, cx: r.x, cy: r.y, v: e.value.trim()};
       }).sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx));
     }"""
-    # roo 日期格子(2026-10-09 实测): 可点格 <td>(有时无 class)/禁用格 td.day.disabled; 双面板取最左。
+    # 日历全量快照: **全部可见面板**(头文本 + body bbox) + 全部可见日格(文字/bbox/class/祖先class/日期属性)。
+    # 面板配对: 优先"头的祖先里含可见 body"(DOM 包含关系), 否则按可见顺序配对; 两者都拿不到就退回旧 _DAY_JS。
+    _CAL_JS = """() => {
+      const vis = e => { if (!e || e.nodeType !== 1) return false;
+        const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const info = td => {
+        const r = td.getBoundingClientRect();
+        let a = '';
+        for (const at of ['data-date', 'data-value', 'data-day', 'title', 'aria-label']) {
+          const v = td.getAttribute ? td.getAttribute(at) : null;
+          if (v) { a = v; break; }
+        }
+        let anc = '';
+        for (let p = td, i = 0; p && i < 4; i++, p = p.parentElement) anc += ' ' + String(p.className || '');
+        const own = String(td.className || '');
+        return {x: r.x + r.width / 2, y: r.y + r.height / 2, cx: r.x, cy: r.y, w: r.width, h: r.height,
+                cls: own, attr: a, anc: anc,
+                dis: /disabl|forbid/i.test(own + anc),
+                other: /other|prev|next|outside|not-current|notcurrent|old|gray|grey/i.test(own + anc)};
+      };
+      const cells = [...document.querySelectorAll('.roo-datepicker-body td')]
+        .filter(td => vis(td) && /^\\d{1,2}$/.test((td.textContent || '').trim()))
+        .map(td => Object.assign(info(td), {d: (td.textContent || '').trim()}));
+      const heads = [...document.querySelectorAll('.roo-datepicker-header')].filter(vis);
+      const bodies = [...document.querySelectorAll('.roo-datepicker-body')].filter(vis);
+      const panels = [];
+      for (let i = 0; i < heads.length; i++) {
+        const h = heads[i];
+        let body = null;
+        for (let p = h.parentElement, k = 0; p && k < 5; k++, p = p.parentElement) {
+          const b = p.querySelector('.roo-datepicker-body');
+          if (b && vis(b)) { body = b; break; }
+        }
+        if (!body) body = bodies[Math.min(i, bodies.length - 1)] || null;   // 兜底: 按可见顺序配对
+        if (!body) continue;
+        const r = body.getBoundingClientRect();
+        panels.push({head: (h.innerText || '').trim().slice(0, 60), x: r.x, y: r.y, w: r.width, h: r.height});
+      }
+      if (!panels.length && bodies.length) {                 // 一个头都没有(结构改版): 当唯一面板用
+        const r = bodies[0].getBoundingClientRect();
+        panels.push({head: '', x: r.x, y: r.y, w: r.width, h: r.height});
+      }
+      return {panels: panels, cells: cells};
+    }"""
+    # 全部可见面板头文本 —— 翻月方向必须用**全部**可见月的 min/max 判断, 不假设左右顺序(规格 §D)。
+    _HEADS_JS = """() => [...document.querySelectorAll('.roo-datepicker-header')]
+        .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+        .map(e => (e.innerText || '').trim())"""
+    # ⚠️ 旧路径(仅"面板/格子快照完全拿不到"时兜底): 取**最左**可见格 —— 双面板下会点中邻月尾巴格,
+    #    2026-10-14 真机就是这么把 09-05 设成 10-05 的, 故它已不是主通道。
     _DAY_JS = """(d) => {
       const out = [];
       for (const td of document.querySelectorAll('.roo-datepicker-body td')) {
@@ -562,7 +635,7 @@ class MeituanAdapter:
       out.sort((p, q) => p.lx - q.lx);
       return out[0] || null;
     }"""
-    # 面板头文本(如「2026 十月」); 月份解析在 _panel_month(Python 侧)。
+    # 面板头文本(如「2026 十月」); 月份解析在 _parse_month(Python 侧)。
     _MONTH_JS = """() => {
       const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
       const hs = [...document.querySelectorAll('.roo-datepicker-header')].filter(vis);
@@ -584,6 +657,19 @@ class MeituanAdapter:
     def _read_dates(self, page):
         return [str(x["v"]) for x in self._date_inputs(page)][:2]
 
+    @staticmethod
+    def _norm_day(v):
+        """页面上的日期写法(2026-9-5 / 2026/09/05 …) → 统一成 2026-09-05 再比; 解析不了返回 ''。"""
+        mm = re.match(r"^(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})$", str(v or "").strip())
+        return "%04d-%02d-%02d" % (int(mm.group(1)), int(mm.group(2)), int(mm.group(3))) if mm else ""
+
+    def _confirmed(self, page, target, which="start"):
+        """读回**对应那个输入框**(开始=第 1 个 / 结束=第 2 个)是否已是目标日 —— 只有读回一致才算点中。"""
+        got = self._read_dates(page)
+        if len(got) < 2:
+            return False
+        return self._norm_day(got[1] if which == "end" else got[0]) == target
+
     def _set_date_range(self, page, df, dt):
         """设日期区间; 网格点选失败→键盘输入; 都不生效则中止(绝不带错误区间下载)"""
         ins = self._date_inputs(page)
@@ -593,12 +679,12 @@ class MeituanAdapter:
         try:
             page.mouse.click(ins[0]["x"], ins[0]["y"])
             time.sleep(1.5)
-            ok = self._click_day(page, df)
+            ok = self._click_day(page, df, "start")
             if ok:
                 ins = self._date_inputs(page) or ins
                 page.mouse.click(ins[-1]["x"], ins[-1]["y"])
                 time.sleep(1.0)
-                ok = self._click_day(page, dt)
+                ok = self._click_day(page, dt, "end")
         except Exception as e:
             self.sink.log(f"⚠️ 日历点选异常: {str(e)[:70]}", level="warn")
             ok = False
@@ -643,37 +729,22 @@ class MeituanAdapter:
         page.mouse.click(box["x"], box["y"])
         return True
 
-    def _click_day(self, page, target):
-        """点日历格; 月份不对先翻月; 面板未挂载/重渲染时耐心重试(2026-10-09 实测)。"""
-        y, m, d = (int(x) for x in target.split("-"))
-        for attempt in range(40):
-            cur = self._panel_month(page)
-            if cur is None:
-                time.sleep(0.6)
-                continue
-            if cur == (y, m):
-                if self._try_day(page, d):
-                    return True
-                time.sleep(0.5)
-                continue
-            if not self._nav_month(page, (y, m) > cur):
-                time.sleep(0.5)
-                continue
-            time.sleep(0.9)
-        return False
+    def _cal_state(self, page):
+        """(全部可见面板, 全部可见日格) —— 每次循环都要**重新读**(点尾巴格会改变面板显示, 坐标不能缓存)。"""
+        try:
+            st = page.evaluate(self._CAL_JS) or {}
+            return (st.get("panels") or []), (st.get("cells") or [])
+        except Exception:
+            return [], []
 
     _CN_MONTH = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
                  "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
 
-    def _panel_month(self, page):
-        """面板头(如「2026 十月」)→ (年, 月); 兼容 2026年10月 / 2026-10 / 中文数字月(2026-10-09)。"""
-        try:
-            t = page.evaluate(self._MONTH_JS)
-        except Exception:
-            t = None
+    def _parse_month(self, t):
+        """面板头 / 月标题文本 → (年, 月); 兼容「2026十月」/「2026 十一月」/2026年10月/2026-10/2026/3。"""
         if not t:
             return None
-        t2 = t.replace("\n", "").replace(" ", "")
+        t2 = str(t).replace("\n", "").replace(" ", "")
         mm = re.search(r"(20[0-9]{2})[年/-]?(十[一二]?|[一二三四五六七八九]|1[0-2]|0?[1-9])", t2)
         if not mm:
             return None
@@ -681,24 +752,187 @@ class MeituanAdapter:
         m = int(tok) if tok.isdigit() else self._CN_MONTH.get(tok)
         return (int(mm.group(1)), m) if m else None
 
+    def _panel_month(self, page):
+        """第一个可见面板头的月份(兼容旧契约; 双面板判断请用 _cal_state/_panel_months)。"""
+        try:
+            t = page.evaluate(self._MONTH_JS)
+        except Exception:
+            t = None
+        return self._parse_month(t)
+
+    def _panel_months(self, page):
+        """**全部**可见面板的 (年, 月)(解析不了的丢弃) —— 双面板导航方向用 min/max 判断, 不假设左右顺序。"""
+        try:
+            heads = page.evaluate(self._HEADS_JS) or []
+        except Exception:
+            heads = []
+        out = []
+        for t in heads:
+            mm = self._parse_month(t)
+            if mm and mm not in out:
+                out.append(mm)
+        return out
+
+    def _day_candidates(self, page, y, m, d):
+        """目标 (年,月) 面板内的 day=d **候选格**列表(邻月尾巴格数字相同 → 可能多个)。
+
+        排序只是"软化"的优先序, **不替代验证**: ① 带可解析日期属性且精确等于目标日的排最前;
+        ② 属性是日期但不是目标日的(明确是别的月)靠后; ③ class/祖先 class 含 other|prev|next|old…
+        的(邻月尾巴)降权; ④ 其余按"更可能属于当月"的行列顺序。
+        """
+        panels, cells = self._cal_state(page)
+        tgt, months = None, []
+        for p in panels:
+            mm = self._parse_month(p.get("head"))
+            if mm:
+                months.append(mm)
+                if mm == (y, m) and tgt is None:
+                    tgt = p
+        if tgt is None and len(panels) == 1 and not months:
+            tgt = panels[0]        # 单面板且头解析不出月份 → 面板内找, 由"点后读回"裁判
+        if tgt is None and panels and (y, m) not in months:
+            return []              # 目标月的面板不在可见快照里(调用方会去翻月) → 不猜, 交回上层
+        out, seen = [], set()
+        for c in cells:
+            if str(c.get("d")) != str(d) or c.get("dis"):
+                continue
+            if tgt is not None:
+                if not (tgt["x"] - 1 <= c["cx"] <= tgt["x"] + tgt["w"] + 1
+                        and tgt["y"] - 1 <= c["cy"] <= tgt["y"] + tgt["h"] + 1):
+                    continue                      # 候选格必须在这个面板的 bbox 内(规格 §B)
+            key = (round(c["cx"]), round(c["cy"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
+
+        def _rank(c):
+            a = str(c.get("attr") or "")
+            exact = 1 if re.search(r"(^|[^0-9])%04d[-/.]0?%d[-/.]0?%d([^0-9]|$)" % (y, m, d), a) else 0
+            stray = 0
+            if a and not exact:
+                mm2 = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", a)
+                if mm2 and (int(mm2.group(1)), int(mm2.group(2)), int(mm2.group(3))) != (y, m, d):
+                    stray = 1                  # 属性明说了是别的日期 → 靠后
+            return (0 if exact else (2 if stray else 1),
+                    1 if c.get("other") else 0,
+                    round(c["cy"]), round(c["cx"]))
+        out.sort(key=_rank)
+        return out
+
+    def _chevrons(self, page, forward):
+        """**所有**可见的同向 chevron 候选(按 x 升序) —— 逐个试, 点后必须读回面板月份验证。"""
+        try:
+            return page.evaluate("""(fwd) => {
+              const want = fwd ? 'chevron-right-new' : 'chevron-left-new';
+              return [...document.querySelectorAll('i.roo-icon')]
+                .filter(e => String(e.className).indexOf(want) >= 0)
+                .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+                .map(e => { const r = e.getBoundingClientRect();
+                            return {x: r.x + r.width / 2, y: r.y + r.height / 2, cx: r.x}; })
+                .sort((a, b) => a.cx - b.cx);
+            }""", forward) or []
+        except Exception:
+            return []
+
     def _nav_month(self, page, forward):
-        """翻月: roo 双面板 → 取**最左**面板的 chevron 图标(左=上月, 右=下月)点击。"""
-        box = page.evaluate("""(fwd) => {
-          const want = fwd ? 'chevron-right-new' : 'chevron-left-new';
-          const cands = [...document.querySelectorAll('i.roo-icon')]
-            .filter(e => String(e.className).indexOf(want) >= 0)
-            .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
-          cands.sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
-          const el = cands[0];
-          if (!el) return null;
-          const r = el.getBoundingClientRect();
-          return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-        }""", forward)
-        if not box:
+        """翻月: 点同向 chevron 候选, **读回面板月份**确认确实朝目标方向移动了; 都不行 → False。"""
+        before = self._panel_months(page)
+        if not before:
             return False
-        page.mouse.click(box["x"], box["y"])
-        time.sleep(0.9)
-        return True
+        for box in self._chevrons(page, forward):
+            try:
+                page.mouse.click(box["x"], box["y"])
+            except Exception:
+                continue
+            time.sleep(0.5)
+            after = self._panel_months(page)
+            if after and ((min(after) > min(before)) if forward else (max(after) < max(before))):
+                return True
+            time.sleep(0.4)
+        return False
+
+    def _reopen_picker(self, page, which="start"):
+        """重新点开开始/结束输入框(选择器被关掉时用)。"""
+        ins = self._date_inputs(page)
+        if len(ins) < 2:
+            return False
+        el = ins[0] if which != "end" else ins[-1]
+        try:
+            page.mouse.click(el["x"], el["y"])
+            time.sleep(0.6)
+            return True
+        except Exception:
+            return False
+
+    def _reopen_if_closed(self, page, which="start"):
+        """候选点完选择器可能已被关掉(点尾巴格会跳月/收面板) → 只在**确实看不到面板**时重开:
+        面板开着时再点输入框反而会把它关掉(流量页真机实测过这个坑)。"""
+        panels, cells = self._cal_state(page)
+        if panels or cells:
+            return False
+        return self._reopen_picker(page, which)
+
+    def _confirm_after_click(self, page, target, which="start"):
+        """点完立刻读回; 面板重渲染留一点余量(最多读两次), 读回一致才算这次候选点对了。"""
+        for i in range(2):
+            time.sleep(0.5 if i == 0 else 0.4)
+            if self._confirmed(page, target, which):
+                return True
+        return False
+
+    def _click_day(self, page, target, which="start"):
+        """点日历格(which: 正在设"开始"还是"结束", 决定读回哪个输入框验证)。
+
+        双面板 + 日数字重复: 目标月可见 → **绝不翻月**, 只在那个面板里挑候选, 每个候选**点后读回**;
+        目标月不可见 → 按 min/max 判方向翻月(点后读回月份验证)。每次循环重新读面板与候选。
+        全程点不到 → False(交给 _type_date 兜底 + 读回 gate 裁判, 绝不静默降级)。
+        """
+        y, m, d = (int(x) for x in target.split("-"))
+        deadline = time.time() + 45
+        for attempt in range(40):
+            if time.time() > deadline:
+                break
+            panels, _cells = self._cal_state(page)
+            months = [mm for mm in (self._parse_month(p.get("head")) for p in panels) if mm]
+            if months:
+                if (y, m) in months:
+                    cands = self._day_candidates(page, y, m, d)
+                    if not cands:
+                        self._reopen_if_closed(page, which)        # 面板被关了 → 重开再试
+                    for c in cands:                               # 每轮重新读候选(坐标不许缓存)
+                        try:
+                            page.mouse.click(c["x"], c["y"])
+                        except Exception:
+                            continue
+                        if self._confirm_after_click(page, target, which):
+                            return True
+                        self._reopen_if_closed(page, which)            # 面板被关掉才重开
+                    time.sleep(0.4)
+                    continue
+                if self._nav_month(page, (y, m) > max(months)):       # 方向: 目标更晚→往后翻
+                    continue
+                time.sleep(0.5)
+                continue
+            # ---- 旧路径(面板快照拿不到: 未挂载/结构改版): 保留原"耐心重试"行为 ----
+            if attempt % 3 == 2:
+                self._reopen_picker(page, which)
+            cur = self._panel_month(page)
+            if cur is None:
+                time.sleep(0.6)
+                continue
+            if cur == (y, m):
+                if self._try_day(page, d):
+                    got = self._read_dates(page)
+                    if len(got) < 2 or self._confirmed(page, target, which):
+                        return True
+                time.sleep(0.5)
+                continue
+            if not self._nav_month(page, (y, m) > cur):
+                time.sleep(0.5)
+                continue
+            time.sleep(0.9)
+        return False
 
     # 业务 tab 的**选中态取证**(规格书 §4.5/T05): 与流量页 _set_flow_biz 同一纪律 ——
     # 点完必须能**读回**"当前选中的是哪个业务", 读不回来就不算确认。

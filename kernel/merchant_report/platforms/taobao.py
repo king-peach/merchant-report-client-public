@@ -21,6 +21,21 @@ STATS_HOME = "https://melody.shop.ele.me/"
 # 增值服务页(充值/消费记录): 单店 URL, shop_id 由 switch_shop 拿到
 VAS_URL = "https://melody.shop.ele.me/app/shop/{shop_id}/vas#app.shop.vas"
 
+
+def _poll_window():
+    """「展示过程」开关**安全点**(需求 F): 长等待循环里给主线程一次执行窗口动作的机会。
+
+    为什么要在循环里显式调: EventSink.log()/step() 只在"有事发生"时才被调用, 而登录/下载
+    这类**纯等待**循环可能几十秒不产生日志 → 用户此刻点开关要等太久。挂在这里保证主要
+    等待环节 1~2 秒内响应。主线程之外或未启用时是零成本 no-op(见 browser_window.poll);
+    poll_safe 保证绝不抛(窗口控制失败绝不影响任务)。
+    """
+    try:
+        from .. import browser_window as _bw
+        _bw.poll_safe()
+    except Exception:
+        pass
+
 # 切店弹层「搜索结果行」读取: 门店叶子行(lv==2) 或 class 含 itemShopName 的行。
 # 2026-10-13 新增「搜索ID直选」快路径用 —— 输编号后按此判定过滤结果里是否锁定到唯一目标店。
 _SHOP_SEARCH_ROWS_JS = r"""() => {
@@ -763,6 +778,7 @@ class TaobaoAdapter:
                              timeout_s=timeout_s)
         end = time.time() + timeout_s
         while time.time() < end:
+            _poll_window()                   # 展示过程开关: 等待登录的这几分钟里也能随时切
             time.sleep(4)
             if self._logged_in():
                 self.sink.log("✅ 登录成功")

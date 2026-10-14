@@ -684,7 +684,7 @@ def _browser_dead_exhausted_note(relaunched):
 
 
 def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
-             skip_browser=False, llm_client=None):
+             skip_browser=False, llm_client=None, show_browser=False):
     from .events import EventSink, HumanBridge
     sink = sink or EventSink("task")
     human = human or HumanBridge()
@@ -950,6 +950,15 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                     watch_browser(_live, sink)   # 断开即记日志: 定位"什么时候死的"
             except Exception:
                 pass
+            if show_browser:
+                # 「展示过程」开关开着启动(需求 F): 浏览器一就绪就滑入主屏(带滑入动画)。
+                # 只动窗口坐标/状态, 与取数逻辑零接触; request() 只改标志, poll() 在主线程执行。
+                try:
+                    from . import browser_window as _bw
+                    _bw.request(True)
+                    _bw.poll(sink)
+                except Exception:
+                    pass
             ad, ok = build_adapter(actx)
             ad_holder["ad"] = ad
             if not ok:

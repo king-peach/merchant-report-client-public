@@ -121,7 +121,11 @@ pub fn run_task(
     password: String,
     store_details: String,
     skip_browser: bool,
+    // 「展示过程」开关(需求 F): 打开时内核开场就把自动化浏览器滑入主屏。
+    // Option<bool> = 旧版前端不带这个键也能跑(缺省视为 false), 不做破坏性变更。
+    show_browser: Option<bool>,
 ) -> Result<String, String> {
+    let show_browser = show_browser.unwrap_or(false);
     // 模板兜底校验(前端已缓存路径可能失效)
     if !std::path::Path::new(&template).is_file() {
         return Err(format!(
@@ -172,6 +176,10 @@ pub fn run_task(
     }
     if skip_browser {
         cmd.arg("--no-browser");
+    }
+    if show_browser {
+        // 开场滑入主屏(需求 F): 只影响窗口坐标, 与取数逻辑无关
+        cmd.arg("--show-browser");
     }
     // Windows 安装包内自带 Chromium(与 macOS 同引擎, 行为一致)。
     // 存在则把它指给 Playwright: 客户机不需要系统 Edge/Chrome, 也不下载浏览器。

@@ -156,6 +156,8 @@ const LLM_PRESETS: { label: string; base: string; model: string; hint: string }[
 const LS_MERCHANTS = "mrc.merchants";
 const LS_LLM = "mrc.llm";
 const LS_HIST = "mrc.history";
+// 「展示过程」开关记忆(需求 F, 2026-10-14): 开着 → 下一轮任务开场就把自动化浏览器滑入主屏
+const LS_SHOWBROWSER = "mrc.showBrowser";
 
 function loadLS<T>(key: string, def: T): T {
   try { return JSON.parse(localStorage.getItem(key) || "") ?? def; } catch { return def; }
@@ -193,6 +195,20 @@ export default function App() {
   const allDayCurrent = useRef("");           // 当前正在跑的天(给 launch/result 回调用)
   const allMode = useRef<"single" | "range">("single"); // 本次一键是单日还是时间段
   const aborted = useRef(false);              // 用户点了「终止」: 结果回调不得再自动续跑
+  // 「展示过程」(需求 F, 2026-10-14): 手动开关, 默认关; 运行中可随时切, **不影响任务**。
+  // state 供渲染, ref 供 launch/事件回调读最新值(闭包快照陷阱), localStorage 记忆跨次启动。
+  const [showBrowser, setShowBrowser] = useState<boolean>(() => {
+    try { return localStorage.getItem(LS_SHOWBROWSER) === "1"; } catch { return false; }
+  });
+  const showBrowserRef = useRef(showBrowser);
+  const toggleShowBrowser = () => {
+    const next = !showBrowserRef.current;
+    showBrowserRef.current = next; setShowBrowser(next);
+    try { localStorage.setItem(LS_SHOWBROWSER, next ? "1" : "0"); } catch { /* 隐私模式: 只影响记忆 */ }
+    // 运行中 → 直接通知内核(只动窗口坐标, 不影响自动化); 没有运行中的任务 → 静默(本地开关照常记住)
+    void invoke("send_to_kernel", { payload: { type: "browser_window", visible: next } })
+      .catch(() => { /* 无任务在跑: 忽略 */ });
+  };
   const [steps, setSteps] = useState<Record<string, Step>>({});
   const [banner, setBanner] = useState<Banner | null>(null);
   // need_human 超时兜底(2026-10-13): 面板超时未点 → 自动按"超时"应答, 内核走其既有的
@@ -416,6 +432,8 @@ export default function App() {
         username: (merchant as any)?.[platform]?.username ?? "",
         password: (merchant as any)?.[platform]?.password ?? "",
         skipBrowser,
+        // 「展示过程」: 每轮都读最新开关值(时间段逐日循环里用户中途改了也能生效)
+        showBrowser: showBrowserRef.current,
       });
     } catch (e: any) {
       setLogs((l) => [...l, `启动失败: ${e}`]); setRunning(false);
@@ -642,6 +660,13 @@ export default function App() {
                 ▶▶ 一键跑所有平台
               </button>
               {running && <button className="ghost" onClick={abort}>终止</button>}
+              {/* 「展示过程」开关(2026-10-14): 运行中随时可点; 只把浏览器窗口滑入/滑出主屏,
+                  不中断任务、不影响取数。开着的话下一轮任务开场就滑入(localStorage 记忆)。 */}
+              <label className={`ghost toggle${showBrowser ? " on" : ""}`}
+                     title="打开后自动化浏览器会滑入主屏（可随时再点收回）。只在屏幕上移动窗口，不影响取数；关闭时窗口藏在主屏之外，需要登录/验证码时仍会自动弹出">
+                <input type="checkbox" checked={showBrowser} onChange={toggleShowBrowser} />
+                👁 展示过程{showBrowser ? "（开）" : ""}
+              </label>
             </div>
             <div className="row dim" style={{ marginTop: 4 }}>
               默认昨天（每次打开/回到前台自动对齐；手动改过就按你选的走）；单日 = 只填这一天。

@@ -15,6 +15,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "kernel"))
 from merchant_report.events import HumanBridge          # noqa: E402
 from merchant_report import events as E                 # noqa: E402
+from merchant_report import stdin_router as SR          # noqa: E402
 
 
 class _NeverAnswers:
@@ -26,16 +27,31 @@ class _NeverAnswers:
 
 
 class _OneShot:
+    """只回一行, 之后**阻塞**。模拟真实管道: 读取线程是常驻的, 读不到就等着 ——
+    旧实现每次 wait 临时开一条读线程, 后续用例的临时线程会把本用例替身里剩下的行吃掉
+    (同一个 _OneShot 被两条线程读 → 断言拿不到), 那正是需求 F 要根治的"抢行"问题。"""
+
     def __init__(self, line):
         self._line = line
 
     def readline(self):
-        return self._line
+        if self._line is not None:
+            line, self._line = self._line, None
+            return line
+        time.sleep(30)
+        return ""
+
+
+def _fresh_router(stream):
+    """每个用例重置全局分发器, 并固定它读哪个流(不依赖 sys.stdin 的全局替换:
+    上一用例的常驻读取线程还在后台阻塞着, 换 sys.stdin 它也不会读了)。"""
+    SR._singleton = SR.StdinRouter(stream=stream)
 
 
 def test_timeout_returns_none():
     old = sys.stdin
     sys.stdin = _NeverAnswers()
+    _fresh_router(_NeverAnswers())
     try:
         t0 = time.time()
         r = HumanBridge(from_stdin=True).wait({"type": "need_human"}, timeout_s=0.5)
@@ -50,6 +66,7 @@ def test_timeout_returns_none():
 def test_normal_response():
     old = sys.stdin
     sys.stdin = _OneShot(json.dumps({"choice": "继续"}, ensure_ascii=False) + "\n")
+    _fresh_router(sys.stdin)
     try:
         r = HumanBridge(from_stdin=True).wait({"type": "need_human"}, timeout_s=5)
         assert r == {"choice": "继续"}, r
@@ -61,15 +78,19 @@ def test_normal_response():
 def test_wiring():
     assert getattr(E, "DEFAULT_WAIT_TIMEOUT_S", 0) >= 300, "必须有默认上限(不许无限等待)"
     src = inspect.getsource(E.HumanBridge.wait)
-    assert "daemon=True" in src, "读行必须放 daemon 线程(不阻塞进程退出)"
+    assert "daemon=True" not in src, \
+        "2026-10-14 起单读者红线: 不许再自己开 readline 线程(stdin 走常驻分发器)"
+    assert "stdin_router" in src, "要从常驻分发器取人工响应"
     assert "queue" in src and "timeout" in src, "必须走队列超时"
+    router_src = inspect.getsource(SR.StdinRouter)
+    assert "daemon=True" in router_src, "分发器的读取线程必须是 daemon(不阻塞进程退出)"
     # 三个关键等待点都传了 timeout(双开门 120 / 日期门 600 / 卡点面板 DEFAULT_TIMEOUT_S)
     from merchant_report import orchestrator as O
     from merchant_report import failure_ui as F
     so, sf = inspect.getsource(O), inspect.getsource(F)
     assert "timeout_s=120" in so and "timeout_s=600" in so, "双开门/日期门未传等待上限"
     assert "timeout_s=DEFAULT_TIMEOUT_S" in sf, "卡点面板未传等待上限"
-    print("✅ 接线: 默认上限 + daemon 线程 + 三个关键等待点全部传上限")
+    print("✅ 接线: 默认上限 + 常驻分发器(daemon) + 三个关键等待点全部传上限")
 
 
 def main():
