@@ -71,10 +71,10 @@ jobs:
           # 用 runner 自带完整 Python 装到 embed 的 site-packages(embed 自身不带 pip)
           python -m pip install --upgrade pip
           # playwright 锁版本: 未锁版会随 pip 静默漂移, 浏览器组件(chromium)随之下载不同版本, 出包不可复现。
-          # 2026-10-16 事故回退: 1.63.0(chromium v1243/Chrome for Testing 153.0.8010.12) 在淘宝"下载报表"瞬间
-          # 浏览器主进程必崩(SIGSEGV in BrowserMain; Mac 真机系统崩溃报告+Crashpad dump 双铁证, Windows 客户机同症状)
-          # → 回退 1.60.0(chromium v1223, Mac 真机同流程验证通过)。升级前必须真机跑一遍下载回归, 不能只看 CI 组件自检。
-          python -m pip install --target $target "playwright==1.60.0" openpyxl certifi
+          # 2026-10-16: Mac 内嵌运行时回退 1.60.0(修 mac 淘系下载崩溃, 见 mac 打包链); Windows 链保持 1.63.0 ——
+          # Windows 客户机原本正常(无自动关闭现象), 曾误改 1.60.0 导致首启重下浏览器组件(130MB)卡住, 已回退。
+          # 注意: mac/Windows 两客户端 playwright 版本可不同(分客户端处理), 改动任何一端前必须先真机跑下载回归。
+          python -m pip install --target $target "playwright==1.63.0" openpyxl certifi
           Write-Host "=== site-packages 体积 ==="
           "{0:N1} MB" -f ((Get-ChildItem $target -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
 
