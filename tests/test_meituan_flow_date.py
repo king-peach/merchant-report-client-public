@@ -190,6 +190,164 @@ def mk(page):
     return ad, logs
 
 
+def _relax_page(**kw):
+    """严格路径(面板候选 + td 标记)全空的假页; 只在**宽松找格** JS 上给出坐标。
+
+    真机 2026-09 背景(任务 M2): 流量页 18 店×2 轮全败, desc `... (未找到)` = `_day_candidates`
+    空 **且** `_MARK_DAY_JS` 标记 0 个 —— 第 1 击就找不到格子。宽松兜底是**放弃前**的最后手段。
+    """
+    p = FakePage(**kw)
+    relax = [{"x": 150.0, "y": 210.0, "cx": 135.0, "cy": 198.0, "w": 30.0, "h": 24.0,
+              "cls": "day-cell", "anc": " roo-datepicker-body", "chain": "td.day-cell"}]
+
+    def ev(js, arg=None):
+        if "out.length >= 5" in (js or ""):          # _RELAX_DAY_JS 的独有标记
+            return list(relax)
+        if "data-hm-day" in (js or ""):
+            return 0                                 # 严格标记路径 0 个
+        return FakePage.evaluate(p, js, arg)
+
+    p.evaluate = ev
+    return p
+
+
+def _count_all_clicks(p):
+    """把**每一次**鼠标点击都当"点到格子上"计数(配合 accepts=True 的页面模型)。"""
+    def _c(x, y=None):
+        p.mouse_clicks += 1
+        p.clicks += 1
+        p.tick("2026-09-30")
+    p.mouse.click = _c
+
+
+def test_m2_second_click_ladder():
+    """任务 M2: 第 2 击阶梯加固 —— 重解析瞬态(第 1 次空/第 2 次正常)必须**重试后成功**, desc 带 ×2。
+
+    真机证据(2026-10-15 ndjson): 对账页 desc `2026-09面13`(无 ×2 / 无(未找到)) = 第 2 击前
+    重新解析拿到空 → 旧代码直接 `return False`, 而**三条失败路径 desc 完全一样**, 远程分不清。
+    """
+    p = FakePage(accepts=True, inputs=False)          # 无日期输入框 → 跳过键入, 直落日历
+    _count_all_clicks(p)
+    ad, logs = mk(p)
+    cell = {"x": 150.0, "y": 210.0, "cx": 135.0, "cy": 198.0, "w": 30.0, "h": 24.0,
+            "d": "30", "cls": "", "anc": "", "attr": "2026-09-30", "dis": False,
+            "other": False, "_panel": (2026, 9), "_tail": False}
+    seq = [list([cell]), [], list([cell])]            # 第 1 次重解析空 → 第 2 次正常
+
+    def _cands(page, y, m, d):
+        return list(seq.pop(0)) if seq else list([cell])
+    ad._day_candidates = _cands
+    assert ad._set_flow_date(p, "2026-09-30") is True, logs
+    assert any("×2" in m and "已生效" in m for _, m in logs), f"成功 desc 必须带 ×2: {logs}"
+    assert p.clicks >= 2, "同一格必须点满两次"
+    print("✅ M2 第2击瞬态(重解析第1次空/第2次正常) → 重试后成功, desc 带 ×2")
+
+    # 三条失败路径必须**可区分**(真机远程排错靠它)
+    pair = inspect.getsource(MeituanAdapter._click_same_cell_twice)
+    pair_all = pair + inspect.getsource(MeituanAdapter._second_click_relax)
+    for tag in ("第1击未击发", "第2击重解析空", "第2击未击发"):
+        assert tag in pair_all, f"失败 desc 必须能区分路径: 缺 {tag}"
+    assert "_pick_anchored" in pair, "第 2 击必须走锚点选格(不许盲取 cands[0])"
+    assert "range(3)" in pair and "_pair_last_fail" in pair, "要有重解析重试 + 失败细节实例属性"
+    print("✅ M2 契约: 三条失败路径可区分 + 锚点选格 + 重解析重试 + _pair_last_fail")
+
+
+def test_m2_relaxed_fallback():
+    """任务 M2: 严格路径全空 → **宽松找格**兜底给坐标 → 成功(生效判定仍只认读回硬证据)。"""
+    p = _relax_page(accepts=True, inputs=False)
+    _count_all_clicks(p)
+    ad, logs = mk(p)
+    ad._day_candidates = lambda page, y, m, d: []      # 严格候选永远空
+    assert ad._set_flow_date(p, "2026-09-30") is True, logs
+    assert any("宽松" in m and "×2" in m for _, m in logs), f"desc 要标注宽松兜底: {logs}"
+    assert any("已生效" in m for _, m in logs), logs
+    print("✅ M2 宽松兜底: 严格全空 → 宽松坐标 → 两击 → 读回通过(放宽的只是找格手段)")
+
+    # 宽松也不中(页面不吃) → 未确认 + 失败 desc 注明「宽松亦未找到」, 绝不用默认日期冒充
+    p2 = _relax_page(accepts=False, inputs=False, values=["2026-09-29", "2026-09-29"])
+    _count_all_clicks(p2)
+    ad2, logs2 = mk(p2)
+    ad2._day_candidates = lambda page, y, m, d: []
+    assert ad2._set_flow_date(p2, "2026-09-30") is False, logs2
+    assert any("未确认" in m for _, m in logs2), logs2
+    src = inspect.getsource(MeituanAdapter._find_day_cell_relaxed)
+    assert "innerText" in MeituanAdapter._RELAX_DAY_JS and "5 <" not in MeituanAdapter._RELAX_DAY_JS, \
+        "宽松找格: innerText 精确相等 + 尺寸 5<w<64"
+    assert "old|other|prev|next|disabl" in MeituanAdapter._RELAX_DAY_JS, "宽松找格要跳邻月/禁用格"
+    assert "out.length >= 5" in MeituanAdapter._RELAX_DAY_JS, "宽松候选要有上限(~5)"
+    mark = inspect.getsource(MeituanAdapter._mark_day_cell)
+    assert "宽松亦未找到" in mark, "宽松兜底也失败时 desc 必须注明"
+    assert "_relax_day_forensics" in mark or "_relax_day_forensics" in \
+        inspect.getsource(MeituanAdapter._set_flow_date) or "_relax_day_forensics" in \
+        inspect.getsource(MeituanAdapter._set_bill_inputs), "现场包要含宽松几何取证"
+    print("✅ M2 契约: 宽松兜底(innerText/尺寸/跳邻月/上限5) + 失败注明 + 几何取证")
+
+
+class PackPage(FakePage):
+    """带 screenshot/frames/url 的假页(真 collect_diagnostic_pack 集成用例用)。"""
+
+    def screenshot(self, path=None, timeout=None):
+        raise RuntimeError("假件没有截图能力")
+
+    @property
+    def frames(self):
+        return []
+
+
+def test_m2_date_pack():
+    """任务 M2: 失败现场包 —— 每 phase 每轮**只写一次** + sink 出现「日期现场」日志 + 取证异常不崩。"""
+    import tempfile
+    import merchant_report.diagnose as diag
+
+    # ① monkeypatch: 断言只调一次 + extra 有 phase/date/readback + 🆘 日志
+    calls = []
+    orig = diag.collect_diagnostic_pack
+    diag.collect_diagnostic_pack = lambda page, step, err, ddir=None, extra=None: (
+        calls.append({"page": page, "step": step, "err": err, "ddir": ddir, "extra": extra}),
+        "/tmp/fake-diag.json")[1]
+    try:
+        p = FakePage(accepts=False, inputs=False, values=["", ""])
+        _count_all_clicks(p)
+        ad, logs = mk(p)
+        assert ad._set_flow_date(p, "2026-09-30") is False, logs
+        assert len(calls) == 1, f"每 phase 每轮只许写一次现场包: {len(calls)}"
+        assert calls[0]["step"] == "date-flow", calls[0]
+        extra = calls[0]["extra"]
+        assert extra["phase"] == "flow" and extra["date"] == "2026-09-30", extra
+        assert "readback" in extra and "candidates_n" in extra and "heads" in extra, extra
+        assert any("日期现场" in m for _, m in logs), logs
+        # 第二次(同一实例, 同一 phase) → 只记路径不重写
+        assert ad._date_pack(p, "flow", "2026-09-30", {"x": 1}) == ""
+        assert len(calls) == 1, "同 phase 第二次不许重写(避免刷文件)"
+        # bill phase 独立一次
+        ad._date_pack(p, "bill", "2026-09-30", {"x": 1})
+        assert len(calls) == 2 and calls[1]["step"] == "date-bill", calls
+
+        # ② 取证自身抛异常 → 主流程照常返回 False, 不崩、不记 🆘
+        diag.collect_diagnostic_pack = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        p2 = FakePage(accepts=False, inputs=False, values=["", ""])
+        _count_all_clicks(p2)
+        ad2, logs2 = mk(p2)
+        assert ad2._set_flow_date(p2, "2026-09-30") is False, logs2
+        assert not any("日期现场" in m for _, m in logs2), logs2
+        print("✅ M2 现场包: 每 phase 一次 + extra 字段齐 + 🆘 日志; 取证抛异常 → 主流程照常 False")
+    finally:
+        diag.collect_diagnostic_pack = orig
+
+    # ③ 真 collect_diagnostic_pack + 缺截图能力的假页 → 静默跳过, 落盘到 download_dir, 不抛
+    d = tempfile.mkdtemp(prefix="mtm2-")
+    p3 = PackPage(accepts=False, inputs=False, values=["", ""])
+    _count_all_clicks(p3)
+    ad3, logs3 = mk(p3)
+    ad3.download_dir = d
+    assert ad3._set_flow_date(p3, "2026-09-30") is False, logs3
+    import os
+    files = sorted(os.listdir(d))
+    assert any(f.startswith("diag_date-flow") and f.endswith(".json") for f in files), files
+    assert any("日期现场" in m for _, m in logs3), logs3
+    print(f"✅ M2 现场包落盘(缺 screenshot 也不抛): {files}")
+
+
 def main():
     # ① 面板点满两次 → 输入框拿到目标日期 → 判「已生效」
     p = FakePage(accepts=True)
@@ -237,16 +395,27 @@ def main():
     assert p4.values == ["2026-09-30", "2026-09-30"], p4.values
     print(f"✅ 跨月: 2026十月 →(单月chevron)→ 2026九月 → 点两次格子 → 生效")
 
-    # ⑥ 2026-10-15 任务 J: 键入**生效**的那一态 —— 不该再进日历(省时且避免面板副作用)
-    p5 = FakePage(accepts=False, values=["", ""], type_sticks=True)
+    # ⑥ 2026-10-15 任务 M4: 本页**键入已停用**(探针实测读回恒 ['','']) → 绝不再键入;
+    #    窗口内的日子一律走日历。这里把 `_flow_type_dates` 换成"调用即炸"来钉死这点。
+    p5 = FakePage(accepts=True, values=["", ""], type_sticks=True)
     ad5, logs5 = mk(p5)
+    _boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("_flow_type_dates 不得再被调用"))
+    ad5._flow_type_dates = _boom
+
+    class AutoTick5(FakeLocator):
+        def click(self, timeout=None):
+            self.page.clicks += 1
+            self.page.tick("2026-09-30")
+            return None
+
+    p5.locator = lambda sel: AutoTick5(p5, p5.values) if "data-hm-day" in sel else FakeInputs(p5, p5.values)
     assert ad5._set_flow_date(p5, "2026-09-30") is True, logs5
     assert p5.values == ["2026-09-30", "2026-09-30"], p5.values
-    assert p5.clicks == 0, "键入已生效时不该再点日格子"
-    assert any("键入" in m and "已生效" in m for _, m in logs5), logs5
-    print("✅ 键入态: 输入框吃键入 → 直接生效(不进日历, 不点格子)")
+    assert p5.typed == [], f"任务 M4: 流量页不得再键入任何字符: {p5.typed}"
+    assert not any("键入" in m for _, m in logs5), f"不该再有键入相关日志: {logs5}"
+    print("✅ 任务M4: 流量页键入已停用(不键入、无键入日志) → 窗口内直接走日历")
 
-    # ⑦ 2026-10-15 任务 J: 键入**不生效**的那一态(真机 10-14) → 必须自动落到日历兜底
+    # ⑦ 2026-10-15 任务 J/M4: 窗口内 → 自动落日历点选(硬证据 = 输入框读回 == 目标日)
     p6 = FakePage(accepts=True, values=["", ""], type_sticks=False)
     ad6, logs6 = mk(p6)
 
@@ -258,17 +427,16 @@ def main():
 
     p6.locator = lambda sel: AutoTick6(p6, p6.values) if "data-hm-day" in sel else FakeInputs(p6, p6.values)
     assert ad6._set_flow_date(p6, "2026-09-30") is True, logs6
-    assert any("键入未生效" in m for _, m in logs6), f"键入失败必须留证: {logs6}"
-    assert any("日历点选" in m for _, m in logs6), logs6
+    assert any("日历点选" in m and "已生效" in m for _, m in logs6), logs6
     assert p6.values == ["2026-09-30", "2026-09-30"], p6.values
-    print("✅ 键入不生效 → 自动落日历点选(两态建模; 真机 10-14 就是这一态)")
+    print("✅ 窗口内 → 日历点选(同一格两击)生效(真实机 10-15 那一态)")
 
-    # ⑦' 两态都不成 → 未确认(留空), 绝不用默认日期的数据冒充
+    # ⑦' 日历也不成 → 未确认(留空), 绝不用默认日期的数据冒充
     p7 = FakePage(accepts=False, values=["", ""], type_sticks=False)
     ad7, logs7 = mk(p7)
     assert ad7._set_flow_date(p7, "2026-09-30") is False, logs7
     assert any("未确认" in m for _, m in logs7), logs7
-    print("✅ 键入+日历都不成 → 「未确认」(调用方留空)")
+    print("✅ 日历不成 → 「未确认」(调用方留空)")
 
     # ⑧ 关键: 调用方(capture_circle)必须在未确认时放弃该店, 不能继续抓
     src = inspect.getsource(mt.MeituanAdapter.capture_circle)
@@ -294,11 +462,24 @@ def test_click_twice_contract():
     assert "_FLOW_INPUTS_JS" in inspect.getsource(MeituanAdapter._flow_inputs) \
         and "开始时间" in MeituanAdapter._FLOW_INPUTS_JS, \
         "日期控件必须按 placeholder 开始/结束时间 探测(本页两框默认为空)"
-    assert "_flow_type_dates" in src, "① 必须先试直接键入"
+    assert "self._flow_type_dates(" not in src, \
+        "任务 M4: 流量页键入必败(探针读回恒 ['','']) → 调用已停用, 不许再回到调用方 (说明性文字可留)"
+    assert "勿再调用" in inspect.getsource(MeituanAdapter._flow_type_dates), \
+        "停用的 _flow_type_dates 要留 docstring 说明(勿再调用)"
     assert "_flow_verified" in src, "读回验证必须走统一的硬证据函数"
     assert "已选时间" in inspect.getsource(MeituanAdapter._flow_verified), \
         "第二证据(页面「已选时间：」文本)必须保留"
     assert "_flow_read" in src, "控制台/失败分支要能读到当前输入框值(取证)"
+    # 任务 M4: 窗口前置判定(窗外 = 页面限制 → 一行日志秒退, 不翻月/不点击/不键入/不写重取证包)
+    assert "_flow_date_reachable" in src, "必须**先**判窗口(窗外 = 客观取不到)"
+    assert src.index("_flow_date_reachable") < src.index("_flow_open_custom"), \
+        "判窗必须在翻月/开面板**之前**(逐店反复试探客观取不到的日期只是白烧时间)"
+    assert "_flow_window_msg" in src and "宁缺勿假" in inspect.getsource(MeituanAdapter._flow_window_msg), \
+        "窗外只留一行 warn 说清(商圈TOP10 留空·宁缺勿假)"
+    assert "_flow_day_disabled" in src, "窗内也要防窗口边缘误判(目标日格全 disabled → 一行日志返回)"
+    reach_bounds = inspect.getsource(mt._flow_window_bounds)
+    assert "FLOW_WINDOW_DAYS" in reach_bounds and "days=1" in reach_bounds, \
+        "窗口规则 = [今天-30, 今天-1](含边界)"
     # 日历兜底(点两次同一格 + Esc 清场重来)
     assert "_click_same_cell_twice" in src, "日历兜底必须走成对点选(同一格两击)"
     pair = inspect.getsource(MeituanAdapter._click_same_cell_twice)
@@ -348,5 +529,8 @@ def test_visible_month_parse():
 
 if __name__ == "__main__":
     main()
+    test_m2_second_click_ladder()
+    test_m2_relaxed_fallback()
+    test_m2_date_pack()
     test_click_twice_contract()
     test_visible_month_parse()

@@ -96,6 +96,25 @@ function dayFailShort(day: string, results: OneClickResult[]): string {
     .map((r) => PLATFORM_SHORT[r.platform] ?? r.platform).join("、");
 }
 
+/** 失败短原因: 优先 message(压缩空白, 超 40 字截断)，退回 error_code */
+function shortFail(e: any): string {
+  const m = String(e?.message || "").replace(/\s+/g, " ").trim();
+  if (m) return m.length > 40 ? m.slice(0, 40) + "…" : m;
+  return e?.error_code || "失败";
+}
+
+/** 某天失败原因（按原因分组去重，如 `美团/管家失败: 模板被占用`；多组用；连接） */
+function dayFailNotes(day: string, results: OneClickResult[]): string {
+  const groups = new Map<string, string[]>();
+  results.filter((r) => r.day === day && !r.ok).forEach((r) => {
+    const key = r.err || "未明原因";
+    const plats = groups.get(key);
+    if (plats) plats.push(PLATFORM_SHORT[r.platform] ?? r.platform);
+    else groups.set(key, [PLATFORM_SHORT[r.platform] ?? r.platform]);
+  });
+  return [...groups.entries()].map(([reason, plats]) => `${plats.join("/")}失败: ${reason}`).join("；");
+}
+
 // ---------- 类型 ----------
 type StepState = "running" | "ok" | "failed" | "skipped" | null;
 interface Step { id: string; name: string; state: StepState; detail?: string; elapsed_s?: number; error_code?: string }
@@ -135,6 +154,8 @@ const ERROR_TEXT: Record<string, string> = {
   E_TASK_SLOW: "报表生成较慢，可继续等待或取消",
   E_SELECTOR_MISSING: "页面可能已改版，AI 正在分析原因…",
   E_FILE_LOCKED: "模板被 Excel 占用，请关闭后重试",
+  E_TEMPLATE_LOCKED: "模板被其他程序占用（Excel/WPS 未完全退出），关闭后重试",
+  E_FILL_FAIL: "写入失败（详细原因见下方日志）",
   E_CHECKSUM_FAIL: "数据校验未通过，请核对",
   E_LOGIN_TIMEOUT: "登录等待超时，请重试",
   E_NO_REPORT: "未找到指定日期的报表文件",
@@ -315,8 +336,12 @@ export default function App() {
         allDone.current += 1;
         allResults.current.push({
           day, platform, ok: !!e.ok,
-          err: e.ok ? "" : (e.error_code || e.message || "失败"),
+          err: e.ok ? "" : shortFail(e),
         });
+        // 即时失败日志: 出结果即打出可读原因(汇总要等全部跑完, 这里先让用户看到)
+        if (!e.ok) {
+          setLogs((l) => [...l, `  ❌ ${PLATFORM_LABEL[platform] ?? platform} 失败: ${shortFail(e)}`]);
+        }
         const next = allQueue.current.shift();
         if (next) {
           window.setTimeout(() => { if (!aborted.current) void launch(next, false); }, 1200);
@@ -354,7 +379,7 @@ export default function App() {
             setLogs((l) => [...l,
               "━━━ 时间段跑完 · 汇总 ━━━",
               ...ranDays.map((d, i) => `  ${shortDay(d)}: ${marksByDay[i]}`
-                + (failsByDay[i] ? `（${failsByDay[i]}失败）` : "")),
+                + (failsByDay[i] ? `（${dayFailNotes(d, allResults.current) || `${failsByDay[i]}失败`}）` : "")),
               `  共 ${dayTotal} 天 × ${PLATFORM_ORDER.length} 平台 = ${total} 任务：`
               + `${okTotal} 成功 / ${failList.length} 失败`
               + (failList.length ? `（${failList.join("、")}）` : ""),
@@ -376,7 +401,9 @@ export default function App() {
     } else if (e.type === "task_exit") {
       setRunning(false); clearHumanTimer();
       if (e.stderr_tail?.length) {
-        setLogs((l) => [...l, "── 内核诊断输出 ──", ...e.stderr_tail]);
+        // 标签化: 内核退出事件可能晚于下一任务启动(跨任务串台), 标出平台+日期消除歧义
+        const who = `${PLATFORM_SHORT[e.platform] ?? e.platform ?? ""}${e.date ? "·" + e.date : ""}`;
+        setLogs((l) => [...l, who ? `── 内核诊断输出（${who}）──` : "── 内核诊断输出 ──", ...e.stderr_tail]);
       }
     }
   });

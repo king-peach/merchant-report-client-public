@@ -29,6 +29,49 @@ def _poll_window():
         pass
 
 MEITUAN_HOME = "https://e.waimai.meituan.com/"
+
+# 流量页日期控件的**可取窗口**: 美团只给最近 30 天 `[今天-30, 今天-1]`(本地日期), 格子 < 今天-30
+# 带 `disabled`、点击无效; 且本页**键入/React 合成注入全死**(探针实测读回恒 ['','']) —— 滑出窗口
+# 的日期就是客观取不到(页面限制, 不是故障)。所以在**动手之前**判窗, 秒级跳过并留一行日志说清楚。
+# 2026-10-15 真机探针: 今日=10-15 时窗口 = [9-15, 10-14]; 9-13/9-14 已滑出 → 商圈TOP10 客观不可取。
+FLOW_WINDOW_DAYS = 30
+
+# 对账页日期失败现场的三种**可区分** reason(任务 M4 要求远程排障一眼分清):
+#   · 键入3遍未收敛 → 单独一行日志(`🖱 对账页键入3遍未收敛`) + 现场包 `typing_readback` 字段;
+#   · 日历兜底失败 → `_CAL_FAIL`;
+#   · 日格禁用     → `_DISABLED`(客观不可点, 不换轮重试)。
+_CAL_FAIL = "日历兜底失败"
+_DISABLED = "日格禁用"
+
+
+def _flow_date_reachable(date_str, today=None):
+    """`date_str`(YYYY-MM-DD)是否落在流量页日期控件可取窗口 `[今天-30, 今天-1]` 内(含边界)。
+
+    纯日期函数(无页面依赖, 好测): 解析不了 → False(宁缺勿假, 不猜)。
+    `today` 可注入(`datetime.date` 或 "YYYY-MM-DD"), 缺省用本地今天。
+    """
+    try:
+        if today is None:
+            today = datetime.date.today()
+        elif isinstance(today, str):
+            today = datetime.date(*[int(x) for x in today.split("-")])
+        d = datetime.date(*[int(x) for x in str(date_str).split("-")])
+    except Exception:
+        return False
+    return (today - datetime.timedelta(days=FLOW_WINDOW_DAYS)) <= d <= (today - datetime.timedelta(days=1))
+
+
+def _flow_window_bounds(today=None):
+    """窗口两端 `(min, max)` 的字符串形式(给日志用; 纯函数, 无页面依赖)。"""
+    if today is None:
+        today = datetime.date.today()
+    elif isinstance(today, str):
+        today = datetime.date(*[int(x) for x in today.split("-")])
+    lo = today - datetime.timedelta(days=FLOW_WINDOW_DAYS)
+    hi = today - datetime.timedelta(days=1)
+    return lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
+
+
 # 报表页可独立打开(无需主站外壳); 生成走 UI(裸 fetch 直调被签名/时效挡: code:500), 取文件走 ctx.request
 REPORT_URL = "https://waimaieapp.meituan.com/igate/bizdata/report/download"
 # SPA 壳体入口(/igate 是 iframe 端点: 未认证时只回 {'method':'logon'} 脚本, 页面会白屏)
@@ -758,9 +801,46 @@ class MeituanAdapter:
         return True
 
     def _pair_desc(self, cell, y, m):
-        """候选格的人话描述(真机日志定位用): 「2026-09面8」/「2026-09面8(尾)」(尾=邻月尾巴格)。"""
+        """候选格的人话描述(真机日志定位用): 「2026-09-8」/「2026-09-8(尾)」(尾=邻月尾巴格)。
+
+        2026-10-15 任务 M2: 原描述用 `面` 当分隔符(形如 `2026-09面NN`) —— 纯文案 bug(用户读日志被干扰),
+        统一改常规 `-` 分隔。本方法同时服务下载页 `_pick_day_cell` 与日历成对点选, 语义未变。
+        """
         panel = cell.get("_panel") or (y, m)
-        return f"{panel[0]}-{panel[1]:02d}面{cell.get('d')}" + ("(尾)" if cell.get("other") else "")
+        return f"{panel[0]}-{panel[1]:02d}-{cell.get('d')}" + ("(尾)" if cell.get("other") else "")
+
+    @staticmethod
+    def _cell_key(cell):
+        """格子的**身份键**(面板月 + 日 + 尾巴标记) —— 第 2 击必须落回第 1 击那**同一个格**。
+
+        抽成公共小助手: 下载页 `_pick_day_cell` 与 `_click_same_cell_twice` 的锚点匹配共用,
+        避免两套锚点逻辑分叉(任务 M2 要求)。
+        """
+        c = cell or {}
+        return (c.get("_panel"), c.get("_tail"), str(c.get("d")))
+
+    def _pick_anchored(self, cands, anchor_key, idx=0, fallback=None):
+        """新快照里按**锚点**找第 1 击那一格(绝不静默换格, 换格会凑出跨月错对)。
+
+        两级匹配(任务 M2 的"锚点"口径):
+          ① 精确身份键 `(面板月, 尾巴标记, 日)` 全等;
+          ② 同面板月 + 同日, 优先非邻月尾巴(重渲染后尾巴标记可能翻转);
+          ③ 仍无 → 同下标 → `fallback`(第 1 击那一格本身)。Returns: cell 或 None。
+        """
+        cands = cands or []
+        for c in cands:
+            if self._cell_key(c) == anchor_key:
+                return c
+        if anchor_key:
+            pm, _tail, d = anchor_key
+            same = [c for c in cands
+                    if tuple(c.get("_panel") or ()) == tuple(pm or ()) and str(c.get("d")) == d]
+            if same:
+                same.sort(key=lambda c: 1 if c.get("other") else 0)
+                return same[0]
+        if idx is not None and idx < len(cands):
+            return cands[idx]
+        return fallback
 
     def _log_attempt(self, n, desc, pair):
         """一行一次成对尝试(**成败都记**, 含整对读回值) —— 下次远程只看这一行就能定位。"""
@@ -769,26 +849,64 @@ class MeituanAdapter:
         except Exception:
             pass
 
-    def _pick_day_cell(self, page, y, m, d, cands, idx):
+    def _date_pack(self, page, phase, date, extra):
+        """日期失败**现场包**(任务 M2): 截图 + 脱敏 DOM + 页面文本 + 自定义 extra。
+
+        复用 `diagnose.collect_diagnostic_pack`(orchestrator/taobao 都在用), 不自造轮子。
+        · `phase` = "bill" / "flow"; 每个 phase **每轮运行只写一次**(`self._date_pack_done`),
+          后续失败只记路径不重写(避免刷文件);
+        · 本函数 try/except 包死 —— **取证自身任何异常绝不许影响主流程**(失败返回 "")。
+        Returns: 现场包路径(或已写过时的旧路径 / 写失败时的 "")。
+        """
+        try:
+            done = getattr(self, "_date_pack_done", None)
+            if done is None:
+                done = self._date_pack_done = set()
+            if phase in done:
+                return ""
+            done.add(phase)
+            ddir = getattr(self, "download_dir", None) or ""
+            payload = {"phase": phase, "date": date}
+            payload.update(extra or {})
+            from ..diagnose import collect_diagnostic_pack
+            path = collect_diagnostic_pack(page, f"date-{phase}",
+                                           f"日期设置失败({phase} {date})", ddir, extra=payload)
+            if path:
+                try:
+                    self.sink.log(f"🆘 日期现场已保存: {path}（请发给开发）", level="warn")
+                except Exception:
+                    pass
+            return path or ""
+        except Exception:
+            return ""
+
+    def _pack_extra(self, page, **kw):
+        """现场包 extra 的公共字段(真实有什么给什么): 可见月标题 / 候选数与前 8 条 / 读回值。"""
+        out = dict(kw)
+        try:
+            heads = page.evaluate(self._HEADS_JS) or []
+        except Exception:
+            heads = []
+        out["heads"] = heads
+        return out
+
+    def _pick_day_cell(self, page, y, m, d, cands, idx, anchor_key=None):
         """第 2 击前的**重新解析**(坐标不缓存、不复用旧值) —— 必须落回第 1 击那**同一个格**。
 
-        锚点 = 第一击候选的(面板月 + 日 + 尾巴标记); 在击发那一刻的新快照里按锚点找同格
-        (面板重渲染后尾巴偏移/行序变化也能找到); 新快照解析不出 → 同下标 → 最后退回锚点本身,
-        **绝不换到别的格**。Returns: (x, y, desc) 或 None。
+        锚点 = 第一击那一刻记录的(面板月 + 日 + 尾巴标记)(调用方传入的 `anchor_key`, 缺省退回
+        `cands[idx]`); 在击发那一刻的新快照里按锚点找同格(面板重渲染后尾巴偏移/行序变化也能找到);
+        新快照解析不出 → 同下标 → 最后退回锚点本身, **绝不换到别的格**。Returns: (x, y, desc) 或 None。
         """
         if not cands or idx >= len(cands):
             return None
         anchor = cands[idx]
-        at = (anchor.get("_panel"), anchor.get("_tail"))
         try:
             fresh = self._day_candidates(page, y, m, d)              # ← 重新解析(每次击发前)
         except Exception:
             fresh = []
-        for c in fresh:
-            if (c.get("_panel"), c.get("_tail")) == at:
-                return (c["x"], c["y"], self._pair_desc(c, y, m))
-        if idx < len(fresh):
-            return (fresh[idx]["x"], fresh[idx]["y"], self._pair_desc(fresh[idx], y, m))
+        c = self._pick_anchored(fresh, anchor_key or self._cell_key(anchor), idx, fallback=anchor)
+        if c is not anchor:
+            return (c["x"], c["y"], self._pair_desc(c, y, m))
         return (anchor["x"], anchor["y"], self._pair_desc(anchor, y, m))
 
     def _pair_flow(self, page, df, dt, limit_s=None):
@@ -801,6 +919,9 @@ class MeituanAdapter:
         """
         y, m, d = (int(x) for x in df.split("-"))
         dy, dm, dd = (int(x) for x in dt.split("-"))
+        # 任务 M2: 第 1 击的锚点(面板月+尾巴+日)按 **df** 记录 —— 面板重渲染后第 2 击靠它在
+        # 新快照里落回**同一个格**; 解析不出日历候选时退回"同下标", 最后退回第 1 击那一格本身。
+        pair_anchor = [None]
         deadline = time.time() + (limit_s or self._DATE_WALL_S)
         for attempt in range(1, 4):                                  # 每轮大轮候选 <=3
             if time.time() > deadline:
@@ -835,6 +956,7 @@ class MeituanAdapter:
                     self._open_picker(page)
                 if not self._click_at(page, c["x"], c["y"], "df格"):
                     continue
+                pair_anchor[0] = self._cell_key(c)                    # 第 1 击的锚点(任务 M2)
                 time.sleep(0.5)                                       # 沿用 0.4~0.6s 级, 不许加长
                 desc = f"{self._pair_desc(c, y, m)} ×2"
                 # 少数版本的组件**单击即成**(single_click_completes): 整对已达成 → 到此为止, 不补第 2 击。
@@ -849,7 +971,7 @@ class MeituanAdapter:
                 self._arm_end(page)                                   # ③ 点结束框(配方)
                 time.sleep(0.4)
                 if dt == df:                                          # ④ 同一格再点一次(第 2 击=终点)
-                    second = self._pick_day_cell(page, y, m, d, cands, idx)
+                    second = self._pick_day_cell(page, y, m, d, cands, idx, pair_anchor[0])
                 else:                                                 # 通用: 第 2 击点 dt 的候选
                     tc = self._day_candidates(page, dy, dm, dd)
                     if not tc:
@@ -1856,6 +1978,33 @@ class MeituanAdapter:
             txt = ""
         return any(f"已选时间：{d}" in txt for d in self._date_variants(date))
 
+    def _flow_today(self):
+        """窗口判定的"今天" —— 独立方法(子类/测试可覆盖, 免得到处直调 `datetime.date.today`)。"""
+        return datetime.date.today()
+
+    def _flow_window_msg(self, date):
+        """窗外/禁用日格那**唯一一行** warn 日志(措辞对齐任务 M4 规格, 可 grep 复验)。"""
+        lo, hi = _flow_window_bounds(self._flow_today())
+        return (f"📅 流量页: {date} 超出美团可取窗口(最近30天: {lo}~{hi})"
+                f" → 商圈TOP10 留空(宁缺勿假)")
+
+    def _flow_day_disabled(self, page, y, m, d):
+        """目标日格是否"存在但**全部** disabled"(任务 M4: 窗外/窗口边缘的日子就是这个样子)。
+
+        真机 10-15 探针: 窗外日格带 `disabled` 类、点击无效。注意 `_day_candidates` **已按 `dis`
+        过滤**禁用格(所以它看不见这一态), 本方法读**原始**可见日格快照(含 `dis`)判:
+          · 有目标日格, 且全部 `dis` → True(调用方按"窗口外"处理: 一行日志返回, 不点不试);
+          · 一个格子都没解析出来 → False("不知道" ≠ "不能用", 交既有失败路径取证)。
+        """
+        try:
+            _panels, cells = self._cal_state(page)
+        except Exception:
+            return False
+        hit = [c for c in (cells or []) if str(c.get("d")) == str(d)]
+        if not hit:
+            return False
+        return all(c.get("dis") for c in hit)
+
     def _flow_dump_controls(self, page):
         """现场取证: 日期区附近的候选控件(文案+类名) —— 远程没有真 DOM, 不许瞎猜。"""
         try:
@@ -1884,7 +2033,12 @@ class MeituanAdapter:
             pass
 
     def _flow_type_dates(self, page, date):
-        """直接键入两框(每框: 点 → Ctrl+A → 键入 → Enter), 再失焦提交 → 读回验证。"""
+        """直接键入两框(每框: 点 → Ctrl+A → 键入 → Enter), 再失焦提交 → 读回验证。
+
+        ⚠️ 2026-10-15 真机探针实测本页键入**必败**(读回恒 `['','']`: roo range 控件不吃键入,
+        React 受控输入也不认程序写入; 页面无 localStorage 日期键、无其它入口) —— 已**停用**,
+        `_set_flow_date` 不再调用本方法。保留实现仅供排查/取证参考, **勿再调用**。
+        """
         ins = self._flow_inputs(page)
         if len(ins) < 2:
             return False
@@ -1955,10 +2109,23 @@ class MeituanAdapter:
                 return cur == want
             box = page.evaluate("""(fwd) => {
                 const want = fwd ? 'chevron-right' : 'chevron-left';
+                const vis = e => { const r = e.getBoundingClientRect();
+                                   return r.width > 0 && r.height > 0; };
+                // 任务 M4: 页面**其它位置**也有 chevron-left 图标(探针第一次就因点错把面板点关了)
+                // → 翻月用的 chevron 必须限定在**可见面板矩形**内(面板 bbox 扩 2px 边距)。
+                const rects = [...document.querySelectorAll(
+                    '.roo-datepicker-body, .roo-datepicker-panel, .roo-datepicker')]
+                  .filter(vis).map(e => { const r = e.getBoundingClientRect();
+                                          return {x0: r.x - 2, y0: r.y - 2, x1: r.right + 2, y1: r.bottom + 2}; });
+                const inPanel = e => {
+                    if (!rects.length) return true;      // 拿不到面板矩形 → 退回旧口径(不硬失败)
+                    const r = e.getBoundingClientRect(); const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+                    return rects.some(b => cx >= b.x0 && cx <= b.x1 && cy >= b.y0 && cy <= b.y1);
+                };
                 const cands = [...document.querySelectorAll('i.roo-icon')]
                   .filter(e => { const c = String(e.className);
                                  return c.indexOf(want) >= 0 && c.indexOf('double') < 0; })
-                  .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+                  .filter(vis).filter(inPanel);
                 if (!cands.length) return null;
                 cands.sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
                 const el = fwd ? cands[cands.length - 1] : cands[0];
@@ -1970,8 +2137,60 @@ class MeituanAdapter:
             time.sleep(1.0)
         return False
 
+    # 宽松找格(任务 M2 兜底): 严格路径(面板感知候选 + td 标记)全空时, 才用它 —— 放宽的只是
+    # "找格"手段(任意可见的、尺寸像格子的、文本==目标日 的元素), **生效判定仍只认读回硬证据**。
+    _RELAX_DAY_JS = """(o) => {
+      const day = String(o.day);
+      const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const out = [];
+      const all = document.querySelectorAll('td, li, a, span, div, button');
+      for (const e of all) {
+        if (out.length >= 5) break;
+        const r = e.getBoundingClientRect();
+        if (!(r.width > 5 && r.width < 64 && r.height > 5 && r.height < 64)) continue;
+        if (!vis(e)) continue;
+        const txt = ((e.innerText || e.textContent) || '').trim();
+        if (txt !== day) continue;
+        if (e.disabled || e.getAttribute('aria-disabled') === 'true') continue;
+        let cls = '';
+        for (let p = e, i = 0; p && i < 4; i++, p = p.parentElement) cls += ' ' + String(p.className || '');
+        if (/old|other|prev|next|disabl/i.test(cls)) continue;
+        out.push({x: r.x + r.width / 2, y: r.y + r.height / 2, cx: r.x, cy: r.y,
+                  w: r.width, h: r.height, cls: String(e.className || '').slice(0, 80),
+                  anc: cls.slice(0, 200),
+                  chain: [...(function(){ const a = []; for (let p = e, i = 0; p && i < 4; i++, p = p.parentElement)
+                             a.push((p.tagName || '') + '.' + String(p.className || '').slice(0, 40)); return a; })()].join(' > ')});
+      }
+      return out;
+    }"""
+
+    def _find_day_cell_relaxed(self, page, y, m, day):
+        """宽松找格(任务 M2): 任意可见元素的 innerText == day 且尺寸像格子 → 返回候选列表(<=5)。
+
+        只在严格路径(面板感知 `_day_candidates` + `_MARK_DAY_JS` 标记)全空时才用。
+        往返:**找格放宽, 生效判定不放宽** —— 调用方点一个就立刻读回, 读回不对就试下一个候选。
+        """
+        try:
+            return page.evaluate(self._RELAX_DAY_JS, {"day": str(day)}) or []
+        except Exception:
+            return []
+
+    def _relax_day_forensics(self, page, y, m, day):
+        """宽松兜底也失败时的现场:**面板区域含目标日文本元素的几何+类名+祖先链**(给下一轮真机)。"""
+        try:
+            els = page.evaluate(self._RELAX_DAY_JS, {"day": str(day)}) or []
+            return [{"x": round(e.get("x") or 0), "y": round(e.get("y") or 0),
+                     "w": round(e.get("w") or 0), "h": round(e.get("h") or 0),
+                     "cls": e.get("cls"), "chain": e.get("chain")} for e in els[:5]]
+        except Exception:
+            return []
+
     def _mark_day_cell(self, page, y, m, day):
-        """给目标日格子打标记 → (kind, handle, desc)。kind: 'coord' / 'loc' / None(没找到)。"""
+        """给目标日格子打标记 → (kind, handle, desc)。kind: 'coord' / 'loc' / 'relax' / None(没找到)。
+
+        任务 M2 顺序(硬→软): `_day_candidates` → `_MARK_DAY_JS` → **宽松兜底**;
+        失败 desc 用常规 `-` 分隔(旧文案里的 `面` 是纯 bug, 已修)。
+        """
         try:
             cands = self._day_candidates(page, y, m, day) or []
         except Exception:
@@ -1984,47 +2203,125 @@ class MeituanAdapter:
             n = page.evaluate(self._MARK_DAY_JS, {"day": str(day), "iso": iso})
         except Exception:
             n = 0
-        if not n:
-            return None, None, f"{y}-{m:02d}面{day}(未找到)"
-        try:
-            return "loc", page.locator('[data-hm-day="1"]').first, f"{y}-{m:02d}面{day}"
-        except Exception:
-            return None, None, f"{y}-{m:02d}面{day}(定位失败)"
+        if n:
+            try:
+                return "loc", page.locator('[data-hm-day="1"]').first, f"{y}-{m:02d}-{day:02d}"
+            except Exception:
+                return None, None, f"{y}-{m:02d}-{day:02d}(定位失败)"
+        # 宽松兜底(最后; 只有前面两级全空才走)
+        relax = self._find_day_cell_relaxed(page, y, m, day)
+        if relax:
+            return "relax", relax, f"{y}-{m:02d}-{day:02d}(宽松候选{len(relax)})"
+        return None, None, f"{y}-{m:02d}-{day:02d}(未找到·宽松亦未找到)"
 
-    def _click_same_cell_twice(self, page, y, m, day):
+    def _click_same_cell_twice(self, page, y, m, day, verify=None):
         """成对点选: **同一格两击**(第1击=起点, 第2击=终点); 序列内零验证、不换格。
 
         第 2 击前**重新解析**(面板可能重渲染): 坐标路径按锚点(面板月+日+尾巴标记)落回同一格,
         标记路径沿用同一个 locator(同一 DOM 节点) —— 绝不换到别的格(换格会凑出跨月错对)。
         两击都击发成功 → True。
+
+        2026-10-15 任务 M2 加固(真机 2026-09 对账页: desc `2026-09面NN` 两轮全败, 远端分不清
+        是三条失败路径里的哪一条): 第 2 击改为**阶梯** ——
+          ① 重新解析最多 3 次 × 0.5s 直到非空(面板重渲染的瞬态);
+          ② 按锚点选格(见 `_pick_anchored`), 不盲取 `cands[0]`;
+          ③ 仍空**且**第 1 击是 coord 路径 → **重击同一坐标**一次(面板静止时同格同点; 读回验证兜底);
+          ④ 仍败 → 返回 False 并写 `self._pair_last_fail`(供现场包), desc 追加**可区分**的失败路径标记。
+        只加冗余, 不改语义: 成功路径 desc 仍以 ` ×2` 收尾。
+
+        `verify`: 可选的零参回调(调用方的**读回硬证据**) —— 仅用于"宽松候选依次试": 点一个候选
+        (两击)后立刻读回, 任一候选让整体验证通过即算成功; 全不中为止。默认 None 时只点首个候选。
         """
         kind, handle, desc = self._mark_day_cell(page, y, m, day)
         if kind is None:
             return False, desc
+        first_state = {}
         try:
             if kind == "coord":
+                first_state = {"path": "coord", "xy": [handle[0], handle[1]]}
                 page.mouse.click(handle[0], handle[1])
+            elif kind == "relax":
+                first_state = {"path": "relax", "xy": [handle[0]["x"], handle[0]["y"]],
+                               "n": len(handle)}
+                page.mouse.click(handle[0]["x"], handle[0]["y"])
             else:
+                first_state = {"path": "loc", "sel": '[data-hm-day="1"]'}
                 handle.click(timeout=6000)
-        except Exception:
-            return False, desc
+        except Exception as e:
+            self._pair_last_fail = {"path": "第1击未击发", "desc": desc, "err": str(e)[:80]}
+            return False, f"{desc}（第1击未击发）"
         time.sleep(0.6)
-        # 第 2 击
+        # ---- 第 2 击(阶梯加固) ----
+        if kind == "relax":
+            return self._second_click_relax(page, handle, desc, first_state, verify)
         try:
             if kind == "coord":
-                cands = self._day_candidates(page, y, m, day) or []
+                cands = []
+                for _try in range(3):                                  # ① 重解析最多 3 次
+                    try:
+                        cands = self._day_candidates(page, y, m, day) or []
+                    except Exception:
+                        cands = []
+                    if cands:
+                        break
+                    time.sleep(0.5)
                 if not cands:
-                    return False, desc
-                c2 = cands[0]
+                    # ③ 面板静止 → 重击同一坐标一次(真机现场: 起点已落一击、终点停在旧值)
+                    try:
+                        page.mouse.click(handle[0], handle[1])
+                    except Exception as e:
+                        self._pair_last_fail = {"path": "第2击未击发", "desc": desc,
+                                                "first": first_state, "err": str(e)[:80]}
+                        return False, f"{desc}（第2击未击发）"
+                    time.sleep(0.3)
+                    return True, f"{desc} ×2(重击同坐标)"
+                c2 = self._pick_anchored(cands, self._cell_key(cands[0]), 0,
+                                         fallback=cands[0])                 # ② 锚点选格
                 page.mouse.click(c2["x"], c2["y"])
                 desc = f"{desc} ×2"
             else:
                 handle.click(timeout=6000)
                 desc = f"{desc} ×2"
-        except Exception:
-            return False, desc
+        except Exception as e:
+            self._pair_last_fail = {"path": "第2击未击发", "desc": desc, "err": str(e)[:80],
+                                    "first": first_state}
+            return False, f"{desc}（第2击未击发）"
         time.sleep(1.2)
         return True, desc
+
+    def _second_click_relax(self, page, cands, desc, first_state, verify):
+        """宽松候选的第 2 击: 候选**依次**两击 + 每次立刻读回(verify), 任一通过即成功。
+
+        "同一个格两击"的语义照旧(每个候选自己成对); 放宽的只是"找格"。任一候选让调用方的
+        读回验证通过 → 返回 True; 全不中 → False 并记 `_pair_last_fail`。
+
+        第 1 击已在候选 #0 上落过(首个候选只需补 1 击即成一"对"), 其余候选各自补两击 ——
+        每补完一个候选**立刻读回**(调用方验证), 通过即收工。
+        """
+        last_err = ""
+        for i, c in enumerate(cands[:5]):
+            try:
+                if i:
+                    page.mouse.click(c["x"], c["y"])                   # 该候选的第 1 击
+                    time.sleep(0.4)
+                page.mouse.click(c["x"], c["y"])                       # 第 2 击(候选 #0 由第 1 击配对)
+                time.sleep(0.4)
+            except Exception as e:
+                last_err = str(e)[:80]
+                continue
+            if verify is None:
+                time.sleep(0.8)
+                return True, f"{desc} ×2(宽松候选#{i + 1})"
+            try:
+                ok = bool(verify())
+            except Exception:
+                ok = False
+            if ok:
+                return True, f"{desc} ×2(宽松候选#{i + 1})"
+        self._pair_last_fail = {"path": "第2击未击发" if last_err else "第2击重解析空",
+                                "desc": desc, "first": first_state, "err": last_err,
+                                "relax_n": len(cands)}
+        return False, f"{desc}（{'第2击未击发' if last_err else '第2击重解析空'}）"
 
     def _set_flow_date(self, page, date):
         """把流量页日期设为指定日 —— **必须拿到硬证据才算生效**。
@@ -2046,34 +2343,50 @@ class MeituanAdapter:
           · 日历候选优先走面板感知的 `_day_candidates`(双面板/邻月尾巴格不再误点), 空则退回 `_MARK_DAY_JS`;
           · 成对点选失败 → **Esc 清场重来**(1 轮), 绝不在脏状态里连续试探; 每轮读回都写进日志。
         任一步都不成立 → False(调用方放弃该店该日, 不用默认日期的数据冒充)。
+
+        2026-10-15 任务 M4(真机探针钉死): 本页日期控件窗口 = **最近 30 天 `[今天-30, 今天-1]`**,
+        窗外的日格带 `disabled`、点击无效; 且本页**键入/React 合成注入全死**(读回恒 ['',''])。所以:
+          · 动手**之前**先判窗(见 `_flow_date_reachable`) —— 窗外 = 已知页面限制, **秒级返回**,
+            不翻月/不点击/不键入/不写重取证包, 只留一行 warn 说清「客观取不到」;
+          · 删除 `_flow_type_dates` 调用(实测必败, 白等 1 轮);
+          · 窗内先查目标日格是否**全部 disabled** → 同样一行日志返回(防窗口边缘误判)。
         """
         try:
-            # ⓪ 探测: 先看清这页的日期控件(取证日志 —— 远程排障靠它, 不允许瞎猜选择器)
+            # ⓪ 窗口前置判定(任务 M4): 窗外 = 美团页面限制(不是故障) → 一行日志 + 秒级返回。
+            #    必须在读 probe/翻月/点击之前 —— 逐店反复试探一个客观取不到的日期只是白烧时间。
+            if not _flow_date_reachable(date, self._flow_today()):
+                self.sink.log(self._flow_window_msg(date), level="warn")
+                return False
+            # ① 探测: 先看清这页的日期控件(取证日志 —— 远程排障靠它, 不允许瞎猜选择器)
             probe = self._flow_inputs(page)
             self.sink.log("🔎 流量页日期控件: " + (
                 "; ".join(f"#{i}{p.get('tag') or '?'}ph={p.get('ph')!r}"
                           f"ro={int(bool(p.get('ro')))}v={p.get('v')!r}"
                           for i, p in enumerate(probe[:4]))
                 or "未找到(既无 placeholder 开始时间/结束时间, 也无日期值)"))
-            # ① 直接键入(对账页那套在本页没试过 → 先试, 但**以读回为准**)
-            if len(probe) >= 2 and self._flow_type_dates(page, date):
-                self.sink.log(f"📅 流量页日期 → {date}（已生效·键入）")
-                return True
-            self.sink.log(f"🔎 流量页日期: 直接键入未生效(读回={self._flow_read(page)}) → 改日历点选")
-            self._clear_picker(page)                       # 键入失败可能留下脏面板/脏输入 → 清场
-            # ② 日历点选兜底(任务 H 成对纪律)
+            self._clear_picker(page)                       # 残留脏面板/脏输入先清场
+            # ② 日历点选(任务 H 成对纪律: 同一格两击 + 整对读回 + 失败 Esc 清场重来)
             for rnd in range(1, 3):
                 heads = self._flow_open_custom(page)
                 if not heads:
                     self._flow_dump_controls(page)
                     self.sink.log("   ⚠️ 流量页「自定义」面板未能打开 → 该店商圈列留空", level="warn")
+                    self._date_pack(page, "flow", date, self._pack_extra(
+                        page, reason="面板未能打开", attempt=rnd, desc="面板未能打开",
+                        readback=self._flow_read(page), first_hit=getattr(self, "_pair_last_fail", None)))
                     return False
                 _nav = self._nav_month_roo(page, date)
                 try:
                     _y, _m, _d = (int(x) for x in date.split("-"))
                 except Exception:
                     return False
-                _hit, _desc = self._click_same_cell_twice(page, _y, _m, _d)
+                # 窗内防误判(任务 M4): 目标日格**全部** disabled → 不点, 一行日志返回。
+                if self._flow_day_disabled(page, _y, _m, _d):
+                    self._clear_picker(page)
+                    self.sink.log(self._flow_window_msg(date), level="warn")
+                    return False
+                _hit, _desc = self._click_same_cell_twice(
+                    page, _y, _m, _d, verify=lambda: self._flow_verified(page, date))
                 vals = self._flow_read(page)
                 if self._flow_verified(page, date, vals):
                     self.sink.log(f"📅 流量页日期 → {date}"
@@ -2093,6 +2406,23 @@ class MeituanAdapter:
             frag = [x.strip() for x in txt.replace("\n", "|").split("|")
                     if x.strip() and any(ch.isdigit() for ch in x)][:12]
             self.sink.log(f"   🔎 流量页日期取证(未确认): {frag}", level="warn")
+            # 任务 M2: 现场包(每 phase 每轮只写一次) —— 含候选快照 + 宽松兜底几何取证 + 成对失败细节
+            try:
+                _y, _m, _d = (int(x) for x in date.split("-"))
+            except Exception:
+                _y = _m = _d = 0
+            _cands = []
+            if _y:
+                try:
+                    _cands = self._day_candidates(page, _y, _m, _d) or []
+                except Exception:
+                    _cands = []
+            self._date_pack(page, "flow", date, self._pack_extra(
+                page, reason="最终未确认", desc="未确认", readback=vals, text_frag=frag,
+                candidates_n=len(_cands),
+                candidates_head=[self._pair_desc(c, _y, _m) for c in _cands[:8]],
+                relax_geo=self._relax_day_forensics(page, _y, _m, _d) if _y else [],
+                first_hit=getattr(self, "_pair_last_fail", None)))
             return False
         except Exception as e:
             self.sink.log(f"⚠️ 流量页日期设置失败(该店商圈列将留空): {str(e)[:70]}", level="warn")
@@ -2412,30 +2742,35 @@ class MeituanAdapter:
             or "未找到(无日期型 input)"))
         if len(probe) < 2:
             return False
-        # ② 直接键入(现配方) → ③ 读回
+        # ② 直接键入(任务 M4: 单遍必败 → 最多 3 遍收敛)
         if self._type_bill_dates(page, probe, date):
             return True
-        self.sink.log(f"🖱 对账页键入未生效(读回={self._bill_read(page)}) → 改日历点选")
-        # ④ 日历点选兜底(成对协议; 每轮失败 Esc 清场, 绝不在脏状态里继续试探)
+        _bad_typing = list(self._bill_read(page) or [])
+        self.sink.log(f"🖱 对账页键入3遍未收敛(读回={_bad_typing}) → 改日历点选")
+        # ④ 日历兜底(任务 M4: 单击双侧协议 —— 对账页**不是**流量页的"同格两击")
+        _reason = _CAL_FAIL        # 「日历兜底失败」(三种 reason 需可区分: 见 _CAL_*)
         for rnd in range(1, 3):
             self._clear_picker(page)
             if not self._open_bill_calendar(page):
                 self.sink.log("   ⚠️ 对账页日历面板未能打开 → CE/CJ 留空", level="warn")
+                self._date_pack(page, "bill", date, self._pack_extra(
+                    page, reason="面板未能打开", attempt=rnd, desc="面板未能打开",
+                    readback=self._bill_read(page),
+                    first_hit=getattr(self, "_pair_last_fail", None)))
                 return False
-            _nav = self._nav_month_roo(page, date)
-            try:
-                _y, _m, _d = (int(x) for x in date.split("-"))
-            except Exception:
-                return False
-            _hit, _desc = self._click_same_cell_twice(page, _y, _m, _d)
+            _ok, _desc, _nav = self._click_bill_day_once(page, date)
             vals = self._bill_read(page)
-            if len(vals) >= 2 and all(self._norm_day(v) == date for v in vals):
+            if self._bill_typing_converged(vals, date):
                 self.sink.log(f"📅 对账页日期 → {date}"
-                              f"（已生效·日历点选·第{rnd}轮·{_desc}·输入框={vals}）")
+                              f"（已生效·日历单击·第{rnd}轮·{_desc}·输入框={vals}）")
                 return True
+            # reason 只认三种可区分口径: 「日格禁用」/「日历兜底失败」(键入那一路已单独记日志)
+            _reason = _DISABLED if _desc == _DISABLED else _CAL_FAIL
             self.sink.log(f"🖱 对账页日期尝试{rnd}: {_desc} → 读回 {vals}"
-                          f"（翻月{'到' if _nav else '未到'} {_y}-{_m:02d}"
-                          f"{'' if _hit else '·格子没点到'}）", level="warn")
+                          f"（翻月{'到' if _nav else '未到'} {date[:7]}"
+                          f"{'' if _ok else '·格子没点到'}）", level="warn")
+            if _desc == _DISABLED:
+                break                                      # 禁用 = 客观不可点, 换轮也一样
         # ⑤ 全部失败: 细日志(URL/表格行数 + 前 2 行摘要), 交调用方留空
         try:
             rows = self._bill_rows(page, "交易号") or []
@@ -2443,7 +2778,73 @@ class MeituanAdapter:
                           f"前2行={[r[:4] for r in rows[:2]]}", level="warn")
         except Exception:
             pass
+        # 任务 M2: 现场包(每 phase 每轮只写一次) —— 两轮全败时才写, 自解释无需二分法猜
+        try:
+            _y, _m, _d = (int(x) for x in date.split("-"))
+        except Exception:
+            _y = _m = _d = 0
+        _cands = []
+        if _y:
+            try:
+                _cands = self._day_candidates(page, _y, _m, _d) or []
+            except Exception:
+                _cands = []
+        self._date_pack(page, "bill", date, self._pack_extra(
+            page, reason=_reason, desc=_reason, readback=self._bill_read(page),
+            typing_readback=_bad_typing,
+            candidates_n=len(_cands),
+            candidates_head=[self._pair_desc(c, _y, _m) for c in _cands[:8]],
+            relax_geo=self._relax_day_forensics(page, _y, _m, _d) if _y else [],
+            first_hit=getattr(self, "_pair_last_fail", None)))
         return False
+
+    def _click_bill_day_once(self, page, date):
+        """对账页日历兜底协议(任务 M4): **单击双侧** —— box0、box1 各点一次目标日格。
+
+        与流量页 `_click_same_cell_twice`(同一格两击)不同: 对账页是**区间**控件, 正确姿势是
+        「点 box0 → 面板 → 翻月到目标月 → 单击目标日格(单击即落定、面板自关) → 点 box1 →
+        同样单击目标日」。真机实测 `[9-18,9-18]` 一次通过。第 2 击落到表格上会误点 ——
+        所以本方法**不复用**流量页的"同格两击"。
+
+        Returns: (是否两次都点到了, desc, 是否翻月成功)。
+        """
+        try:
+            _y, _m, _d = (int(x) for x in date.split("-"))
+        except Exception:
+            return False, "日期格式非法", False
+        nav_ok = False
+        ins = self._bill_date_inputs(page) or []
+        if len(ins) < 2:
+            return False, "日期框缺失", False
+        for k, box in enumerate((ins[0], ins[-1])):
+            try:
+                page.mouse.click(box["x"], box["y"])       # 点该框 → 面板出现
+            except Exception:
+                return False, f"第{k + 1}框点击失败", nav_ok
+            time.sleep(0.9)
+            try:
+                if not page.evaluate(self._FLOW_HEADS_JS):
+                    return False, f"第{k + 1}框面板未打开", nav_ok
+            except Exception:
+                return False, f"第{k + 1}框面板读取失败", nav_ok
+            nav_ok = self._nav_month_roo(page, date) or nav_ok
+            # 日格禁用(任务 M4): 候选 class 含 disabled → 直接放弃日历(记日志), 绝不点。
+            # `_day_candidates` 已滤禁用格 → 用原始快照判"有格但全禁用"这一态。
+            if self._flow_day_disabled(page, _y, _m, _d):
+                return False, _DISABLED, nav_ok
+            try:
+                cands = self._day_candidates(page, _y, _m, _d) or []
+            except Exception:
+                cands = []
+            if not cands:
+                return False, f"第{k + 1}框目标日格未找到", nav_ok
+            c = cands[0]                                   # 最内层/最优候选(已滤禁用格)
+            try:
+                page.mouse.click(c["x"], c["y"])           # **单击一次**即落定(面板自关)
+            except Exception:
+                return False, f"第{k + 1}框日格点击失败", nav_ok
+            time.sleep(1.0)
+        return True, "单击双侧", nav_ok
 
     def _bill_date_inputs(self, page):
         """对账页日期控件快照(placeholder/class/readonly/当前值) —— 按 placeholder 认优先,
@@ -2475,35 +2876,82 @@ class MeituanAdapter:
     def _bill_read(self, page):
         return [str(x.get("v") or "") for x in self._bill_date_inputs(page)][:2]
 
-    def _type_bill_dates(self, page, probe, date):
-        """现配方: 逐框 点 → Ctrl+A → 键入 → 回车, 再点页头空白**失焦提交**(仅回车表格不刷新),
-        最后读回两框 == date。"""
-        for i in (0, 1):
-            cur = self._bill_date_inputs(page)
-            if len(cur) < 2:
-                return False
-            box = cur[0] if i == 0 else cur[-1]
+    def _type_bill_dates(self, page, probe, date, max_rounds=3):
+        """对账页日期键入 → **最多 3 遍收敛**(任务 M4)。
+
+        真机探针(2026-10-15)结论: 本页两框 = `input.roo-input`(非只读、可直接键入), 但控件有
+        「区间跨度 ≤ 30 天(含头尾)」钳制 —— 从默认区间 `[10-08, 10-15]` 单遍把**两框都打**目标日 `d`
+        时, 中间态首日会被改写成 `末日−29`(例: 9-13 → 中间态 `[2026-09-13, 2026-10-15]` 跨 33 天
+        → 读回 `[2026-09-16, 2026-09-16]`)。**单遍失败是必然, 不是偶发。**
+        实测配方: **同一目标连打最多 3 遍**(每遍 键入两框 + 回车 + 点空白失焦) → 第 2 遍即落 `[d,d]`
+        (9-13/9-14/9-15 全部两遍内成功)。3 遍全败 → False(交给 `_set_bill_inputs` 走日历兜底)。
+
+        `probe` 参数保留仅为兼容既有调用方(本实现每遍自己重新探测控件, 不用这份可能过期的快照)。
+        """
+        def _type_once():
+            """单遍: 逐框 点 → Ctrl+A → 键入 → 回车, 再点页头空白**失焦提交**(仅回车表格不刷新)。"""
+            for i in (0, 1):
+                cur = self._bill_date_inputs(page)
+                if len(cur) < 2:
+                    return False
+                box = cur[0] if i == 0 else cur[-1]
+                try:
+                    page.mouse.click(box["x"], box["y"])
+                    time.sleep(0.4)
+                    page.keyboard.press("ControlOrMeta+a")
+                    time.sleep(0.15)
+                    page.keyboard.type(date, delay=30)
+                    time.sleep(0.3)
+                    page.keyboard.press("Enter")
+                    time.sleep(0.5)
+                except Exception:
+                    return False
             try:
-                page.mouse.click(box["x"], box["y"])
-                time.sleep(0.4)
-                page.keyboard.press("ControlOrMeta+a")
-                time.sleep(0.15)
-                page.keyboard.type(date, delay=30)
-                time.sleep(0.3)
-                page.keyboard.press("Enter")
-                time.sleep(0.5)
+                page.mouse.click(600, 30)      # 失焦提交(点页头空白); 不行再 Tab 兜底
             except Exception:
-                return False
-        try:
-            page.mouse.click(600, 30)          # 失焦提交(点页头空白); 不行再 Tab 兜底
-        except Exception:
+                try:
+                    page.keyboard.press("Tab")
+                except Exception:
+                    pass
+            time.sleep(1.0)
+            return True
+
+        ok, _rounds, _vals = self._bill_retry_typing(
+            _type_once, lambda: self._bill_read(page), date, max_rounds=max_rounds,
+            on_fail=lambda i, v: self.sink.log(f"🔁 对账页日期第{i}/3遍: 读回={v}"))
+        return ok
+
+    def _bill_retry_typing(self, type_once, read_once, date, max_rounds=3, on_fail=None):
+        """「最多 max_rounds 遍: 键入一次 → 读回判定」的**纯控制流**(任务 M4, 可注入便于单测)。
+
+        `type_once()` = 打完一整遍(两框); `read_once()` = 读回两框值。任一遍两框都 == date
+        即成功(**立即停, 不多打**); 每遍失败回调 `on_fail(i, vals)` 写日志。
+        Returns: (是否收敛, 实际遍数, 最后一遍的读回值)。
+        """
+        vals = []
+        for i in range(1, max_rounds + 1):
             try:
-                page.keyboard.press("Tab")
+                type_once()
+            except Exception as e:
+                vals = []
+                if on_fail:
+                    on_fail(i, [f"键入异常: {str(e)[:40]}"])
+                continue
+            try:
+                vals = list(read_once() or [])[:2]
             except Exception:
-                pass
-        time.sleep(1.0)
-        vals = self._bill_read(page)
-        return len(vals) >= 2 and sum(1 for v in vals if self._norm_day(v) == date) >= 2
+                vals = []
+            if self._bill_typing_converged(vals, date):
+                return True, i, vals
+            if on_fail:
+                on_fail(i, vals)
+        return False, max_rounds, vals
+
+    @staticmethod
+    def _bill_typing_converged(vals, date):
+        """读回的两框值是否**都**落在目标日(纯判定, 3 遍循环与单测共用; 解析不了 → 不算)。"""
+        vals = list(vals or [])[:2]
+        return len(vals) >= 2 and all(MeituanAdapter._norm_day(v) == date for v in vals)
 
     def _open_bill_calendar(self, page):
         """点「自定义」或第一个日期框打开日历面板 → 是否出现**可见**月标题。"""

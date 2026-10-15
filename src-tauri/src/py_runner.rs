@@ -219,6 +219,10 @@ pub fn run_task(
     let app2 = app.clone();
     let pid = child.id();
     let app3 = app.clone();
+    // 诊断输出标签(2026-10-15): task_exit 带上本任务平台/日期 —— 内核 stderr 尾巴可能晚于
+    // 下一任务启动才刷出("幽灵块"), 前端据此给块打标消除跨任务歧义。
+    let exit_platform = platform.clone();
+    let exit_date = date.clone();
     std::thread::spawn(move || {
         // stderr 收集线程(诊断信息, 任务退出时一并回传前端)
         let stderr_handle = std::thread::spawn(move || {
@@ -307,6 +311,8 @@ pub fn run_task(
             TaskEvent {
                 payload: serde_json::json!({
                     "type": "task_exit",
+                    "platform": exit_platform,
+                    "date": exit_date,
                     "stderr_tail": stderr_tail.iter().rev().take(8).rev().collect::<Vec<_>>(),
                 }),
             },

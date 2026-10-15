@@ -34,7 +34,10 @@ def load_config(config_path=None) -> dict:
 
 def _defaults() -> dict:
     return {
-        "defaults": {"date": "", "fill_mode": "auto", "download_dir": str(app_data_dir() / "reports")},
+        "defaults": {"date": "", "fill_mode": "auto", "download_dir": str(app_data_dir() / "reports"),
+                     # 模板瘦身(M5): 保存前剪掉"无值但带样式"的越界空格(WPS 整行套格式 →
+                     # 输出 21.6MB)。默认开; 置 false 或设环境变量 MRC_SLIM_XLSX=0 可关。
+                     "slim_xlsx": True},
         "stores": [],
         "llm": {"base_url": "", "api_key": "", "model": "", "enabled": True},
         "notify": {"windows_toast": True, "webhook": ""},

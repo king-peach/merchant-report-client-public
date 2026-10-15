@@ -135,8 +135,6 @@ def test_per_store_weather_and_write():
         for sn in ("岚霞路", "高桥"):
             ws = wb.create_sheet(sn)
             ws["A5"], ws["C5"], ws["D5"] = "日期", "天气", "温度"
-            # 结构预检锚点(任务 I): 缺了会被判 unknown → 拒写(产品里正是防"猜列写错")
-            ws["DJ5"], ws["HH1"], ws["HN1"] = "主站营业额", "京东外卖数据", "美团管家"
             ws["A6"] = datetime.strptime("2026-10-12", "%Y-%m-%d")   # 已有前一天 → 追加到第 7 行
         wb.save(tpl)
 
@@ -168,14 +166,12 @@ def mk_tianlu_template(path):
     wb.create_sheet("Sheet2")
     ws = wb.create_sheet("岚霞路")
     ws["A5"], ws["B5"], ws["C5"] = "日期", "星期", "天气"
-    ws["DJ5"], ws["HH1"], ws["HN1"] = "主站营业额", "京东外卖数据", "美团管家"   # 结构预检锚点(任务 I)
     ws["B6"] = '=TEXT(A6,"AAAA")'                       # 公式列(第 6 行起)
     ws["E6"] = "=C6*2"
     ws["A6"] = datetime.strptime("2026-10-12", "%Y-%m-%d")
     tl = wb.create_sheet("天麓")
     tl["A1"] = "3月示例外卖平台数据"
     tl["A4"], tl["B4"], tl["C4"] = "日期", "星期", "天气"    # 表头比常规表**少一行**
-    tl["DJ4"], tl["HH1"], tl["HN1"] = "主站营业额", "京东外卖数据", "美团管家"   # 锚点在表头行(第 4 行)
     tl["B5"] = '=TEXT(A5,"AAAA")'
     tl["E5"] = "=C5*2"
     tl["A5"] = datetime.strptime("2026-10-12", "%Y-%m-%d")  # 数据从第 5 行开始

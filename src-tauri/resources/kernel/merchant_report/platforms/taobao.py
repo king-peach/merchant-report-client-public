@@ -124,26 +124,57 @@ LAUNCH_TIMEOUT_MS = 90000
 
 
 def _other_live_task_pids():
-    """本机**其它**活着的任务进程 pid(不含自己); 探测不可用 → None。
+    """本机**其它**活着的任务进程 [(pid, ppid), ...](不含自己); 探测不可用 → None。
 
     双开防护(2026-10-11 真机事故): 两个窗口同时跑任务时, 任何一方启动浏览器前的
     "残留清理"若把对方正在用的浏览器强杀掉, 两边就会循环互关、任务全断。
     所以动手前先探活: 有任何一个其它任务, 或探测不可用(不确定), 就不杀。
     判据: 命令行含 'merchant_report.task_main'(py_runner 启动内核的唯一入口)。
-    返回: pid 列表(可能为空) / None = 探测失败。"""
+
+    2026-10-15 改返回 (pid, ppid) 二元组: "一键跑所有平台"是**串行队列** —— 前一个平台的
+    子进程收尾(关浏览器)要 1~2 秒, 而前端收到 result 事件 ~1.2s 后就 spawn 下一个平台,
+    于是后一个任务探活时总能看见前一个平台的**兄弟进程**(同一个 py_runner 父进程的直系子进程)。
+    旧版只返回 pid, 调用方无法区分"兄弟"与"真正另一个窗口" → 每切一个平台就弹一次双开恐吓框。
+    带上 ppid 后, 调用方(见 orchestrator._split_foreign_task_pids)即可按父进程号判定兄弟关系。
+    ppid 解析不到时记 -1(未知): 调用方对未知一律按"非兄弟"保守处理。
+
+    返回: [(pid, ppid), ...](可能为空) / None = 探测失败。"""
     me = os.getpid()
     try:
         if os.name == "nt":
-            # $PID = 这条 PowerShell 自己: 它的命令行里也含下面的查询串, 不排除会把自己算进去
+            # $PID = 这条 PowerShell 自己: 它的命令行里也含下面的查询串, 不排除会把自己算进去。
+            # 逐行输出 "pid ppid"(2026-10-15): 兄弟判定需要父进程号。
             ps = ("Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and "
                   "$_.CommandLine -like '*merchant_report.task_main*' } "
-                  "| Select-Object -ExpandProperty ProcessId")
+                  "| ForEach-Object { '{0} {1}' -f $_.ProcessId,$_.ParentProcessId }")
             out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                                  capture_output=True, text=True, timeout=25).stdout
-        else:
-            out = subprocess.run(["pgrep", "-f", "merchant_report.task_main"],
+            pairs = []
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 2 or not parts[0].strip().isdigit() or not parts[1].strip().lstrip("-").isdigit():
+                    continue          # 非法行(空行/欢迎横幅/编码噪声) → 跳过
+                pid, ppid = int(parts[0]), int(parts[1])
+                if pid != me:
+                    pairs.append((pid, ppid))
+            return pairs
+        # POSIX: pgrep 只给 pid → 再一条 ps 补 ppid(2026-10-15); 个别查不到 ppid 的记 -1(未知)
+        out = subprocess.run(["pgrep", "-f", "merchant_report.task_main"],
+                             capture_output=True, text=True, timeout=5).stdout
+        pids = [int(x) for x in out.split() if x.strip().isdigit() and int(x) != me]
+        if not pids:
+            return []
+        ppid_of = {}
+        try:
+            pso = subprocess.run(["ps", "-o", "pid=,ppid=", "-p", ",".join(map(str, pids))],
                                  capture_output=True, text=True, timeout=5).stdout
-        return [int(x) for x in out.split() if x.strip().isdigit() and int(x) != me]
+            for line in pso.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].isdigit() and parts[1].lstrip("-").isdigit():
+                    ppid_of[int(parts[0])] = int(parts[1])
+        except Exception:
+            ppid_of = {}          # ps 失败 → 全部 ppid 未知(-1), 调用方按"非兄弟"保守处理
+        return [(p, ppid_of.get(p, -1)) for p in pids]
     except Exception:
         return None
 
@@ -371,7 +402,9 @@ def _cleanup_stale_browser(profile_dir, sink=None):
     只结束命令行里带本 profile 路径的进程, 不动用户自己开的浏览器窗口。
     返回 True=已清理(含无需清理); False=跳过(双开 / 探测不可用)。
     (注: 本函数曾因模块漏 `import subprocess` 被 except 静默吞掉、长期空转;
-    修复 import 的同时必须带上上面这道探测闸 —— 否则双开时就是互相关闭。)"""
+    修复 import 的同时必须带上上面这道探测闸 —— 否则双开时就是互相关闭。)
+    2026-10-15: 本函数只看"有没有"其它任务(**判空**), 不关心返回结构 —— 兄弟进程也算"有",
+    照样跳过清理(宁可不清理也不误杀, 语义不变); 仅把给用户看的进程号从元组里取 pid。"""
     others = _other_live_task_pids()
     if others is None:
         # 探测不可用 → 无法确认有没有别的实例在跑: 宁可不清理, 也不误杀(安全侧)
@@ -385,9 +418,11 @@ def _cleanup_stale_browser(profile_dir, sink=None):
     if others:
         if sink is not None:
             try:
+                # 2026-10-15: 探活改返 [(pid, ppid)] → 取元组第一项(pid)拼给用户看
+                pids = ",".join(str(o[0] if isinstance(o, (tuple, list)) else o) for o in others)
                 sink.log("⚠️ 检测到另一个「商家报表助手」任务正在运行(进程 %s) — 本次跳过"
                          "残留浏览器清理(避免两个窗口互相关闭)。若浏览器无法启动: "
-                         "请关闭多余的窗口后重试。" % ",".join(map(str, others)), level="warn")
+                         "请关闭多余的窗口后重试。" % pids, level="warn")
             except Exception:
                 pass
         return False
@@ -3698,6 +3733,177 @@ class TaobaoAdapter:
         time.sleep(4)
         return self._parse_funnel(f)["ftype"] == name
 
+    # 顾客维度候选元素的**打标 JS**(2026-10-15 任务 K2 从 _pick_cust 抽出, 逻辑与原实现逐字一致:
+    #   只认"等于 name 或以 name 开头"且可见(>8px)的元素, 「全部顾客」不放松成模糊匹配)。
+    _CUST_CANDIDATE_JS = """(nm) => {
+      const want = (nm === '全部顾客') ? ['全部顾客'] : [nm];
+      const all = [...document.querySelectorAll('*')].filter(el => {
+        const t = (el.innerText || '').trim();
+        if (!t || t.length > 8) return false;
+        if (!want.some(w => t === w || t.startsWith(w))) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 8 && r.height > 8;
+      });
+      // ⚠️ 真机(2026-10-01): 顾客维度是 antd radio 按钮组, 三层嵌套
+      //    DIV._customer(1152px) > DIV.ant-radio-group(240px) > LABEL(80px) > SPAN
+      //    只按 y 排序会选中**最外层容器**(它和 LABEL 同 y), 点它 = 点空白 → 一直是空。
+      //    正解: 去掉"还包含其它候选"的元素(只留最内层), 并优先 LABEL(真正的可点控件)。
+      const inner = all.filter(el => !all.some(o => o !== el && el.contains(o)));
+      const pick = inner.find(el => el.tagName === 'LABEL') || inner[0];
+      document.querySelectorAll('[data-hermes-cust]').forEach(e => e.removeAttribute('data-hermes-cust'));
+      if (!pick) return 0;
+      pick.setAttribute('data-hermes-cust', '1');
+      return inner.length;
+    }"""
+
+    # 验收(2026-10-01 真机): 顾客维度是 antd radio 按钮组 → 直接读**选中态 class** 最靠谱
+    # (比解析页面文本稳; 旧版就是卡在这一步, 明明点中了却判 False)。
+    _CUST_CHECKED_JS = """(nm) => {
+      const hit = [...document.querySelectorAll('label.ant-radio-button-wrapper')]
+        .find(l => (l.innerText || '').trim() === nm);
+      return !!(hit && /(^|\\s)ant-radio-button-wrapper-checked(\\s|$)/.test(hit.className));
+    }"""
+
+    def _cust_readback(self, f):
+        """漏斗当前顾客维度读回值(切换前后取证用); 读不到 → ''。"""
+        try:
+            return (self._parse_funnel(f).get("cust") or "").strip()
+        except Exception:
+            return ""
+
+    def _cust_verify_once(self, f, name):
+        """单击后的一次验收: 选中态 class 或漏斗读回 == name(任一成立即通过)。"""
+        try:
+            if f.evaluate(self._CUST_CHECKED_JS, name):
+                return True
+        except Exception:
+            pass
+        return self._cust_readback(f) == name
+
+    def _cust_verify_poll(self, f, name, timeout_s=6.0, poll=0.4):
+        """点击后**轮询验收**(2026-10-15 任务 K2): 每 ~0.4s 一次, 最长 ~6s。
+
+        替代旧的固定 sleep(1.8): 真机"新客能切、老客必失败"里, 老客那一下页面重渲染更慢,
+        固定等待要么不够(误判失败)要么白等。轮询到就立刻返回, 拿不到才判失败。
+        """
+        for _ in range(max(1, int(timeout_s / poll))):
+            if self._cust_verify_once(f, name):
+                return True
+            time.sleep(poll)
+        return False
+
+    def _mark_cust_by_store_group(self, f, name):
+        """第二方案(2026-10-15 任务 K2): 从「本店」所属漏斗区域里找 radio 组, 点组内 label。
+
+        为什么需要 B 方案: A 方案按整页文本找最内层候选, 若页面别处(趋势图例/榜单)也出现
+        「新客/老客」字样, 可能标错元素 → 点了没生效。这里锚定**「本店」所在的漏斗区域**,
+        取其最近的 div.ant-radio-group, 只在该组内找 label → 定位更死。
+        沿用 A 方案"JS 打标 → locator 点击"的做法(自动换算 iframe 偏移, 避开坐标点击)。
+        返回打标数量(0 = 没找到)。
+        """
+        return f.evaluate("""(nm) => {
+          const vis = e => { const r = e.getBoundingClientRect();
+                             return r.width > 0 && r.height > 0; };
+          // ① 最小可见的「本店」元素(漏斗头部; 取最小 = 排除整页容器)
+          let store = null;
+          for (const el of document.querySelectorAll('*')) {
+            if (!(el.innerText || '').includes('本店') || !vis(el)) continue;
+            if (!store) { store = el; continue; }
+            const a = el.getBoundingClientRect(), b = store.getBoundingClientRect();
+            if (a.width * a.height < b.width * b.height) store = el;
+          }
+          if (!store) return 0;
+          // ② 从「本店」往上找最近一个内含 div.ant-radio-group 的容器
+          let grp = null, node = store;
+          for (let i = 0; i < 6 && node; i++, node = node.parentElement) {
+            const g = node.querySelector('div.ant-radio-group');
+            if (g) { grp = g; break; }
+          }
+          if (!grp) grp = store.querySelector('div.ant-radio-group');
+          if (!grp) return 0;
+          // ③ 组内 label 文本 == nm(允许前缀) → 打标
+          const labels = [...grp.querySelectorAll('label')];
+          const hit = labels.find(l => (l.innerText || '').trim() === nm)
+                   || labels.find(l => (l.innerText || '').trim().startsWith(nm));
+          document.querySelectorAll('[data-hermes-cust]').forEach(e => e.removeAttribute('data-hermes-cust'));
+          if (!hit) return 0;
+          hit.setAttribute('data-hermes-cust', '1');
+          return 1;
+        }""", name)
+
+    def _cust_forensics(self, f, name, before, after):
+        """切顾客维度**最终失败**的现场取证(2026-10-15 任务 K2)。
+
+        为什么必须取证: 真机日志两轮都只有一句「切「老客」失败」—— 分不清是"控件结构变了 /
+        没点中 / 点了没生效"。下轮真机靠这份现场收口: 候选元素几何 + 同组 label + 漏斗头部文本
+        + 整页截图 + 切换前后读回值, 一次拿全。
+        落盘目录/命名沿用 diagnose.collect_diagnostic_pack(抓不到再退 ./diag/ 时间戳)。
+        **绝不抛**: 取证自身任何异常都不影响主流程(调用方再兜一层)。
+        """
+        try:
+            ev = {"name": name, "before": before, "after": after}
+            try:      # ① 候选元素列表 [tagName, text, x, y, width, height, className]
+                ev["candidates"] = f.evaluate("""(nm) => {
+                  const want = ['全部顾客', '新客', '老客'];
+                  const out = [];
+                  for (const el of document.querySelectorAll('*')) {
+                    const t = (el.innerText || '').trim();
+                    if (!t || t.length > 8) continue;
+                    if (!(want.includes(t) || t.startsWith(nm))) continue;
+                    const r = el.getBoundingClientRect();
+                    if (!(r.width > 8 && r.height > 8)) continue;
+                    out.push([el.tagName, t, Math.round(r.x), Math.round(r.y),
+                              Math.round(r.width), Math.round(r.height),
+                              String(el.className).slice(0, 120)]);
+                    if (out.length >= 30) break;
+                  }
+                  return out;
+                }""", name) or []
+            except Exception:
+                ev["candidates"] = []
+            try:      # ② 页面上所有 radio 按钮 label 的 [text, className]
+                ev["radio_labels"] = f.evaluate("""() =>
+                  [...document.querySelectorAll('label.ant-radio-button-wrapper')]
+                    .map(l => [(l.innerText || '').trim(), String(l.className)])""") or []
+            except Exception:
+                ev["radio_labels"] = []
+            try:      # ③ 漏斗头部当前文本
+                ev["funnel_head"] = f.evaluate("""() => {
+                  const t = document.body.innerText || '';
+                  const i = t.indexOf('流量转化');
+                  return (i >= 0 ? t.slice(i, i + 160) : t.slice(0, 160)).replace(/\\s+/g, ' ');
+                }""") or ""
+            except Exception:
+                ev["funnel_head"] = ""
+            path = ""
+            try:      # ④+⑤ 沿用 diagnose 的目录/命名(它自带整页截图 + DOM 骨架 + 页面文本)
+                from ..diagnose import collect_diagnostic_pack
+                path = collect_diagnostic_pack(
+                    getattr(self, "page", None), f"cust_{name}",
+                    f"切顾客维度「{name}」未成功(切换前 '{before}' → 尝试后 '{after}')",
+                    extra={"cust_evidence": ev}) or ""
+            except Exception:
+                path = ""
+            if not path:      # 兜底: collect_diagnostic_pack 不可用 → ./diag/ 下时间戳命名
+                try:
+                    import json as _json
+                    d = os.path.join(os.getcwd(), "diag")
+                    os.makedirs(d, exist_ok=True)
+                    path = os.path.join(d, f"cust_{name}_{time.strftime('%Y%m%d-%H%M%S')}.json")
+                    with open(path, "w", encoding="utf-8") as fh:
+                        _json.dump(ev, fh, ensure_ascii=False, indent=1)
+                    pg = getattr(self, "page", None)
+                    if pg is not None:
+                        pg.screenshot(path=path.replace(".json", ".png"), timeout=15000)
+                except Exception:
+                    path = ""
+            if path:
+                self.sink.log("📸 顾客维度切换未成功，现场取证已保存: "
+                              f"{os.path.abspath(path)}（可将该文件发回给我们排查）", level="warn")
+            return path
+        except Exception:
+            return ""
+
     def _pick_cust(self, f, name):
         """切漏斗的「顾客维度」(新客/老客/全部顾客) —— 连锁视图与单店视图都能用。
 
@@ -3705,47 +3911,50 @@ class TaobaoAdapter:
         的位置规律; **单店视图**(single/business-analysis)结构不同, 直接失配 → 新客/老客读不到、
         TOP 列一直空。现在改成: 按**文本**找候选(允许带箭头后缀), 取最靠上的那个(漏斗在页面上半部,
         趋势图例在下面), 用 JS 打标记后用 locator 点(自动换算 iframe 偏移), 最后用"标签真的变了吗"验收。
+
+        2026-10-15 任务 K2 加固(真机两轮: "新客切成功、老客必失败"):
+          ① 最多 2 次尝试, 两次之间 Escape 清层 + 短等待;
+          ② 验收改**轮询**(每 ~0.4s, 最长 ~6s)替代固定 sleep(1.8) —— 老客重渲染更慢;
+          ③ 第 2 次尝试改用 B 方案(锚定「本店」漏斗区域内的 radio 组, 见 _mark_cust_by_store_group);
+          ④ 两次都不成 → 现场取证落盘(_cust_forensics), 日志打绝对路径, 供真机发回排查。
+        口径不变: 仍返回 bool; 失败后由上层(自校验)回退报表逐店口径, 绝不写错值。
         """
         try:
-            cur = (self._parse_funnel(f).get("cust") or "").strip()
-            if cur == name:
+            before = self._cust_readback(f)
+            if before == name:
                 return True
-            marked = f.evaluate("""(nm) => {
-              const want = (nm === '全部顾客') ? ['全部顾客'] : [nm];
-              const all = [...document.querySelectorAll('*')].filter(el => {
-                const t = (el.innerText || '').trim();
-                if (!t || t.length > 8) return false;
-                if (!want.some(w => t === w || t.startsWith(w))) return false;
-                const r = el.getBoundingClientRect();
-                return r.width > 8 && r.height > 8;
-              });
-              // ⚠️ 真机(2026-10-01): 顾客维度是 antd radio 按钮组, 三层嵌套
-              //    DIV._customer(1152px) > DIV.ant-radio-group(240px) > LABEL(80px) > SPAN
-              //    只按 y 排序会选中**最外层容器**(它和 LABEL 同 y), 点它 = 点空白 → 一直是空。
-              //    正解: 去掉"还包含其它候选"的元素(只留最内层), 并优先 LABEL(真正的可点控件)。
-              const inner = all.filter(el => !all.some(o => o !== el && el.contains(o)));
-              const pick = inner.find(el => el.tagName === 'LABEL') || inner[0];
-              document.querySelectorAll('[data-hermes-cust]').forEach(e => e.removeAttribute('data-hermes-cust'));
-              if (!pick) return 0;
-              pick.setAttribute('data-hermes-cust', '1');
-              return inner.length;
-            }""", name)
-            if not marked:
-                return False
-            f.locator('[data-hermes-cust="1"]').first.click(timeout=5000)
-            time.sleep(1.8)
-            # 验收(2026-10-01 真机): 顾客维度是 antd radio 按钮组 →
-            # 直接读**选中态 class** 最靠谱(比解析页面文本稳; 旧版就是卡在这一步, 明明点中了却判 False)。
-            try:
-                if f.evaluate("""(nm) => {
-                  const hit = [...document.querySelectorAll('label.ant-radio-button-wrapper')]
-                    .find(l => (l.innerText || '').trim() === nm);
-                  return !!(hit && /(^|\\s)ant-radio-button-wrapper-checked(\\s|$)/.test(hit.className));
-                }""", name):
+            for attempt in (1, 2):
+                if attempt == 2:
+                    # 第 1 次失败 → 先清层(可能残留下拉/遮罩吃掉点击), 再走 B 方案
+                    try:
+                        f.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    time.sleep(0.6)
+                marked = self._mark_cust_candidate(f, name) if attempt == 1 \
+                    else self._mark_cust_by_store_group(f, name)
+                if not marked:
+                    continue
+                try:
+                    f.locator('[data-hermes-cust="1"]').first.click(timeout=5000)
+                except Exception:
+                    continue
+                if self._cust_verify_poll(f, name):
+                    if attempt == 2:
+                        self.sink.log(f"ℹ️ 顾客维度「{name}」第 2 次尝试(B 方案)切换成功")
                     return True
+            after = self._cust_readback(f)
+            self.sink.log(f"⚠️ 切顾客维度「{name}」失败: 两次尝试后仍未生效", level="warn")
+            self.sink.log(f"   ↳ 切换前读回: '{before}', 尝试后读回: '{after}'")
+            try:      # 取证自身异常绝不影响主流程
+                self._cust_forensics(f, name, before, after)
             except Exception:
                 pass
-            return (self._parse_funnel(f).get("cust") or "").strip() == name
+            return False
         except Exception as e:
             self.sink.log(f"⚠️ 切顾客维度「{name}」失败: {str(e)[:70]}", level="warn")
             return False
+
+    def _mark_cust_candidate(self, f, name):
+        """A 方案: 按整页文本找最内层候选(优先 LABEL) → 打标。返回候选数量(0=没找到)。"""
+        return f.evaluate(self._CUST_CANDIDATE_JS, name)

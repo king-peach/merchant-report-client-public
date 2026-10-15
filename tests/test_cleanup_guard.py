@@ -65,14 +65,16 @@ _real_sp = TB.subprocess
 TB.subprocess = FakeSP
 try:
     # ---------- B. 有另一个任务在跑 → 一个进程都不杀 ----------
+    # 2026-10-15: 探活返回 [(pid, ppid)] —— 本函数只看"有没有"(判空), 兄弟也算"有"照样跳过。
     print("=== B. 检测到另一个任务在运行 → 一个进程都不杀 ===")
     FakeSP.calls.clear()
-    TB._other_live_task_pids = lambda: [12345]
+    TB._other_live_task_pids = lambda: [(12345, 999)]
     sink = FakeSink()
     r = TB._cleanup_stale_browser("/tmp/dual-guard-prof", sink=sink)
     assert r is False, f"应返回 False(跳过): {r}"
     assert FakeSP.calls == [], f"不许执行任何进程命令: {FakeSP.calls}"
     assert any("另一个" in m and "跳过" in m for _, m in sink.logs), sink.logs
+    assert any("12345" in m for _, m in sink.logs), f"提示里要带 pid(不是元组): {sink.logs}"
     assert sink.logs[0][0] == "warn", sink.logs
     print(f"  ✓ 0 条进程命令; 提示: {sink.logs[0][1][:44]}…")
 
@@ -96,22 +98,42 @@ try:
     assert any("dual-guard-prof" in " ".join(map(str, c)) for c in FakeSP.calls), FakeSP.calls
     print(f"  ✓ 执行了 {len(FakeSP.calls)} 条命令, 且带 profile 路径(只杀本 profile 的残留)")
 
-    # ---------- E. 探活解析: 自己不算 ----------
-    print("=== E. 探活结果解析: 自己(当前进程)被排除 ===")
+    # ---------- E. 探活解析: 新格式 (pid, ppid); 自己(当前进程)不算"其它任务" ----------
+    # POSIX 分支: pgrep 拿 pid 列表 → 再一条 ps 补 ppid。
+    print("=== E. 探活结果解析: (pid, ppid) 两列 + 自己不算其它 ===")
 
     class FakeSP2:
         @staticmethod
         def run(argv, **kw):
 
             class R:
-                stdout = f"{os.getpid()}\n777\n  \nnot-a-pid\n"
-            return R()
+                stdout = ""
+            r = R()
+            if "pgrep" in argv:
+                # 包含: 自己 / 合法 pid / 空白 / 非数字噪声
+                r.stdout = f"{os.getpid()}\n777\n  \nnot-a-pid\n"
+            elif "ps" in argv:
+                r.stdout = "777 555\n"
+            return r
 
     TB.subprocess = FakeSP2
     TB._other_live_task_pids = _real_probe
     got = TB._other_live_task_pids()
-    assert got == [777], got
-    print(f"  ✓ pid {os.getpid()}(自己)与非法值被过滤, 得到 [777]")
+    assert got == [(777, 555)], got
+    assert all(isinstance(x, tuple) and len(x) == 2 for x in got), got
+    print(f"  ✓ 解析出 [(777, 555)]: 自己(pid {os.getpid()})与非法值被过滤, ppid 由 ps 补齐")
+
+    # 真探针(未打桩 subprocess, 只在本机真跑一次): 返回 None 或 [(pid, ppid)] 列表, 且不含本进程 pid
+    print("=== E2. 真探针(本机真跑): 结构正确且不含本进程 ===")
+    TB.subprocess = _real_sp
+    real = _real_probe()
+    assert real is None or (
+        isinstance(real, list) and all(isinstance(x, tuple) and len(x) == 2
+                                       and isinstance(x[0], int) and isinstance(x[1], int)
+                                       for x in real)), real
+    if real is not None:
+        assert os.getpid() not in [p for p, _ in real], f"自己不该出现在探活结果里: {real}"
+    print(f"  ✓ 真探针返回: {real if real is not None else 'None(探测不可用)'}")
 finally:
     TB._other_live_task_pids = _real_probe
     TB.subprocess = _real_sp

@@ -328,10 +328,40 @@ def _autocreate_enabled(cfg):
     return (cfg.get("defaults") or {}).get("auto_create_store_sheet", True) is not False
 
 
+def _split_foreign_task_pids(others, my_ppid):
+    """把"其它任务进程"拆成 (foreign, siblings) —— 供双开门判定是否**真的**另一个窗口。
+
+    2026-10-15 真机误报: "一键跑所有平台"是**串行队列**, 壳(py_runner)对每个平台直接 spawn
+    一个 `python -m merchant_report.task_main` 子进程; 前端收到本平台 result 事件后约 1.2s
+    就启动下一个平台, 而**前一个平台的进程还在收尾**(关浏览器等)。于是后一个任务探活时总能
+    看见前一个平台的**兄弟进程**(同一个 py_runner 父进程的直系子进程) —— 旧逻辑一律当"另一个
+    窗口", 每切一个平台弹一次 120s 恐吓框, 用户点「结束本次」还会打断整个一键队列。
+
+    判据: ppid == 本进程的父进程号(os.getppid()) → 同一父壳下 spawn 的兄弟, 属正常串行衔接。
+    ppid 未知(-1, 探测退化) → 归入 foreign(保守: 宁可多问一句, 不可漏报真双开)。
+    探测不可用(None)/空列表 → 返回 ([], []), 调用方按"无冲突"继续。
+
+    纯函数, 便于单测。"""
+    if not others:
+        return [], []
+    mine = my_ppid
+    foreign, siblings = [], []
+    for item in others:
+        try:
+            pid, ppid = int(item[0]), int(item[1])
+        except Exception:
+            pid, ppid = item, -1        # 容忍旧格式(裸 pid) → 当未知父进程处理
+        (foreign if (ppid == -1 or ppid != mine) else siblings).append((pid, ppid))
+    return foreign, siblings
+
+
 def _other_task_gate(sink, human):
     """双开/旧版残留防护(2026-10-12 客户机实证): 两个「商家报表助手」客户端同时跑任务时,
     **共用同一个浏览器配置目录** —— 先启动的浏览器占住目录, 后启动方的新浏览器被顶死,
     表现就是"浏览器被反复关闭、重开也没用"的死循环。与其让用户一头雾水, 不如先讲清楚。
+
+    2026-10-15: 只在**真正另一个客户端实例**(非本窗口同一队列的兄弟进程)时才弹框 ——
+    见 _split_foreign_task_pids 的误报说明。全是兄弟时按正常串行衔接处理(不弹窗/不 warn)。
 
     返回 True=继续 / False=干净结束(用户选了"结束本次")。
     探测不可用/无响应 → 继续(保持自动化旧行为, 只 warn)。"""
@@ -342,7 +372,18 @@ def _other_task_gate(sink, human):
         others = None
     if not others:
         return True
-    pids = "、".join(str(p) for p in others[:6])
+    try:
+        mine = os.getppid()
+    except Exception:
+        mine = -1
+    foreign, siblings = _split_foreign_task_pids(others, mine)
+    if siblings:
+        sibs = "、".join(str(p) for p, _ in siblings[:6])
+        sink.log(f"ℹ️ 检测到同一窗口内其它任务进程(进程 {sibs})——属串行队列正常衔接"
+                 f"(前一个任务收尾中), 已按继续处理")
+    if not foreign:
+        return True          # 全是兄弟 → 不打扰用户(旧版会在这里弹 120s 恐吓框)
+    pids = "、".join(str(p) for p, _ in foreign[:6])
     sink.log(f"⚠️ 检测到另一个「商家报表助手」任务在运行(进程 {pids})——两个客户端同时跑会"
              f"共用浏览器配置、互相顶死(这是浏览器被反复关闭的常见原因)", level="warn")
     msg = (f"检测到**另一个窗口正在运行任务**（进程 {pids}）。\n"
@@ -687,9 +728,6 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
              skip_browser=False, llm_client=None, show_browser=False):
     from .events import EventSink, HumanBridge
     sink = sink or EventSink("task")
-    # fill 的结构预检告警(版本判不出 → 跳过写入)要进壳的日志面板, 见 fill.set_log_sink
-    from . import fill as _fill_mod
-    _fill_mod.set_log_sink(sink)
     human = human or HumanBridge()
     date = date or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     date_from = date_from or date
@@ -1650,7 +1688,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         try:
             _results = fill_many(store["template"], fill_jobs, mode=mode,
                                  main_sheets=(cfg.get("defaults") or {}).get("main_sheets"),
-                                 create_missing=_create_missing_for(store, "meituan"))
+                                 create_missing=_create_missing_for(store, "meituan"),
+                                 on_retry=lambda m: sink.log(m, level="warn"),
+                                 log=lambda m: sink.log(m, level="info"))
         except Exception as e:
             sink.step_fail("fill", "填入模板", str(e)[:200], "E_FILL_FAIL")
             sink.result(False, error_code="E_FILL_FAIL",
@@ -1659,10 +1699,6 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         _done = set()
         for _sn, _d, _fr in _results:
             _done.add((_fr.get("requested") or _sn, _d))
-            if _fr.get("skipped_unknown_layout"):
-                # 结构未识别 → fill 已拒写(warn 日志在 fill 里), 这里只登记失败: 别报"✓ 行None (0格)"
-                fill_errs.append(f"[{_sn}] {_d}: 模板结构未识别, 已跳过写入")
-                continue
             if _fr.get("reread_bad"):
                 sink.log(f"  ⚠️ [{_sn}] {_d} 回读不一致列: {','.join(_fr['reread_bad'][:8])}", level="warn")
             if _sn in _main_names:
@@ -1864,7 +1900,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         try:
             _results = fill_many(store["template"], fill_jobs, mode=mode,
                                  main_sheets=(cfg.get("defaults") or {}).get("main_sheets"),
-                                 create_missing=_create_missing_for(store, "jd"))
+                                 create_missing=_create_missing_for(store, "jd"),
+                                 on_retry=lambda m: sink.log(m, level="warn"),
+                                 log=lambda m: sink.log(m, level="info"))
         except Exception as e:
             sink.result(False, error_code="E_FILL_FAIL",
                         message=f"京东批量写入失败: {str(e)[:120]}", retryable=True)
@@ -1872,9 +1910,6 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         _done = set()
         for _sn, _d, _fr in _results:
             _done.add((_fr.get("requested") or _sn, _d))
-            if _fr.get("skipped_unknown_layout"):
-                fill_errs.append(f"[{_sn}] {_d}: 模板结构未识别, 已跳过写入")
-                continue
             if _fr.get("reread_bad"):
                 sink.log(f"  ⚠️ [{_sn}] {_d} 回读不一致列: {','.join(_fr['reread_bad'][:8])}", level="warn")
             if _sn in _main_names:
@@ -2041,15 +2076,14 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         try:
             _results = fill_many(store["template"], fill_jobs, mode=mode,
                                  main_sheets=(cfg.get("defaults") or {}).get("main_sheets"),
-                                 create_missing=_create_missing_for(store, "meituan_gj"))
+                                 create_missing=_create_missing_for(store, "meituan_gj"),
+                                 on_retry=lambda m: sink.log(m, level="warn"),
+                                 log=lambda m: sink.log(m, level="info"))
         except Exception as e:
             sink.result(False, error_code="E_FILL_FAIL",
                         message=f"美团管家批量写入失败: {str(e)[:120]}", retryable=True)
             return None
         for _sn, _d, _fr in _results:
-            if _fr.get("skipped_unknown_layout"):
-                fill_errs.append(f"[{_sn}] {_d}: 模板结构未识别, 已跳过写入")
-                continue
             filled_rows.append((_sn, _d, _fr))
             if _fr.get("reread_bad"):
                 sink.log(f"  ⚠️ [{_sn}] {_d} 回读不一致列: {','.join(_fr['reread_bad'][:8])}", level="warn")
@@ -2289,7 +2323,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     try:
         _results = fill_many(store["template"], fill_jobs, mode=mode,
                              main_sheets=(cfg.get("defaults") or {}).get("main_sheets"),
-                             create_missing=_create_missing_for(store, platform))
+                             create_missing=_create_missing_for(store, platform),
+                             on_retry=lambda m: sink.log(m, level="warn"),
+                             log=lambda m: sink.log(m, level="info"))
     except Exception as e:
         sink.step_fail("fill", "填入模板", str(e)[:200], "E_FILL_FAIL")
         sink.result(False, error_code="E_FILL_FAIL", message=f"批量写入失败: {str(e)[:120]}", retryable=True)
@@ -2297,10 +2333,6 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     _done = set()
     for _sn, _d, _fr in _results:
         _done.add((_fr.get("requested") or _sn, _d))
-        if _fr.get("skipped_unknown_layout"):
-            # 模板结构未识别 → fill 已拒写(并打了 warn): 别报"✓ 行None", 计一次失败
-            fill_errs.append(f"[{_sn}] {_d}: 模板结构未识别, 已跳过写入")
-            continue
         if _fr.get("reread_bad"):
             sink.log(f"  ⚠️ [{_sn}] {_d} 回读不一致列: {','.join(_fr['reread_bad'][:8])}", level="warn")
         if _sn in _main_names:

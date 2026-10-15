@@ -192,10 +192,10 @@ def main():
     p2.mouse.click = _open
     assert ad2._set_bill_inputs(p2, "2026-09-30") is True, logs2
     assert p2.values == ["2026-09-30", "2026-09-30"], p2.values
-    assert p2.clicks >= 2, "日历兜底必须点同一格两次"
-    assert any("键入未生效" in m for _, m in logs2), f"要留证: {logs2}"
-    assert any("日历点选" in m and "已生效" in m for _, m in logs2), logs2
-    print("✅ ② 键入不生效 → 日历点选(同一格两击) → 生效")
+    assert p2.clicks >= 2, "日历兜底必须两侧各点一次目标日格(单击双侧)"
+    assert any("键入3遍未收敛" in m for _, m in logs2), f"要留证: {logs2}"
+    assert any("日历单击" in m and "已生效" in m for _, m in logs2), logs2
+    print("✅ ② 键入3遍未收敛 → 日历单击双侧 → 生效")
 
     # ③ 两态都不成 → False + 细日志(输入框读回值), 绝不臆造日期
     p3 = FakePage(values=["", ""], type_sticks=False, accepts=False)
@@ -221,12 +221,18 @@ def main():
         "探测必须记 placeholder/readonly/class(远程排障靠它)"
     assert "开始" in probe and "结束" in probe, "要按 placeholder 认出起止两框"
     setter = inspect.getsource(MeituanAdapter._set_bill_inputs)
-    assert "_type_bill_dates" in setter, "① 先试键入"
-    assert "_click_same_cell_twice" in setter, "② 键入不生效 → 日历点选(同一格两击)"
-    assert "_open_bill_calendar" in setter and "_clear_picker" in setter and "_nav_month_roo" in setter, \
-        "③ 日历兜底要能开面板/清场/翻月"
+    assert "_type_bill_dates" in setter, "① 先试键入(任务 M4: 最多 3 遍收敛)"
+    assert "_click_bill_day_once" in setter, \
+        "② 键入不收敛 → 日历兜底走本页协议:**单击双侧**(不是流量页的同格两击)"
+    assert "_click_same_cell_twice" not in setter, \
+        "任务 M4: 对账页**不许**用流量页的同格两击(第 2 击会落到表格上误点)"
+    click_once = inspect.getsource(MeituanAdapter._click_bill_day_once)
+    assert "_open_bill_calendar" in setter and "_clear_picker" in setter, \
+        "③ 日历兜底要能开面板/清场"
+    assert "_nav_month_roo" in click_once, "翻月在「单击双侧」协议里(点框 → 翻月 → 单击日格)"
     assert "range(1, 3)" in setter, "日历兜底轮次要有上限"
-    print("✅ ⑤ 契约: 探测(placeholder/readonly/class) + 键入 + 日历兜底 + 清场/翻月 + 轮次上限")
+    assert "_bill_typing_converged" in setter, "读回判定要复用统一的收敛函数(两侧都必须 == 目标日)"
+    print("✅ ⑤ 契约: 探测 + 键入3遍 + 日历单击双侧 + 清场/翻月 + 轮次上限")
 
     # ⑥ 整流程重试 2 次(_read_bill_ledger)
     rd = inspect.getsource(MeituanAdapter._read_bill_ledger)
@@ -244,5 +250,86 @@ def _open_but_dead(page):
     return _c
 
 
+def _mk_diag_dir(page):
+    """给假页挂一个临时 download_dir(现场包落盘用)。"""
+    import tempfile
+    d = tempfile.mkdtemp(prefix="mtm2bill-")
+    page.tmpdir = d
+    return d
+
+
+def test_m4_bill_click_once_and_pack():
+    """任务 M4: 对账页 ① **单击双侧**协议(不点同一格两次) ② 失败时现场包每 phase 一次
+    ③ 三种失败 reason 可区分(键入3遍未收敛 / 日历兜底失败 / 日格禁用)。
+
+    真机 2026-10-15 探针: 本页是**区间**控件 —— 正确姿势 = 点 box0 → 面板 → 翻月 → 单击目标日格
+    (单击即落定、面板自关) → 再点 box1 → 同样单击。**同格两击是流量页协议, 对本页是错的**
+    (第 2 击会落到表格上有误点风险)。所以本测试钉的是 M4 的新协议。
+    """
+    import os
+    from merchant_report.platforms.meituan import MeituanAdapter as A
+
+    # ① 键入3遍仍未收敛 → 落日历「单击双侧」→ 成功(两侧各点一次)
+    p = FakePage(values=["", ""], type_sticks=False, accepts=True)
+    ad, logs = mk(p)
+    _orig = p.mouse.click
+    cell_clicks = {"n": 0}
+
+    def _open_and_count(x, y=None):
+        _orig(x, y)
+        p.picker = True
+        if p.cell_at(x, y) is not None:
+            cell_clicks["n"] += 1
+    p.mouse.click = _open_and_count
+    assert ad._set_bill_inputs(p, "2026-09-30") is True, logs
+    assert any("单击双侧" in m and "已生效" in m for _, m in logs), logs
+    assert any("键入3遍未收敛" in m for _, m in logs), logs
+    print("✅ M4 对账页: 键入3遍未收敛 → 日历单击双侧 → 生效")
+
+    # ② 日历兜底失败(格子点了不生效) → 现场包恰好一次 + reason 可区分
+    p2 = FakePage(values=["", ""], type_sticks=False, accepts=False)
+    ad2, logs2 = mk(p2)
+    p2.mouse.click = _open_but_dead(p2)
+    p2.frames = []                                 # 真 collect_diagnostic_pack 要读 page.frames
+    d = _mk_diag_dir(p2)
+    ad2.download_dir = d
+    assert ad2._set_bill_inputs(p2, "2026-09-30") is False, logs2
+    files = sorted(f for f in os.listdir(d) if f.startswith("diag_date-bill"))
+    assert len(files) == 1, f"每 phase 每轮只写一次现场包: {files}"
+    assert any("日期现场" in m for _, m in logs2), logs2
+    # 现场包内 reason 必须是「日历兜底失败」(而不是含糊的"两轮全败")
+    import json
+    payload = json.load(open(os.path.join(d, files[0]), encoding="utf-8"))
+    assert payload.get("reason") == "日历兜底失败", f"reason 要可区分: {payload.get('reason')}"
+    assert "typing_readback" in payload, '现场包要带键入那一路的读回值(区分「键入未收敛」)'
+    print(f"✅ M4 对账页失败: reason={payload.get('reason')} + 现场包一次({files[0]})")
+
+    # ③ 取证自身抛异常 → 主流程照常 False, 不崩
+    import merchant_report.diagnose as diag
+    orig = diag.collect_diagnostic_pack
+    diag.collect_diagnostic_pack = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        p3 = FakePage(values=["", ""], type_sticks=False, accepts=False, day_cells=0)
+        ad3, logs3 = mk(p3)
+        p3.mouse.click = _open_but_dead(p3)
+        assert ad3._set_bill_inputs(p3, "2026-09-30") is False, logs3
+    finally:
+        diag.collect_diagnostic_pack = orig
+    print("✅ M4 取证异常绝缘: collect 抛异常 → 主流程照常返回 False")
+
+    # ④ 契约: 挂点齐全(面板未能打开 / 兜底失败) + 三种 reason 可区分 + 陈旧错字消失
+    setter = inspect.getsource(A._set_bill_inputs)
+    assert "_date_pack" in setter, "对账页失败必须写日期现场包"
+    assert setter.count("_date_pack") >= 2, "两个挂点: 面板未能打开 + 日历兜底失败"
+    assert "_CAL_FAIL" in setter and "_DISABLED" in setter, \
+        "三种 reason 可区分: 键入未收敛(独立日志) / 日历兜底失败 / 日格禁用"
+    assert "日格禁用" in inspect.getsource(A._click_bill_day_once), "日格禁用要就地判(不点)"
+    import re as _re
+    assert not _re.search(r"面[0-9]|面\{", inspect.getsource(A)), "「面」分隔符错字必须清零"
+    assert "{m:02d}-{day:02d}" in inspect.getsource(A._mark_day_cell), "desc 改为常规 - 分隔"
+    print("✅ M4 对账页契约: 两个挂点 + 三种 reason 可区分 + 错字清零")
+
+
 if __name__ == "__main__":
     main()
+    test_m4_bill_click_once_and_pack()

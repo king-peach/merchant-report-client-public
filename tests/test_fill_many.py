@@ -29,20 +29,13 @@ def check(name, cond, extra=""):
 
 
 def make_template(path):
-    """模仿真模板结构: 第 5 行指标名, 第 6 行起是数据区, B 列是公式列。
-
-    表头锚点(主站营业额/京东外卖数据/美团管家)与真模板同列同措: 结构预检(任务 I)靠它们判
-    版本, 缺锚点的表会被判 unknown → 拒写(真实产品里正是要防"猜列写错")。
-    """
+    """模仿真模板结构: 第 5 行指标名, 第 6 行起是数据区, B 列是公式列。"""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = SHEET
     ws["A5"] = "日期"
     ws["B5"] = "星期"
     ws["C5"] = "营业额"
-    ws["DJ5"] = "主站营业额"
-    ws["HH1"] = "京东外卖数据"
-    ws["HN1"] = "美团管家"
     ws["B6"] = '=TEXT(A6,"AAAA")'
     ws["E6"] = "=C6*2"
     wb.create_sheet("Sheet3")

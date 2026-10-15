@@ -69,29 +69,45 @@ def main():
     sys.stderr.write(f"[kernel] merchant={args.merchant} platform={args.platform} "
                      f"scope={args.scope} store_id={args.store_id} date={args.date}\n")
 
+    # EventSink 必须**早于开工前检查**创建: 2026-09-14 真机 —— 4 平台 + 管家/京东整天全部倒在
+    # 这几项检查上, 而失败只打了一行裸 JSON, 既不落盘日志也不进汇总 → 用户日志只剩一行 date=,
+    # 完全看不出"当天为什么什么都没跑"。检查失败同样是**任务结果**, 必须走 sink(落盘 + 界面可见)。
+    # sink 只依赖 args.download_dir(不依赖 cfg), 所以能安全提前到这里。
+    sink = EventSink("task-" + datetime.now().strftime("%Y%m%d-%H%M%S"), to_stdout=True,
+                     echo_ndjson_path=_run_log_path(args.download_dir, args.platform))
+    if sink.echo_path:
+        sys.stderr.write(f"[kernel] 本次运行日志(可复查/可发我): {sink.echo_path}\n")
+
+    def _preflight_fail(code, message, retryable):
+        """开工检查未通过: 先给人看的日志、再发结果事件、落盘后退出(保证 ndjson flush)。"""
+        sink.log(f"❌ 开工检查未通过: {message}", level="warn")
+        sink.result(ok=False, error_code=code, message=message, retryable=retryable)
+        sink.close()
+        sys.exit(1)
+
     # 模板兜底校验(壳已查一次; 双保险)
     if not os.path.isfile(args.template):
-        print('{"type":"result","ok":false,"error_code":"E_TEMPLATE_MISSING",'
-              '"message":"模板文件不存在: %s (可能被移动或改名，请到设置重新选择)","retryable":false}' % args.template)
-        sys.exit(1)
+        _preflight_fail("E_TEMPLATE_MISSING",
+                        f"模板文件不存在: {args.template} (可能被移动或改名，请到设置重新选择)", False)
     # 可写性预检(2026-10-01 Windows 真机: 模板开在 Excel 里 → 采集跑完几分钟才在保存时炸
     #   `[Errno 13] Permission denied`; 现在**开工前**就报清楚, 别浪费用户的时间)
+    # 2026-10-15 升级: 不再"一看被占就失败" —— 用户当场关掉文件就能接着跑, 所以**自动等待释放**
+    # (最多 60 秒, 每 5 秒一探, 释放即继续), 期间把"谁占着/还等多久"实时打给用户。
     try:
-        import json as _json
-        from .fill import ensure_writable
+        from .fill import ensure_writable, wait_writable
         _ok, _why = ensure_writable(args.template)
         if not _ok:
-            print(_json.dumps({"type": "result", "ok": False, "error_code": "E_TEMPLATE_LOCKED",
-                               "message": _why, "retryable": True}, ensure_ascii=False))
-            sys.exit(1)
+            if not wait_writable(args.template, "模板", total_s=60, poll_s=5,
+                                 log=lambda m: sink.log(m, level="warn")):
+                _preflight_fail("E_TEMPLATE_LOCKED", f"{_why}（已自动等待 60 秒仍未释放）", True)
     except SystemExit:
         raise
     except Exception:
+        # 宽容性保留: 探测环节自身出问题(非 Windows 权限/异常环境)不许拦任务 —— 放行给后续逻辑,
+        # 真有问题会在保存时以明确文案暴露(不因"检查器坏了"误杀正常任务)。
         pass
     if args.scope == "store" and not args.store_id:
-        print('{"type":"result","ok":false,"error_code":"E_NO_STORE",'
-              '"message":"单店模式需选择门店(先跑一次全部门店任务以发现门店)","retryable":false}')
-        sys.exit(1)
+        _preflight_fail("E_NO_STORE", "单店模式需选择门店(先跑一次全部门店任务以发现门店)", False)
 
     cfg = load_config(args.config)
     if args.download_dir:
@@ -107,10 +123,6 @@ def main():
         "store_details": args.store_details or "",
         "credentials": {"username": args.username, "password": args.password},
     }
-    sink = EventSink("task-" + datetime.now().strftime("%Y%m%d-%H%M%S"), to_stdout=True,
-                     echo_ndjson_path=_run_log_path(args.download_dir, args.platform))
-    if sink.echo_path:
-        sys.stderr.write(f"[kernel] 本次运行日志(可复查/可发我): {sink.echo_path}\n")
     human = HumanBridge(from_stdin=True)
     # 常驻 stdin 分发器(需求 F): 一个读取线程按类型分发 —— 人工响应 → HumanBridge 队列;
     # 「展示过程」开关 → browser_window.request(只改标志, CDP 仍由主线程安全点执行)。
