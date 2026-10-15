@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""美团管家: 敏感操作(IA/IB) + 当日工时(IC) + 线上/线下单量(ID/IE/IF) 接入测试。
+"""美团管家: 敏感操作(HZ/IA) + 当日工时(IB) + 线上/线下单量(IC/ID/IE) 接入测试。
 
 真机依据(2026-10-06 长沙绿地之窗店, 2026-10-09 探针复核):
   ① 渠道读数 ↔「订单来源」详情页**逐项相等**: 店内18 = 扫码点餐9+收银POS9;
@@ -72,23 +72,23 @@ def main():
     assert gj._sens_from_bodies(["不是json", ""]) is None
     print("② 敏感操作解析 ✓  (times=6 / amt=131.4; 空壳、干扰键、垃圾→None)")
 
-    # ③ build_write_set: 六列 IA/IB/IC/ID/IE/IF
+    # ③ build_write_set: 六列 HZ/IA/IB/IC/ID/IE
     p = dict(CH_1006)
     p["_sensitive"] = {"times": 6.0, "amt": 131.4}
     w = gm.build_write_set(p)
-    assert (w["IA"], w["IB"]) == (6.0, 131.4), w
-    assert w["IC"] == 0, w
-    assert (w["ID"], w["IE"], w["IF"]) == (192.0, 18.0, 210.0), w
-    print("③ write_set ✓  (IA=6 IB=131.4 IC=0 ID=192 IE=18 IF=210)")
+    assert (w["HZ"], w["IA"]) == (6.0, 131.4), w
+    assert w["IB"] == 0, w
+    assert (w["IC"], w["ID"], w["IE"]) == (192.0, 18.0, 210.0), w
+    print("③ write_set ✓  (HZ=6 IA=131.4 IB=0 IC=192 ID=18 IE=210)")
 
-    # ③' 无 _sensitive → IA/IB 留空; ID/IE/IC 照写
+    # ③' 无 _sensitive → HZ/IA 留空; IC/ID/IB 照写
     w2 = gm.build_write_set(dict(CH_1006))
-    assert "IA" not in w2 and "IB" not in w2, w2
-    assert (w2["ID"], w2["IE"], w2["IC"]) == (192.0, 18.0, 0), w2
-    # ③'' 整页解析空 → 连 IC/ID 都不写(最危险的错法: 把"没抓到"写成"全0")
+    assert "HZ" not in w2 and "IA" not in w2, w2
+    assert (w2["IC"], w2["ID"], w2["IB"]) == (192.0, 18.0, 0), w2
+    # ③'' 整页解析空 → 连 IB/IC 都不写(最危险的错法: 把"没抓到"写成"全0")
     w3 = gm.build_write_set({})
-    assert not any(k in w3 for k in ("IA", "IB", "IC", "ID", "IE", "IF")), w3
-    print("③' 无敏感数据→IA/IB留空; 解析空→六列全不写 ✓")
+    assert not any(k in w3 for k in ("HZ", "IA", "IB", "IC", "ID", "IE")), w3
+    print("③' 无敏感数据→HZ/IA留空; 解析空→六列全不写 ✓")
 
     # ④ _scrape_one 接线: 抓到 → 并入 parsed["_sensitive"]; 抓不到 → 照常返回不写
     real_parse = gm.scrape_overview_text
@@ -111,15 +111,15 @@ def main():
             ws = gm.build_write_set(got)
             if has:
                 assert got.get("_sensitive") == {"times": 6.0, "amt": 131.4}, got.get("_sensitive")
-                assert (ws["IA"], ws["IB"]) == (6.0, 131.4), ws
+                assert (ws["HZ"], ws["IA"]) == (6.0, 131.4), ws
             else:
                 assert "_sensitive" not in got, got
-                assert "IA" not in ws and "IB" not in ws, ws
-            # 两种情况 ID/IE/IC 都必须照写(敏感操作抓不到 ≠ 本店其它列不写)
-            assert (ws["ID"], ws["IE"], ws["IF"], ws["IC"]) == (192.0, 18.0, 210.0, 0), ws
+                assert "HZ" not in ws and "IA" not in ws, ws
+            # 两种情况 IC/ID/IB 都必须照写(敏感操作抓不到 ≠ 本店其它列不写)
+            assert (ws["IC"], ws["ID"], ws["IE"], ws["IB"]) == (192.0, 18.0, 210.0, 0), ws
     finally:
         gm.scrape_overview_text = real_parse
-    print("④ _scrape_one 接线 ✓  (抓到并入 _sensitive / 抓不到留空, ID/IE/IC 不受影响)")
+    print("④ _scrape_one 接线 ✓  (抓到并入 _sensitive / 抓不到留空, IC/ID/IB 不受影响)")
 
     print("\n✅ 管家 敏感操作·当日工时·线上线下单量 接入测试全绿")
 

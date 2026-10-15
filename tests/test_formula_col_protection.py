@@ -195,12 +195,19 @@ def meituan_write_set():
 
 
 def build_sheet():
-    """合成模板(表头第 5 行 + 禁写列第 6 行公式 + A6 日期) → (wb, ws)。"""
+    """合成模板(表头第 5 行 + 禁写列第 6 行公式 + A6 日期) → (wb, ws)。
+
+    另加**结构预检锚点**(任务 I): 真模板靠这三处判版本(新版 = DJ/HH/HN), 缺锚点的表会被
+    fill 判 unknown → 拒写(那正是产品要防的"猜列写错")。本夹具按**新版**列位摆锚点。
+    """
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "测试店"
     for col, name in HEADERS.items():
         ws[f"{col}5"] = name
+    ws["DJ5"] = "主站营业额"        # 平移探针 1(新版 DJ / 旧版 DK)
+    ws["HH1"] = "京东外卖数据"      # 平移探针 2(新版 HH / 旧版 HI)
+    ws["HN1"] = "美团管家"          # 平移探针 3(新版 HN / 旧版 HO)
     for col, f in FORMULAS.items():
         ws[f"{col}6"] = f
     ws["A6"] = datetime.datetime.strptime(DATE, "%Y-%m-%d")

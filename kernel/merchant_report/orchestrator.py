@@ -687,6 +687,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
              skip_browser=False, llm_client=None, show_browser=False):
     from .events import EventSink, HumanBridge
     sink = sink or EventSink("task")
+    # fill 的结构预检告警(版本判不出 → 跳过写入)要进壳的日志面板, 见 fill.set_log_sink
+    from . import fill as _fill_mod
+    _fill_mod.set_log_sink(sink)
     human = human or HumanBridge()
     date = date or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     date_from = date_from or date
@@ -1039,8 +1042,13 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                         _open_stores = [s for s in _stores if s.get("open")]
                         _rest = [s for s in _stores if not s.get("open")]
                         if _stores:
+                            # 补门店名(2026-10-15 任务 J): 只加日志, **不改跳过行为** ——
+                            # 长房东郡/兰亭这类"平台标非营业中"的店属设计跳过, 但事后对账
+                            # ("这家为什么缺淘宝对比格")时, 光看个数对不出来。
+                            _rest_names = "、".join(str(s.get("name") or "?") for s in _rest[:12])
                             sink.log(f"🏬 门店清单 {len(_stores)} 家: 营业中 {len(_open_stores)} 家 → 只抓这些; "
-                                     f"跳过 {len(_rest)} 家(非营业中)")
+                                     f"跳过 {len(_rest)} 家(非营业中)"
+                                     + (f": {_rest_names}{'…' if len(_rest) > 12 else ''}" if _rest else ""))
                         if _open_stores:
                             sink.log(f"🛰 逐店抓取开始: {len(_open_stores)} 家(外卖本店列 + 外卖/爆品团的"
                                      f"「商圈同行前10%均值」基准列, 预计每家 20~30 秒)")
@@ -1409,14 +1417,17 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             _id_by_name = {str(r.get("B") or "").strip(): str(r.get("C") or "").strip()
                            for r in _rows_last if isinstance(r, dict) and r.get("B")}
             if callable(_ledger_fn):
-                sink.step_start("promo", "采集推广", f"{len(_matched)} 店 × CE/CJ 流水"
+                sink.step_start("promo", "采集推广",
+                                f"{len(_matched)} 店 × {len(dates)} 天 × CE/CJ 流水"
                                 + ("+ CF/CG 概览(昨日)" if dates[-1] == _yday else "(CF/CG: 非昨日→0)"))
+                _promo_try = 0                     # 逐店逐日尝试数(任务 J·C5: 覆盖度要可核对)
                 for _nm, _sn, _why in _matched:
                     _sid = _why if _sn is None else (_id_by_name.get(_nm) or "")
                     if not _sid:
                         sink.log(f"  · {_nm}: 报表里没有门店编号, 跳过推广抓取", level="warn")
                         continue
                     for _d in dates:
+                        _promo_try += 1
                         try:
                             _pl = _ledger_fn(_sid, _d)
                             if not isinstance(_pl, dict):
@@ -1428,6 +1439,10 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                                     or _pl.get("recharge") is not None):
                             _sink_sheet = _sn if _sn else "_本店"
                             promo_by_sheet.setdefault(_sink_sheet, {})[_d] = _pl
+                        else:
+                            # 单条失败**必须留痕**(不静默): 真机 17/17 全失败时, 光看
+                            # "流水 0 店"分不出是没跑、还是跑了但每天都失败。
+                            sink.log(f"  · {_nm} {_d}: 对账页未取到流水 → 该日 CE/CJ 留空", level="warn")
                     # CF/CG: 仅「目标日==昨天」时抓概览(切昨日+硬验收在 capture_promo 内)
                     if dates[-1] == _yday and callable(_ov_fn):
                         try:
@@ -1451,7 +1466,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                 else:
                     promo_pri_ov = (stats or {}).get("promo") or None
                 sink.step_ok("promo", "采集推广",
-                             f"流水 {len(promo_by_sheet)} 店 / 概览 {len(promo_ov_by_sheet)} 店")
+                             f"流水 {len(promo_by_sheet)} 店 / 概览 {len(promo_ov_by_sheet)} 店"
+                             + (f"（逐店逐日 {_promo_try} 次尝试；失败分支已逐条告警）"
+                                if _promo_try else ""))
             else:
                 sink.log("ℹ️ 推广: 本平台无 capture_promo_ledger → 跳过(淘宝/京东走各自机制)")
         elif abort_salvage:
@@ -1461,8 +1478,10 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         elif not _matched:
             sink.log(f"ℹ️ 推广: 未匹配到模板门店 Sheet(scope={scope}) → CE/CJ 留空"
                      f"(推广流水按门店写入各自 Sheet)", level="warn")
-        # 商圈Top: 仅**单门店视角**可得(wmPoiId=门店编号)。用户口径: 做单门店数据时才采集,
-        # 全部门店模式不采集(Top 列留空)。抓不到就留空, 绝不臆造。
+        # 商圈Top: 仅**单门店视角**可得(wmPoiId=门店编号), 但**逐店 × 逐日**都要采 ——
+        # 2026-10-15 用户口径(任务 J): "以前的全部门店逻辑要去掉, 实际就是走的单店逻辑",
+        # 模板要以报表结果为准 → 每家 matched 店 × 区间内每一天都采一次(原来只采 dates[-1])。
+        # 抓不到就留空, 绝不臆造。
         _cap_on = (cfg.get("defaults") or {}).get("capture_circle_top") is not False
         # 门槛必须**说明白为什么没跑**: 2026-09-28 用户报「TOP 还是没取到」时, 日志里
         # 一条商圈记录都没有 → 既不知道跑没跑, 也不知道卡在哪。这里逐个条件给理由。
@@ -1483,27 +1502,33 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             _id_by_name = {str(r.get("B") or "").strip(): str(r.get("C") or "").strip()
                            for r in _rows_last if isinstance(r, dict) and r.get("B")}
             sink.step_start("circle", "采集商圈Top",
-                            f"单门店视角 × {len(store_plan['matched'])} 店 × {dates[-1]}")
+                            f"单门店视角 × {len(store_plan['matched'])} 店 × {len(dates)} 天")
+            _circ_ok, _circ_try = 0, 0
             for _nm, _sn, _why in store_plan["matched"]:
                 _sid = _id_by_name.get(_nm) or ""
                 if not _sid:
                     sink.log(f"  · {_nm}: 报表里没有门店编号, 跳过商圈采集", level="warn")
                     continue
-                _capd = None
-                _ct0 = time.time()
-                try:
-                    _capd = _ad.capture_circle(_sid, date=dates[-1])
-                except Exception as e:
-                    sink.log(f"  · {_nm}: 商圈采集异常 {str(e)[:80]}", level="warn")
-                if _capd:
-                    circle_by_sheet[_sn] = _capd
-                    _mm = mt_map.circle_write_set_all(_capd)
-                    sink.log(f"  ✓ {_nm} → 商圈列 主站{len(_mm['main'])}/拼好饭{len(_mm['bao'])}"
-                             f"（口径 {_capd.get('bench') or '默认'} · {time.time() - _ct0:.0f}s）")
-                else:
-                    sink.log(f"  · {_nm}: 商圈数据未取到(该店 Top 列留空)", level="warn")
+                for _d in dates:
+                    _circ_try += 1
+                    _capd = None
+                    _ct0 = time.time()
+                    try:
+                        _capd = _ad.capture_circle(_sid, date=_d)
+                    except Exception as e:
+                        sink.log(f"  · {_nm} {_d}: 商圈采集异常 {str(e)[:80]}", level="warn")
+                    if _capd:
+                        circle_by_sheet[(_sn, _d)] = _capd
+                        _circ_ok += 1
+                        _mm = mt_map.circle_write_set_all(_capd)
+                        sink.log(f"  ✓ {_nm} {_d} → 商圈列 主站{len(_mm['main'])}/拼好饭{len(_mm['bao'])}"
+                                 f"（口径 {_capd.get('bench') or '默认'} · {time.time() - _ct0:.0f}s）")
+                    else:
+                        sink.log(f"  · {_nm} {_d}: 商圈数据未取到(该日该店 Top 列留空)", level="warn")
             sink.step_ok("circle", "采集商圈Top",
-                         f"{len(circle_by_sheet)}/{len(store_plan['matched'])} 店取到商圈值")
+                         f"{_circ_ok}/{_circ_try} 店×天取到商圈值"
+                         + (f"（{len(store_plan['matched'])} 店 × {len(dates)} 天）"
+                            if _circ_try else ""))
         # 商圈/推广采集是本次任务最后一次用浏览器 → 到这里才真正释放
         _stop_browser()
         per_store_filled = []
@@ -1607,8 +1632,11 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                         _warn_no_store_weather(sink, _sn, _wx_targets, _warned)
                         _ws2 = mt_map.build_write_set(_row, _brow,
                                                       weather=_wx_of(wx_by_sheet, wmap, _sn, d))
-                        _c = circle_by_sheet.get(_sn)
-                        if _c and d == dates[-1]:
+                        # 商圈TOP列: 逐店**逐日**取(2026-10-15 任务 J 去掉 dates[-1] 门槛 ——
+                        # 多日区间时每天的行都要有 TOP 值; 该日该店没采到 → 不写(留空),
+                        # 绝不用别天的值顶替)。差异列仍不写(模板公式自己算)。
+                        _c = circle_by_sheet.get((_sn, d))
+                        if _c:
                             _cw = mt_map.circle_write_set_all(_c)
                             _ws2.update(_cw["main"])
                             _ws2.update(_cw["bao"])
@@ -1631,6 +1659,10 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         _done = set()
         for _sn, _d, _fr in _results:
             _done.add((_fr.get("requested") or _sn, _d))
+            if _fr.get("skipped_unknown_layout"):
+                # 结构未识别 → fill 已拒写(warn 日志在 fill 里), 这里只登记失败: 别报"✓ 行None (0格)"
+                fill_errs.append(f"[{_sn}] {_d}: 模板结构未识别, 已跳过写入")
+                continue
             if _fr.get("reread_bad"):
                 sink.log(f"  ⚠️ [{_sn}] {_d} 回读不一致列: {','.join(_fr['reread_bad'][:8])}", level="warn")
             if _sn in _main_names:
@@ -1653,10 +1685,11 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                         "写入格数/天": filled_rows[0][1]["filled"] if filled_rows else 0,
                         "拼好饭报表": "已取到" if bao_rows else "未取到(拼好饭列留空)",
                         "流量": "已填本店值(报表自带)",
-                        "商圈TOP": (f"已填 {len(circle_by_sheet)} 店（口径 "
+                        "商圈TOP": (f"已填 {len(circle_by_sheet)} 店×天"
+                                    f"（{len({s for s, _d in circle_by_sheet})} 店；口径 "
                                     f"{next(iter(circle_by_sheet.values())).get('bench') or '默认'}）"
                                     if circle_by_sheet else
-                                    "未采集(仅单门店视角可得：全部门店模式或单店漏斗不可用时留空)"),
+                                    "未采到(逐店逐日单门店视角采集；单店漏斗不可用/无浏览器会话时留空)"),
                         "推广": _promo_summary()})
         # 数值合理性校验(规格书 铁律 8 / T11) + 表头名回退诊断: 收尾统一打印, 便于 grep 复验
         for _w in mt_map.validate_report():
@@ -1839,6 +1872,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         _done = set()
         for _sn, _d, _fr in _results:
             _done.add((_fr.get("requested") or _sn, _d))
+            if _fr.get("skipped_unknown_layout"):
+                fill_errs.append(f"[{_sn}] {_d}: 模板结构未识别, 已跳过写入")
+                continue
             if _fr.get("reread_bad"):
                 sink.log(f"  ⚠️ [{_sn}] {_d} 回读不一致列: {','.join(_fr['reread_bad'][:8])}", level="warn")
             if _sn in _main_names:
@@ -1897,7 +1933,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
         sink.result(ok=True, outputs=outputs, summary=summary)
         return {"outputs": outputs, "summary": summary, "dates": dates}
 
-    # 1.7 美团管家支路: 多门店模式(一店一Sheet, Sheet名=门店名关键字; 脑图口径 HO~HT)
+    # 1.7 美团管家支路: 多门店模式(一店一Sheet, Sheet名=门店名关键字; 脑图口径 HN~HY)
     # 无全店聚合视图 → scope=all = 每家门店各自导出+各自填Sheet; 单店 = 只跑 keyword 店
     if platform == "meituan_gj":
         from .platforms import gj_mapping
@@ -1981,7 +2017,7 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
             return None
         filled_rows, fill_errs = [], []
         sink.step_start("fill", "填入模板",
-                        f"区间 {dates[0]}~{dates[-1]} 共{len(dates)}天 × {len(plan['matched'])} 店 (美团管家 HO~HT)")
+                        f"区间 {dates[0]}~{dates[-1]} 共{len(dates)}天 × {len(plan['matched'])} 店 (美团管家 HN~HY)")
         # 先算 write_set(纯计算, 不碰文件), 最后**批量写一次** —— 与淘宝/京东/美团外卖同口径。
         # 原来每店每天各自 fill_template = 每店一轮读+写+存+回读, 31 家店白花几分钟。
         # 主数据表 = 默认解析(第 3 个 sheet; 可用 config defaults.main_sheet 覆盖),
@@ -2011,6 +2047,9 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
                         message=f"美团管家批量写入失败: {str(e)[:120]}", retryable=True)
             return None
         for _sn, _d, _fr in _results:
+            if _fr.get("skipped_unknown_layout"):
+                fill_errs.append(f"[{_sn}] {_d}: 模板结构未识别, 已跳过写入")
+                continue
             filled_rows.append((_sn, _d, _fr))
             if _fr.get("reread_bad"):
                 sink.log(f"  ⚠️ [{_sn}] {_d} 回读不一致列: {','.join(_fr['reread_bad'][:8])}", level="warn")
@@ -2258,6 +2297,10 @@ def run_task(cfg, store, date=None, date_from=None, sink=None, human=None,
     _done = set()
     for _sn, _d, _fr in _results:
         _done.add((_fr.get("requested") or _sn, _d))
+        if _fr.get("skipped_unknown_layout"):
+            # 模板结构未识别 → fill 已拒写(并打了 warn): 别报"✓ 行None", 计一次失败
+            fill_errs.append(f"[{_sn}] {_d}: 模板结构未识别, 已跳过写入")
+            continue
         if _fr.get("reread_bad"):
             sink.log(f"  ⚠️ [{_sn}] {_d} 回读不一致列: {','.join(_fr['reread_bad'][:8])}", level="warn")
         if _sn in _main_names:

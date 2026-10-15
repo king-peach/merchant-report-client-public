@@ -1,40 +1,49 @@
 # -*- coding: utf-8 -*-
-"""美团管家 → 模板 HO~HZ 映射(脑图口径: 经营分析→营业概况)。
+"""美团管家 → 模板 HN~HY 映射(脑图口径: 经营分析→营业概况)。
 
 数据源: 营业概览页 DOM 直读(主路径) 或「导出」的 xlsx(备用)。
 「营业」sheet / 页面明细区的订单分类构成:
     订单分类 | 营业收入 | 营业额 | 优惠金额 | 优惠占比 | 订单量
     店内销售 / 自提销售 / 美团外卖 / 淘宝闪购 / 自营外卖 / 京东秒送(未开通渠道无该行)
 
-模板列(实测 r5):
-    HO 营业额-店内销售    ← 店内销售.营业额
-    HP 营业收入-店内销售   ← 店内销售.营业收入
-    HQ 订单量-店内销售    ← 店内销售.订单量
-    HR 营业额-自提销售    ← 自提销售.营业额
-    HS 营业收入-自提销售   ← 自提销售.营业收入
-    HT 订单量-自提销售    ← 自提销售.订单量
-    HX 自营外卖营业额     ← 自营外卖.营业额
-    HY 自营外卖收入       ← 自营外卖.营业收入
-    HZ 自营外卖单量       ← 自营外卖.订单量
-    HU/HV/HW 抖音外卖三项  ← 无渠道数据(抖音走第三方, 管家不汇总) → 留空
+模板列(**10.13 版实测**, 逐列对照见 refs 双模板表头):
+    HN 营业额-店内销售    ← 店内销售.营业额
+    HO 营业收入-店内销售   ← 店内销售.营业收入
+    HP 订单量-店内销售    ← 店内销售.订单量
+    HQ 营业额-自提销售    ← 自提销售.营业额
+    HR 营业收入-自提销售   ← 自提销售.营业收入
+    HS 订单量-自提销售    ← 自提销售.订单量
+    HT/HU/HV 抖音外卖三项  ← 无渠道数据(抖音走第三方, 管家不汇总) → 见下「抖音外卖」说明
+    HW 自营外卖营业额     ← 自营外卖.营业额
+    HX 自营外卖收入       ← 自营外卖.营业收入
+    HY 自营外卖单量       ← 自营外卖.订单量
+    HZ 敏感操作次数 / IA 敏感操作金额 / IB 当日工时
+    IC 线上单量 / ID 线下单量 / IE 单量合计
 脑图另标的 HK(订单量) 出自「财务数据→账务操作统计」, 与模板美团外卖区冲突复用 → 暂不映射。
+
+⚠️ 旧版模板的管家区整体比 10.13 **右移一格**(旧版从 HO 起, 10.13 从 HN 起)。
+   本模块一律按 **10.13 列位**写死; 旧版模板由 fill 层(任务 I)的列位平移统一 +1 兜底
+   → HN 落到 HO, 以此类推。**不要**在这里按模板版本分支, 更不要动 fill 层。
+
+历史: 2026-10-15(任务 J)前本模块用的是**旧版**字母(HO 起) → 在 10.13 模板上整块右移一格,
+    `HN`(店内营业额)永远空, 客户模板公式 `IH=E+DG+HH+HN` 因此少算。现整体 -1 已修正。
 """
 GJ_MAPPING = [
-    ("HO", "店内销售", "营业额"),
-    ("HP", "店内销售", "营业收入"),
-    ("HQ", "店内销售", "订单量"),
-    ("HR", "自提销售", "营业额"),
-    ("HS", "自提销售", "营业收入"),
-    ("HT", "自提销售", "订单量"),
+    ("HN", "店内销售", "营业额"),
+    ("HO", "店内销售", "营业收入"),
+    ("HP", "店内销售", "订单量"),
+    ("HQ", "自提销售", "营业额"),
+    ("HR", "自提销售", "营业收入"),
+    ("HS", "自提销售", "订单量"),
     # 抖音外卖: **渠道行是动态的**(未开通的店后台不渲染该行)。用户口径(2026-10-08):
     # "如果有抖音外卖数据就填入, 没有就直接填 0" —— 缺该渠道 = 该店抖音外卖确实为 0(真实值)。
     # (旧代码这三列压根没映射 → 一直空; 现在加进来, 缺渠道时由 build_write_set 写 0)
-    ("HU", "抖音外卖", "营业额"),
-    ("HV", "抖音外卖", "营业收入"),
-    ("HW", "抖音外卖", "订单量"),
-    ("HX", "自营外卖", "营业额"),
-    ("HY", "自营外卖", "营业收入"),
-    ("HZ", "自营外卖", "订单量"),
+    ("HT", "抖音外卖", "营业额"),
+    ("HU", "抖音外卖", "营业收入"),
+    ("HV", "抖音外卖", "订单量"),
+    ("HW", "自营外卖", "营业额"),
+    ("HX", "自营外卖", "营业收入"),
+    ("HY", "自营外卖", "订单量"),
 ]
 
 import json as _json  # noqa: E402
@@ -288,7 +297,7 @@ def parse_summary_json(obj):
 
     obj: dict 或原始 JSON 字符串。
     失败 → (None, {"api_error": 原因}), 调用方回退 DOM; 成功时 meta 额外含:
-    source="api" 与 sensitive_from_api(或 None, 供直写 IA/IB)。
+    source="api" 与 sensitive_from_api(或 None, 供直写 HZ/IA)。
     """
     if isinstance(obj, str):
         try:
@@ -489,10 +498,10 @@ def build_write_set(parsed, weather=(None, None)):
         v = (parsed.get(cat) or {}).get(field)
         vals[col] = num(v)
     # 用户口径(2026-10-08): "美团商家中抖音外卖和自营外卖的数据需要汇总到模板里的抖音外卖数据里"
-    # → 模板「抖音外卖」(HU/HV/HW) = 后台[抖音外卖] + 后台[自营外卖] 之和
+    # → 模板「抖音外卖」(HT/HU/HV) = 后台[抖音外卖] + 后台[自营外卖] 之和
     #   (该账号后台没有"抖音外卖"行 —— 抖音外卖业务是由"自营外卖"渠道报出来的, 故必须相加)
     #   两个渠道都不存在 → 保持上面缺渠道规则的结果(0)。
-    for _col, _fld in (("HU", "营业额"), ("HV", "营业收入"), ("HW", "订单量")):
+    for _col, _fld in (("HT", "营业额"), ("HU", "营业收入"), ("HV", "订单量")):
         _sum, _hit = 0.0, False
         for _cat in ("抖音外卖", "自营外卖"):
             if _cat in _cats:
@@ -500,26 +509,26 @@ def build_write_set(parsed, weather=(None, None)):
                 _sum += num((parsed.get(_cat) or {}).get(_fld)) or 0.0
         if _hit:
             vals[_col] = _sum
-    # ── 敏感操作 (IA/IB): 「综合统计→敏感操作」详情页懒加载 XHR 抓取 ──
+    # ── 敏感操作 (HZ/IA): 「综合统计→敏感操作」详情页懒加载 XHR 抓取 ──
     #    由 meituan_gj._capture_sensitive 写入 parsed["_sensitive"]={"times":..,"amt":..};
     #    抓不到 → 不写(留空) —— "宁可不写, 也不写错"。
     _sens = parsed.get("_sensitive") if isinstance(parsed, dict) else None
     if _zero_missing and isinstance(_sens, dict):
         _t, _a = num(_sens.get("times")), num(_sens.get("amt"))
         if _t is not None:
-            vals["IA"] = _t
+            vals["HZ"] = _t
         if _a is not None:
-            vals["IB"] = _a
-    # ── 当日工时 (IC): 用户口径(2026-10-08)「数据源未定, 先填 0」 ──
+            vals["IA"] = _a
+    # ── 当日工时 (IB): 用户口径(2026-10-08)「数据源未定, 先填 0」 ──
     if _zero_missing:
-        vals["IC"] = 0
-    # ── 线上/线下单量 (ID/IE/IF): 用户口径(2026-10-08 选项B) → 渠道读数直接求和(见 online_offline) ──
+        vals["IB"] = 0
+    # ── 线上/线下单量 (IC/ID/IE): 用户口径(2026-10-08 选项B) → 渠道读数直接求和(见 online_offline) ──
     if _zero_missing:
         _on, _off = online_offline(parsed)
         if _on is not None and _off is not None:
-            vals["ID"] = _on
-            vals["IE"] = _off
-            vals["IF"] = _on + _off
+            vals["IC"] = _on
+            vals["ID"] = _off
+            vals["IE"] = _on + _off
     if weather and weather[0] is not None:
         vals["C"] = weather[0]
     if weather and len(weather) > 1 and weather[1] is not None:

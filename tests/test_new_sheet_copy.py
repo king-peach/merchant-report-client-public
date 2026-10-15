@@ -30,6 +30,11 @@ def _mk_template(path):
     ws["A5"] = "日期"
     ws["E5"] = "总营业额"
     ws["M5"] = "差异"
+    # 结构预检锚点(任务 I): 新建 Sheet 是复刻样板表的, 锚点必须一起复刻 —— 否则新表被判
+    # unknown → 拒写(fill 宁可少写也不猜列)。列位同新版模板(DJ/HH/HN)。
+    ws["DJ5"] = "主站营业额"
+    ws["HH1"] = "京东外卖数据"
+    ws["HN1"] = "美团管家"
     for i, r in enumerate(range(6, 12)):
         ws.cell(r, 1).value = 46294 + i          # A 列日期脚手架
         ws.cell(r, 5).value = 2732.7 if i == 0 else None      # 真数据(样板表当天写的)

@@ -74,17 +74,58 @@ class FakeMouse:
 
     def click(self, x, y=None):
         self.page.mouse_clicks += 1
+        if y is None:
+            return None
+        # 点日期输入框 → 记聚焦(键入路径要读它); 点 (10,10)=翻月 由 evaluate 假件计数
+        for i, inp in enumerate(self.page.flow_inputs()):
+            if abs(inp["x"] - x) < 3 and abs(inp["y"] - y) < 3:
+                self.page.focused = i
+                return None
         return None
+
+
+class FakeKeyboard:
+    """键入路径的假件: type 把 ASCII 逐字符交给页面(受控组件会吞掉 → type_sticks)。"""
+
+    def __init__(self, page):
+        self.page = page
+
+    def press(self, key):
+        p = self.page
+        if key == "ControlOrMeta+a":
+            p.typed = []                          # 全选 → 清空缓冲
+            return
+        if key == "Tab":
+            p.focused = None
+            return
+        if key == "Escape":
+            p.typed = []
+            return
+        if key == "Enter":
+            if p.type_sticks and p.focused is not None:
+                buf = "".join(p.typed)
+                if len(buf) == 10:
+                    p.values[p.focused] = buf      # 页面吃下键入 → 写进输入框
+            p.typed = []
+            return
+
+    def type(self, text, delay=None):
+        self.page.typed.extend(list(text))
 
 
 class FakePage:
     """accepts=False 模拟"页面没吃下我们的日期选择"(还停在默认昨日)。
 
-    - clicks 计数模拟\"点两次日格子\"(点满 2 次且 accepts=True 时页面才把日期写进输入框);
-    - months = 可见月标题列表(可动态改), 用于驱动**跨月翻页**测试: 点单月 chevron 时翻一页。
+    - clicks 计数模拟"点两次日格子"(点满 2 次且 accepts=True 时页面才把日期写进输入框);
+    - months = 可见月标题列表(可动态改), 用于驱动**跨月翻页**测试: 点单月 chevron 时翻一页;
+    - 2026-10-15 任务 J 新增两个开关, 用于建模"键入不生效 → 日历兜底"两态:
+        inputs=None      不给日期输入框(页面结构里压根没有 placeholder 开始/结束时间);
+        type_sticks=False 键入不吃(React 受控; Ctrl+A+type 后输入框仍空) —— 真机 10-14 就是这个态;
+                          True = 这个页面吃键入(直接键入即生效, 不该再进日历)。
     """
 
-    def __init__(self, accepts=True, values=None, body="", day_cells=1, months=None):
+    def __init__(self, accepts=True, values=None, body="", day_cells=1, months=None,
+                 inputs=True, type_sticks=False):
         self.accepts = accepts
         self.values = values if values is not None else ["2026-09-29", "2026-09-29"]
         self.body = body
@@ -94,7 +135,21 @@ class FakePage:
         self.months = months if months is not None else ["2026九月", "2026十月"]
         self.nav_clicks = 0
         self.mouse_clicks = 0
+        self.inputs = inputs
+        self.type_sticks = type_sticks
+        self.focused = None
+        self.typed = []                  # 键入序列(ASCII 字符按 30ms 一个到达, 这里按帧收集)
         self.mouse = FakeMouse(self)
+        self.keyboard = FakeKeyboard(self)
+
+    def flow_inputs(self):
+        """流量页日期输入框快照(与 meituan._FLOW_INPUTS_JS 同形: tag/placeholder/值)。"""
+        if not self.inputs:
+            return []
+        return [{"x": 100.0, "y": 60.0, "cx": 100.0, "cy": 60.0, "v": self.values[0],
+                 "ph": "开始时间", "tag": "start", "cls": "roo-input", "ro": False, "dis": False},
+                {"x": 300.0, "y": 60.0, "cx": 300.0, "cy": 60.0, "v": self.values[1],
+                 "ph": "结束时间", "tag": "end", "cls": "roo-input", "ro": False, "dis": False}]
 
     def evaluate(self, js, arg=None):
         if "roo-datepicker-header" in js:            # 可见月标题(隐藏头不在假件里)
@@ -107,6 +162,8 @@ class FakePage:
             return {"x": 10, "y": 10}
         if "document.body" in js and "innerText" in js:   # 读正文(容忍空格差异)
             return self.body
+        if "pri = p =>" in js:                       # _FLOW_INPUTS_JS(日期控件探测)
+            return self.flow_inputs()
         if "data-hm-day" in js:                      # 面板里打日格子标记
             return self.day_cells
         if "data-hm-custom" in js:                   # 「自定义」标记
@@ -157,7 +214,6 @@ def main():
     assert any("未确认" in m for _, m in logs2), logs2
     assert any("取证" in m for _, m in logs2), logs2
     print("✅ 页面没吃下选择(仍是昨日) → 判「未确认」+ 留下取证")
-
     # ③ 页面文本里有硬标记(输入框读不到时的第二证据)
     p3 = FakePage(accepts=False, values=["", ""], body="已选时间：2026/09/30 自定义")
     ad3, logs3 = mk(p3)
@@ -179,46 +235,95 @@ def main():
     assert p4.nav_clicks >= 1, f"跨月目标必须触发翻月(nav_clicks={p4.nav_clicks})"
     assert p4.mouse_clicks >= 1, "翻月必须用真鼠标点击(合成 click 不稳)"
     assert p4.values == ["2026-09-30", "2026-09-30"], p4.values
-    print("✅ 跨月: 2026十月 →(单月chevron)→ 2026九月 → 点两次格子 → 生效")
+    print(f"✅ 跨月: 2026十月 →(单月chevron)→ 2026九月 → 点两次格子 → 生效")
 
-    # ⑤ 关键: 调用方(capture_circle)必须在未确认时放弃该店, 不能继续抓
+    # ⑥ 2026-10-15 任务 J: 键入**生效**的那一态 —— 不该再进日历(省时且避免面板副作用)
+    p5 = FakePage(accepts=False, values=["", ""], type_sticks=True)
+    ad5, logs5 = mk(p5)
+    assert ad5._set_flow_date(p5, "2026-09-30") is True, logs5
+    assert p5.values == ["2026-09-30", "2026-09-30"], p5.values
+    assert p5.clicks == 0, "键入已生效时不该再点日格子"
+    assert any("键入" in m and "已生效" in m for _, m in logs5), logs5
+    print("✅ 键入态: 输入框吃键入 → 直接生效(不进日历, 不点格子)")
+
+    # ⑦ 2026-10-15 任务 J: 键入**不生效**的那一态(真机 10-14) → 必须自动落到日历兜底
+    p6 = FakePage(accepts=True, values=["", ""], type_sticks=False)
+    ad6, logs6 = mk(p6)
+
+    class AutoTick6(FakeLocator):
+        def click(self, timeout=None):
+            self.page.clicks += 1
+            self.page.tick("2026-09-30")
+            return None
+
+    p6.locator = lambda sel: AutoTick6(p6, p6.values) if "data-hm-day" in sel else FakeInputs(p6, p6.values)
+    assert ad6._set_flow_date(p6, "2026-09-30") is True, logs6
+    assert any("键入未生效" in m for _, m in logs6), f"键入失败必须留证: {logs6}"
+    assert any("日历点选" in m for _, m in logs6), logs6
+    assert p6.values == ["2026-09-30", "2026-09-30"], p6.values
+    print("✅ 键入不生效 → 自动落日历点选(两态建模; 真机 10-14 就是这一态)")
+
+    # ⑦' 两态都不成 → 未确认(留空), 绝不用默认日期的数据冒充
+    p7 = FakePage(accepts=False, values=["", ""], type_sticks=False)
+    ad7, logs7 = mk(p7)
+    assert ad7._set_flow_date(p7, "2026-09-30") is False, logs7
+    assert any("未确认" in m for _, m in logs7), logs7
+    print("✅ 键入+日历都不成 → 「未确认」(调用方留空)")
+
+    # ⑧ 关键: 调用方(capture_circle)必须在未确认时放弃该店, 不能继续抓
     src = inspect.getsource(mt.MeituanAdapter.capture_circle)
     assert "if not self._set_flow_date(page, date)" in src, "capture_circle 必须检查日期是否确认"
     assert "该店商圈列留空" in src, "未确认时应放弃该店(留空)而不是照抓"
     print("✅ capture_circle: 日期未确认 → 放弃该店(商圈列留空), 不拿默认日期冒充")
 
-    print("✅ 流量页日期(硬证据验收 + 未确认即放弃 + 跨月翻页)单测全部通过")
+    print("✅ 流量页日期(键入/日历两态 + 硬证据验收 + 未确认即放弃 + 跨月翻页)单测全部通过")
 
 
 def test_click_twice_contract():
-    """锁住 2026-10-08/2026-10-10 的真根因, 防止退化。
+    """锁住 2026-10-08 / 2026-10-10 / 2026-10-15 的真根因, 防止退化。
 
     真机证据: 点1次后 已选时间仍是 2026-10-07 / 输入框 ['',''];
               点2次后 已选时间 2026-10-06 / 输入框 ['2026-10-06','2026-10-06']。
     跨月证据: 旧代码抓隐藏年图层(头「2021-2032」)翻页=年跳 → 18/18 未确认;
               改用可见月标题 + 单月 chevron 后探针 probe_flow_date6 打通。
+    2026-10-15 任务 J 证据: 真机仍 18/18「未确认·输入框=['','']」(页面停在默认 2026-10-13)
+              → 重写为「探测 → 键入(读回为准) → 日历点选兜底」; 本契约随之更新。
     """
     src = inspect.getsource(MeituanAdapter._set_flow_date)
-    assert "range(3)" in src, "点格子最多三次(起点+终点, 余量给面板重渲染)"
-    assert "data-hm-day" in src, "要 JS 打标记 + locator 点击(合成 .click() 无效)"
-    assert "data-hm-custom" in src, "「自定义」要打标记点击"
-    assert "\\s+" in src, "「自定义」要归一化匹配(实际 innerText 是 自定义\\n~)"
-    assert "disabled" in src and "old" in src, "要跳过 disabled(未来)/old(上月) 格子; 且必须看 td 自身 class"
-    assert "input_value" in src and "已选时间" in src, "双证据验收必须保留"
-    assert ".type(" not in src, "不许退回「往输入框键入日期」(roo 受控组件不吃, 已实测无效)"
-    # 2026-10-08 真机 trace: 点「自定义」后面板**已自动展开**(日格=84); 再点输入框会把面板关掉(日格=0)。
-    assert 'locator("input[placeholder=\'开始时间\']").first.click' not in src, \
-        "不许再点输入框(会把已展开的面板关掉 —— 真机实测 日格 84→0)"
-    assert "offsetParent !== null" in src, "面板/格子要用 offsetParent 判可见(隐藏年份面板有同名 class)"
-    assert "for (const p of panels)" in src and "if (cells.length) break" in src, \
-        "要在可见面板里逐面板找格子(不再只看 panels[0])"
-    # 2026-10-10 跨月修复的守卫
-    assert "chevron-left" in src and "chevron-right" in src, "翻月只许用单月 chevron-left/right"
-    assert "double" in src, "必须显式排除 double-left/right(年跳, 实测跳错年)"
-    assert "_flow_visible_month" in src, "月标题必须按**可见性**读取(隐藏年图层头是干扰)"
-    assert "range(36)" in src, "翻月要有次数上限"
+    # 交互姿势: 控件靠 placeholder 认(本页两框默认空, 不能按"值像日期"找)
+    assert "_FLOW_INPUTS_JS" in inspect.getsource(MeituanAdapter._flow_inputs) \
+        and "开始时间" in MeituanAdapter._FLOW_INPUTS_JS, \
+        "日期控件必须按 placeholder 开始/结束时间 探测(本页两框默认为空)"
+    assert "_flow_type_dates" in src, "① 必须先试直接键入"
+    assert "_flow_verified" in src, "读回验证必须走统一的硬证据函数"
+    assert "已选时间" in inspect.getsource(MeituanAdapter._flow_verified), \
+        "第二证据(页面「已选时间：」文本)必须保留"
+    assert "_flow_read" in src, "控制台/失败分支要能读到当前输入框值(取证)"
+    # 日历兜底(点两次同一格 + Esc 清场重来)
+    assert "_click_same_cell_twice" in src, "日历兜底必须走成对点选(同一格两击)"
+    pair = inspect.getsource(MeituanAdapter._click_same_cell_twice)
+    assert "_mark_day_cell" in pair, "成对点选要先标记目标格"
+    assert pair.count("click") >= 2, "成对协议要**两击**(起点+终点)"
+    assert "data-hm-day" in MeituanAdapter._MARK_DAY_JS, "要 JS 打标记 + locator 点击(合成 .click() 无效)"
+    assert "data-hm-custom" in inspect.getsource(MeituanAdapter._flow_open_custom), \
+        "「自定义」要打标记点击"
+    assert "\\s+" in inspect.getsource(MeituanAdapter._flow_open_custom), \
+        "「自定义」要归一化匹配(实际 innerText 是 自定义\\n~)"
+    assert "_clear_picker" in src, "成对失败必须 Esc 清场重来(不在脏状态里继续试探)"
+    assert "_day_candidates" in inspect.getsource(MeituanAdapter._mark_day_cell), \
+        "格子候选要先走面板感知的 _day_candidates(双面板/邻月尾巴格)"
+    assert "disabl" in MeituanAdapter._MARK_DAY_JS and "old" in MeituanAdapter._MARK_DAY_JS, \
+        "退回标记路径也要跳过 disabled/邻月格"
+    # 跨月(2026-10-10 修复的守卫)
+    assert "_nav_month_roo" in src, "翻月要有独立步骤"
+    nav = inspect.getsource(MeituanAdapter._nav_month_roo)
+    assert "chevron-left" in nav and "chevron-right" in nav, "翻月只许用单月 chevron-left/right"
+    assert "double" in nav, "必须显式排除 double-left/right(年跳, 实测跳错年)"
+    assert "_flow_visible_month" in nav, "月标题必须按**可见性**读取(隐藏年图层头是干扰)"
+    assert "range(36)" in nav, "翻月要有次数上限"
+    assert "range(1, 3)" in src, "日历兜底要有轮次上限(不与下载页共用 range(3) 的旧口径)"
     assert "面板未能打开" in src, "打不开面板 → 留空并告警(宁可不写)"
-    print("✅ 契约: 点两次 + 归一化匹配自定义 + 跳过禁用格 + 双证据验收 + 跨月单月chevron(排除年跳)")
+    print("✅ 契约: 两态(键入/日历) + 同一格两击 + 归一化自定义 + 跳过禁用格 + 跨月单月chevron(排除年跳)")
 
 
 def test_visible_month_parse():

@@ -119,8 +119,8 @@ def _sens_from_bodies(bodies):
 
     真机结构(2026-10-08/09): POST /web/api/v2/bi/runtime/query/graph (queryErpngSenCountSQL)
     响应 data.summary 里**精确键**:
-      "sensitiveTimes": {"targetNum": 6, ...}   ← IA 敏感操作次数
-      "sensitiveAmt":   {"targetNum": 131.4,..} ← IB 敏感操作金额
+      "sensitiveTimes": {"targetNum": 6, ...}   ← HZ 敏感操作次数
+      "sensitiveAmt":   {"targetNum": 131.4,..} ← IA 敏感操作金额
     ⚠️ summary 里还有**同名后缀干扰键** sensitiveTimes_<id> = 操作次数占比(值 100.00%),
     必须精确键匹配, 前缀匹配会把百分比当次数写进模板。空壳响应(summary={})自然跳过。
     要求两个键同时存在才返回(缺一个 → None, 留空不写)。"""
@@ -444,7 +444,7 @@ class MeituanGjAdapter:
     # ① 登录成功后停在「请选择要登录的集团/门店」卡片页(每店一个「选 择」按钮, 文案带空格)
     # ② 点卡片「选择」→ pos 后台; 顶部菜单 报表中心 → 报表中心首页 → 点「营业概览」卡片
     # ③ 营业概览页: 日期双input(readonly, 默认今天) + 查询 + 「导出」按钮 → 直接下载 xlsx
-    # ④ 导出文件 4 sheets(营业/收款/菜品/顾客); 「营业」sheet 的订单分类构成表 = HO~HT 数据源
+    # ④ 导出文件 4 sheets(营业/收款/菜品/顾客); 「营业」sheet 的订单分类构成表 = HN~HS 数据源
     # ⑤ 无全部门店聚合视图 → scope=all = 循环每家门店逐店导出(脑图口径: 一店一Sheet)
     _SELECT_PAGE_MARK = "请选择要登录"
     _SELECT_URL = "https://pos.meituan.com/web/rms-account#/selectorg"
@@ -1276,7 +1276,7 @@ class MeituanGjAdapter:
         self.switch_timer.summary(self.sink)
         return True
 
-    # ---------- 敏感操作(IA/IB) ----------
+    # ---------- 敏感操作(HZ/IA) ----------
     # 「综合统计→敏感操作 详情」是 DPAAS 懒加载报表: 数据画在 canvas 上, DOM 文本读不到
     # (真机: 详情页 innerText 只有 463 字空壳)。唯一可靠取数 = 点进详情页, 拦
     # POST /web/api/v2/bi/runtime/query/graph 响应 (modelName=queryErpngSenCountSQL)。
@@ -1460,17 +1460,17 @@ class MeituanGjAdapter:
             self.sink.log(f"✅ {store_name}: " + " | ".join(
                 f"{c} 收入{d.get('营业收入')}/单{d.get('订单量')}"
                 for c, d in parsed.items() if c != "meta" and not str(c).startswith("_")))
-            # 敏感操作(IA/IB): 进详情页拦 XHR。抓不到 → 留空(宁可不写), 不影响本店其它列。
+            # 敏感操作(HZ/IA): 进详情页拦 XHR。抓不到 → 留空(宁可不写), 不影响本店其它列。
             # 2026-10-10 用户拍板: 全零日店(平台渲染出标签但数值全 0 = 当天确实无营业)**直接跳过**敏感 ——
             # 证据: 09-26 全零日 12/12 店敏感为空(平台侧本无数据, 非丢失); 空店即使静默收工也要 ~23s → 再省。
             if meta.get("zero_data"):
-                self.sink.log(f"⏭ {store_name}: 当日全零(无营业数据) → 敏感操作跳过(IA/IB 留空, 平台侧无数据)")
+                self.sink.log(f"⏭ {store_name}: 当日全零(无营业数据) → 敏感操作跳过(HZ/IA 留空, 平台侧无数据)")
                 return parsed
             _api_sens = meta.get("sensitive_from_api")
             if _api_sens:
                 parsed["_sensitive"] = _api_sens
                 self.sink.log(f"✍️ {store_name}: 敏感操作(接口) {_api_sens['times']:g} 次 / "
-                              f"{_api_sens['amt']:g} 元(写 IA/IB)")
+                              f"{_api_sens['amt']:g} 元(写 HZ/IA)")
                 return parsed
             try:
                 _sens = self._capture_sensitive(page)
@@ -1479,9 +1479,9 @@ class MeituanGjAdapter:
                 self.sink.log(f"⚠️ {store_name}: 敏感操作抓取异常: {str(e)[:100]}(留空)", level="warn")
             if _sens:
                 parsed["_sensitive"] = _sens
-                self.sink.log(f"✍️ {store_name}: 敏感操作 {_sens['times']:g} 次 / {_sens['amt']:g} 元(写 IA/IB)")
+                self.sink.log(f"✍️ {store_name}: 敏感操作 {_sens['times']:g} 次 / {_sens['amt']:g} 元(写 HZ/IA)")
             else:
-                self.sink.log(f"ℹ️ {store_name}: 敏感操作没抓到数据(IA/IB 留空不写)", level="warn")
+                self.sink.log(f"ℹ️ {store_name}: 敏感操作没抓到数据(HZ/IA 留空不写)", level="warn")
             return parsed
         except Exception as e:
             self._last_err = f"页面操作异常: {str(e)[:120]}"

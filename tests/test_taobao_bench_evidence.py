@@ -6,6 +6,7 @@
   ① 切不成 → _pick_bench 返回 False(上层据此令 top10 为空 → 写空), **不允许**"失败当成功";
   ② 真机排查取证: 成功/失败都要有可 grep 的日志(当前基准 / 尝试序列 / 失败原因)。
 """
+import inspect
 import os
 import pathlib
 import sys
@@ -32,7 +33,17 @@ class Log:
 
 class FakeKeyboard:
     def press(self, k):
-        pass
+        self.last = k
+
+
+class FakeMouse:
+    """_bench_reset 的空白点击: 记录坐标(取证"重试前确实清场了")。"""
+
+    def __init__(self):
+        self.clicks = []
+
+    def click(self, x, y=None):
+        self.clicks.append((x, y))
 
 
 class FakeLoc:
@@ -48,6 +59,7 @@ class FakeLoc:
 
     def click(self, timeout=None):
         self.page.clicks.append(self.sel)
+        self.page.timeouts.append(timeout)
         if "商圈同行前10%均值" in self.sel and self.page.has_option:
             self.page.bench = "商圈同行前10%均值"      # 点中了才算切成功
 
@@ -55,12 +67,15 @@ class FakeLoc:
 class FakeFrame:
     """cust = 漏斗当前基准; has_entry=基准入口在不在; has_option=下拉里有前10%选项。"""
 
-    def __init__(self, cust="比上周同时段", has_entry=True, has_option=True):
+    def __init__(self, cust="比上周同时段", has_entry=True, has_option=True, options=None):
         self.bench = cust
         self.has_entry = has_entry
         self.has_option = has_option
+        self.options = options if options is not None else ["商圈同行均值", "商圈同行前10%均值"]
         self.clicks = []
+        self.timeouts = []
         self.keyboard = FakeKeyboard()
+        self.mouse = FakeMouse()
 
     def locator(self, sel):
         return FakeLoc(self, sel)
@@ -69,6 +84,8 @@ class FakeFrame:
         # _parse_funnel: 只关心 cust 段
         if "流量转化" in js:
             return {"cust": self.bench, "ftype": "外卖", "nums": {}, "rates": {}}
+        if "dropdown" in js:                    # _bench_dropdown_options(失败取证: 实际选项)
+            return list(self.options)
         return None
 
 
@@ -111,7 +128,30 @@ def main():
     check("返回 False", a4._pick_bench(f4) is False)
     check("warn 有留空说明", any(lv == "warn" and "留空" in m for lv, m in lg4.lines), str(lg4.lines))
 
-    print("【5】上游接线: ok=bench in cust → TOP 列留空的硬门禁仍在")
+    # ── 2026-10-15 任务 J: 切基准加固(真机 27 次 `切基准 超时`, 全部 timeout=5000ms) ──
+    print("【5】切基准加固: 点击超时 5s→10s + 失败留实际下拉选项 + 重试前清场(仅限切基准一步)")
+    f5 = FakeFrame(cust="比上周同时段", has_entry=True, has_option=False,
+                   options=["商圈同行均值", "商圈同城均值", "比上周同时段"])
+    a5, lg5 = mk(f5)
+    check("切不成仍返回 False(硬门禁不变)", a5._pick_bench(f5) is False)
+    check("基准没被改(切不成绝不冒充)", f5.bench == "比上周同时段", f5.bench)
+    check("点击超时已抬到 10000ms", f5.timeouts and min(f5.timeouts) == 10000, str(f5.timeouts))
+    check("失败日志带出**实际下拉选项**(有证据才能改选择器)",
+          any("实际选项" in m and "商圈同城均值" in m for _, m in lg5.lines), str(lg5.lines))
+    check("整段重试 2 轮(日志可见第 2 次)",
+          any("重试" in m and "第 2/2" in m for _, m in lg5.lines), str(lg5.lines))
+    check("重试前清场(Esc + 点空白, 关掉残留下拉)",
+          f5.keyboard.last == "Escape" and f5.mouse.clicks, f"{f5.keyboard.last}/{f5.mouse.clicks}")
+    src5 = inspect.getsource(TaobaoAdapter._pick_bench)
+    check("重试轮次有上限(range 1,3)", "range(1, 3)" in src5, src5[:0])
+    check("清场走独立函数 _bench_reset", "_bench_reset" in src5)
+    check("失败取证走独立函数 _bench_dropdown_options", "_bench_dropdown_options" in src5)
+    check("清场用 Esc + 空白点击(不是再点一次同一个入口)",
+          "Escape" in inspect.getsource(TaobaoAdapter._bench_reset)
+          and "mouse.click" in inspect.getsource(TaobaoAdapter._bench_reset))
+    print("✅ 切基准加固: 超时 10s / 2 轮重试 / 清场 / 下拉选项取证, 且切不成仍留空")
+
+    print("【6】上游接线: ok=bench in cust → TOP 列留空的硬门禁仍在")
     src = pathlib.Path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kernel",
                                     "merchant_report", "platforms", "taobao.py")).read_text(encoding="utf-8")
     check("capture_per_store 里 ok = bench in cust", "ok = bench in cust" in src)

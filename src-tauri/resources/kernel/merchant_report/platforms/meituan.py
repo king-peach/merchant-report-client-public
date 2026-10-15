@@ -1517,7 +1517,8 @@ class MeituanAdapter:
             except Exception:
                 pass
 
-    # ---- 商圈Top(仅单门店视角可得) ----
+    # ---- 商圈Top(逐店逐日 × 单门店视角) ----
+    # 2026-10-15 任务 J: 常规运行**逐店 × 逐日**采集(不再只取区间末日) —— 每次调用 = 该店该日一份。
     # 实测路径(用户截图确认): 报表页右上角切单店 → 经营数据/流量 → 「流量转化」漏斗
     #   .funnel_tabs-warpper .selector-item          全部顾客 / 新客 / 老客
     #   .funnel_indicator-wrapper .dropdown input    对比基准(默认「商圈同行均值」, 可切「商圈同行前10%均值」)
@@ -1771,152 +1772,328 @@ class MeituanAdapter:
                     return (int(mm.group(1)), mval)
         return None
 
+    # ---- 流量页日期交互(2026-10-15 任务 J 重写) ----
+    # 根因(2026-10-14 真机 18/18): `📅 流量页日期 → 2026-09-12（未确认·输入框=['', '']）`,
+    #   页面停在默认日 2026-10-13, 采集全跑但值取不到 → 与对账页同类(交互方式不生效)。
+    # 现配方(探测 → 直接键入 → 读回验证 → 不生效 → 日历点选兜底), 全部**以读回为准**:
+    #   ① 先取证本页日期控件(placeholder/class/readonly/当前值);
+    #   ② 直接键入两框 → 读回;
+    #   ③ 不成 → 点「自定义」→ 翻月 → **同一格两击**完成区间(任务 H 成对纪律: 序列内零验证、
+    #      不换格、整对读回、失败 Esc 清场重来);
+    #   ④ 仍不成 → 留空 + 取证(绝不拿默认日期的数据冒充该日)。
+    # ⚠️ 与对账页的区别: 本页两框**默认是空的**(所以不能按"值像日期"找控件, 要按 placeholder 认),
+    #    且面板是"点同一个日格两次"完成区间(不是下载页那套「点结束框再点同一格」四步配方)。
+    _FLOW_INPUTS_JS = """() => {
+      const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const isd = s => /^\\d{4}-\\d{1,2}-\\d{1,2}$/.test((s || '').trim());
+      const out = [];
+      for (const e of document.querySelectorAll('input')) {
+        if (!vis(e)) continue;
+        const ph = (e.placeholder || '').trim();
+        const tag = (ph === '开始时间') ? 'start' : ((ph === '结束时间') ? 'end' : '');
+        if (!tag && !isd(e.value)) continue;
+        const r = e.getBoundingClientRect();
+        out.push({x: r.x + r.width / 2, y: r.y + r.height / 2, cx: r.x, cy: r.y,
+                  v: (e.value || '').trim(), ph: ph, tag: tag,
+                  cls: String(e.className || '').slice(0, 60),
+                  ro: !!e.readOnly, dis: !!e.disabled});
+      }
+      const pri = p => (p.tag === 'start' ? 0 : (p.tag === 'end' ? 1 : 2));
+      out.sort((a, b) => (pri(a) - pri(b)) || (a.cy - b.cy) || (a.cx - b.cx));
+      return out;
+    }"""
+    # 日格子标记(旧路径兜底): 有日期属性且**精确等于目标日**的最优先; 其次当月非尾巴格。
+    _MARK_DAY_JS = """(o) => {
+      const day = o.day, iso = o.iso;
+      const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const attr = td => {
+        for (const at of ['data-date', 'data-value', 'data-day', 'title', 'aria-label']) {
+          const v = (td.getAttribute && td.getAttribute(at)) || '';
+          if (v) return v;
+        }
+        const a = td.querySelector('a');
+        return (a && a.getAttribute && (a.getAttribute('data-date') || '')) || '';
+      };
+      const panels = [...document.querySelectorAll('.roo-datepicker-data-panel, .roo-datepicker-body')]
+        .filter(p => p.offsetParent !== null && p.getBoundingClientRect().width > 80);
+      let best = [];
+      for (const p of panels) {
+        const tds = [...p.querySelectorAll('td')].filter(td => {
+          const txt = (((td.querySelector('a') || td).innerText) || '').trim();
+          const cls = String(td.className || '');
+          return txt === day && vis(td) && !/disabl|forbid/i.test(cls)
+                 && !/old|prev|next|other|gray|grey|month/i.test(cls);
+        });
+        if (!tds.length) continue;
+        const exact = tds.filter(td => attr(td).indexOf(iso) >= 0);
+        best = exact.length ? exact : tds;
+        break;
+      }
+      document.querySelectorAll('[data-hm-day]').forEach(e => e.removeAttribute('data-hm-day'));
+      if (!best.length) return 0;
+      best[0].setAttribute('data-hm-day', '1');
+      return best.length;
+    }"""
+
+    def _flow_inputs(self, page):
+        """流量页日期输入框(可能值为空 —— 靠 placeholder「开始时间/结束时间」认)。"""
+        try:
+            return page.evaluate(self._FLOW_INPUTS_JS) or []
+        except Exception:
+            return []
+
+    def _flow_read(self, page):
+        return [str(x.get("v") or "") for x in self._flow_inputs(page)][:2]
+
+    def _flow_verified(self, page, date, vals=None):
+        """硬证据: 两框读回 == 目标日 **或** 页面文本含「已选时间：<目标日>」。"""
+        vals = self._flow_read(page) if vals is None else vals
+        if len(vals) >= 2 and all(self._norm_day(v) == date for v in vals):
+            return True
+        try:
+            txt = page.evaluate("() => (document.body ? document.body.innerText : '')") or ""
+        except Exception:
+            txt = ""
+        return any(f"已选时间：{d}" in txt for d in self._date_variants(date))
+
+    def _flow_dump_controls(self, page):
+        """现场取证: 日期区附近的候选控件(文案+类名) —— 远程没有真 DOM, 不许瞎猜。"""
+        try:
+            out = page.evaluate("""() => {
+              const res = [];
+              for (const el of document.querySelectorAll(
+                  '.selector-item, [class*="selector"], [class*="datepicker"], [class*="dropdown"] span, [class*="date"]')) {
+                const t = (el.textContent || '').trim();
+                if (!t || t.length > 16) continue;
+                if (!/昨|今|自定义|近|周|月|日|时间/.test(t)) continue;
+                res.push(t + ' ⟨' + String(el.className || '').slice(0, 50) + '⟩');
+                if (res.length >= 12) break;
+              }
+              return res; }""")
+            if out:
+                self.sink.log(f"   🔎 日期控件候选: {out[:10]}", level="warn")
+        except Exception:
+            pass
+
+    def _clear_picker(self, page):
+        """Esc 清场: 关掉面板并**丢掉待定区间**(成对协议失败后绝不在脏状态里继续试探)。"""
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    def _flow_type_dates(self, page, date):
+        """直接键入两框(每框: 点 → Ctrl+A → 键入 → Enter), 再失焦提交 → 读回验证。"""
+        ins = self._flow_inputs(page)
+        if len(ins) < 2:
+            return False
+        for i in (0, 1):
+            cur = self._flow_inputs(page)
+            if len(cur) < 2:
+                return False
+            box = cur[0] if i == 0 else cur[-1]
+            try:
+                page.mouse.click(box["x"], box["y"])
+                time.sleep(0.35)
+                page.keyboard.press("ControlOrMeta+a")
+                time.sleep(0.12)
+                page.keyboard.type(date, delay=30)
+                time.sleep(0.3)
+                page.keyboard.press("Enter")
+                time.sleep(0.5)
+            except Exception as e:
+                self.sink.log(f"   ⚠️ 流量页日期键入失败(第{i + 1}框): {str(e)[:50]}", level="warn")
+                return False
+        try:                                   # 受控组件常只在 blur 时提交
+            page.keyboard.press("Tab")
+        except Exception:
+            pass
+        time.sleep(0.8)
+        return self._flow_verified(page, date)
+
+    def _flow_open_custom(self, page):
+        """点「自定义」(归一化匹配 `自定义\\n~`) → 等**可见**月标题。返回 heads(空=没打开)。"""
+        js = """() => {
+            const norm = s => (s || '').replace(/\\s+/g, '').replace(/[~～]/g, '');
+            const els = [...document.querySelectorAll('.selector-item')]
+              .filter(e => norm(e.innerText) === '自定义');
+            document.querySelectorAll('[data-hm-custom]').forEach(e => e.removeAttribute('data-hm-custom'));
+            if (!els.length) return 0;
+            els[0].setAttribute('data-hm-custom', '1'); return els.length; }"""
+        heads = []
+        for _try in range(5):
+            try:
+                n = page.evaluate(js)
+            except Exception:
+                n = 0
+            if n:
+                try:
+                    page.locator('[data-hm-custom="1"]').first.click(timeout=8000)
+                except Exception:
+                    pass
+            time.sleep(1.2)
+            try:
+                heads = page.evaluate(self._FLOW_HEADS_JS) or []
+            except Exception:
+                heads = []
+            if heads:
+                break
+        return heads
+
+    def _nav_month_roo(self, page, date):
+        """翻月到目标月: 只点**可见面板里的单月 chevron**; double-* 是年跳(点它会跳错年), 不能用。"""
+        try:
+            _y, _m, _d = (int(x) for x in date.split("-"))
+        except Exception:
+            return False
+        want = (_y, _m)
+        for _step in range(36):
+            cur = self._flow_visible_month(page)
+            fwd = (want > cur) if cur else True
+            if cur is None or cur == want:
+                return cur == want
+            box = page.evaluate("""(fwd) => {
+                const want = fwd ? 'chevron-right' : 'chevron-left';
+                const cands = [...document.querySelectorAll('i.roo-icon')]
+                  .filter(e => { const c = String(e.className);
+                                 return c.indexOf(want) >= 0 && c.indexOf('double') < 0; })
+                  .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+                if (!cands.length) return null;
+                cands.sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+                const el = fwd ? cands[cands.length - 1] : cands[0];
+                const r = el.getBoundingClientRect();
+                return {x: r.x + r.width / 2, y: r.y + r.height / 2}; }""", fwd)
+            if not box:
+                return False
+            page.mouse.click(box["x"], box["y"])
+            time.sleep(1.0)
+        return False
+
+    def _mark_day_cell(self, page, y, m, day):
+        """给目标日格子打标记 → (kind, handle, desc)。kind: 'coord' / 'loc' / None(没找到)。"""
+        try:
+            cands = self._day_candidates(page, y, m, day) or []
+        except Exception:
+            cands = []
+        if cands:
+            c = cands[0]
+            return "coord", (c["x"], c["y"]), self._pair_desc(c, y, m)
+        iso = "%04d-%02d-%02d" % (y, m, day)
+        try:
+            n = page.evaluate(self._MARK_DAY_JS, {"day": str(day), "iso": iso})
+        except Exception:
+            n = 0
+        if not n:
+            return None, None, f"{y}-{m:02d}面{day}(未找到)"
+        try:
+            return "loc", page.locator('[data-hm-day="1"]').first, f"{y}-{m:02d}面{day}"
+        except Exception:
+            return None, None, f"{y}-{m:02d}面{day}(定位失败)"
+
+    def _click_same_cell_twice(self, page, y, m, day):
+        """成对点选: **同一格两击**(第1击=起点, 第2击=终点); 序列内零验证、不换格。
+
+        第 2 击前**重新解析**(面板可能重渲染): 坐标路径按锚点(面板月+日+尾巴标记)落回同一格,
+        标记路径沿用同一个 locator(同一 DOM 节点) —— 绝不换到别的格(换格会凑出跨月错对)。
+        两击都击发成功 → True。
+        """
+        kind, handle, desc = self._mark_day_cell(page, y, m, day)
+        if kind is None:
+            return False, desc
+        try:
+            if kind == "coord":
+                page.mouse.click(handle[0], handle[1])
+            else:
+                handle.click(timeout=6000)
+        except Exception:
+            return False, desc
+        time.sleep(0.6)
+        # 第 2 击
+        try:
+            if kind == "coord":
+                cands = self._day_candidates(page, y, m, day) or []
+                if not cands:
+                    return False, desc
+                c2 = cands[0]
+                page.mouse.click(c2["x"], c2["y"])
+                desc = f"{desc} ×2"
+            else:
+                handle.click(timeout=6000)
+                desc = f"{desc} ×2"
+        except Exception:
+            return False, desc
+        time.sleep(1.2)
+        return True, desc
+
     def _set_flow_date(self, page, date):
         """把流量页日期设为指定日 —— **必须拿到硬证据才算生效**。
 
         2026-10-08 真机破案(用户报"美团商圈TOP一直没写入"): 本方法**两个** bug 叠加, 日期根本没设进去,
         而我上次加的验收把 18 家店全拦下(证据: 输入框=['',''], 已选时间=默认的 2026-10-07) —— 验收是对的,
         设置是坏的:
-          ① 「自定义」元素 innerText 实际是 `自定义\n~`(带分隔符), 用 `=== '自定义'` 精确匹配 → 永远点不到;
+          ① 「自定义」元素 innerText 实际是 `自定义\\n~`(带分隔符), 用 `=== '自定义'` 精确匹配 → 永远点不到;
           ② roo 的 range 日期选择器**不吃 input.value/键入** → 必须在它自己的面板里**点两次同一格**
              (第1次=区间起点, 第2次=区间终点; 实测点1次后仍 10-07, 点2次后变 10-06 且两个输入框都填上)。
-        现在: 归一化匹配点「自定义」→ 面板里打标记 → locator 点两次目标日格子(跳过 disabled/old)
-        → 再读输入框 + 「已选时间：」双证据验收。任一步不成立 → False(调用方放弃该店, 不用默认日期的数冒充)。
 
         2026-10-10 跨月修复: 旧翻月用 `document.querySelector('.roo-datepicker-data-panel...')` 抓到的是
         **隐藏年图层**(头「2021-2032」, 翻页=年跳) → 跨月目标 18/18 全挂(读回全停在默认日)。改法:
-        可见月标题读月份(「2026十月」中文数字月) + **可见面板里的单月 chevron-left/right** 逐月逼近;
-        另修: 打开面板偶发首点不生效 → 以可见头为准重试点击。真机验证: probe_flow_date6。
+        可见月标题读月份(「2026十月」中文数字月) + **可见面板里的单月 chevron-left/right** 逐月逼近。
+
+        2026-10-15 任务 J 重写(真机 2026-10-14 仍 18/18「未确认·输入框=['','']」): 改为
+        **探测 → 直接键入 → 读回验证 → 不生效 → 日历点选兜底**, 并修正三处:
+          · 不再按"值像日期"找控件(本页两框**默认是空的**) → 按 placeholder「开始时间/结束时间」认;
+          · 日历候选优先走面板感知的 `_day_candidates`(双面板/邻月尾巴格不再误点), 空则退回 `_MARK_DAY_JS`;
+          · 成对点选失败 → **Esc 清场重来**(1 轮), 绝不在脏状态里连续试探; 每轮读回都写进日志。
+        任一步都不成立 → False(调用方放弃该店该日, 不用默认日期的数据冒充)。
         """
         try:
-            # ① 点「自定义」: 归一化(去空白/去 ~ 分隔符)匹配 + JS 打标记 + locator 点击
-            n = page.evaluate("""() => {
-                const norm = s => (s || '').replace(/\s+/g, '').replace(/[~～]/g, '');
-                const els = [...document.querySelectorAll('.selector-item')]
-                  .filter(e => norm(e.innerText) === '自定义');
-                document.querySelectorAll('[data-hm-custom]').forEach(e => e.removeAttribute('data-hm-custom'));
-                if (!els.length) return 0;
-                els[0].setAttribute('data-hm-custom', '1'); return els.length; }""")
-            if n:
+            # ⓪ 探测: 先看清这页的日期控件(取证日志 —— 远程排障靠它, 不允许瞎猜选择器)
+            probe = self._flow_inputs(page)
+            self.sink.log("🔎 流量页日期控件: " + (
+                "; ".join(f"#{i}{p.get('tag') or '?'}ph={p.get('ph')!r}"
+                          f"ro={int(bool(p.get('ro')))}v={p.get('v')!r}"
+                          for i, p in enumerate(probe[:4]))
+                or "未找到(既无 placeholder 开始时间/结束时间, 也无日期值)"))
+            # ① 直接键入(对账页那套在本页没试过 → 先试, 但**以读回为准**)
+            if len(probe) >= 2 and self._flow_type_dates(page, date):
+                self.sink.log(f"📅 流量页日期 → {date}（已生效·键入）")
+                return True
+            self.sink.log(f"🔎 流量页日期: 直接键入未生效(读回={self._flow_read(page)}) → 改日历点选")
+            self._clear_picker(page)                       # 键入失败可能留下脏面板/脏输入 → 清场
+            # ② 日历点选兜底(任务 H 成对纪律)
+            for rnd in range(1, 3):
+                heads = self._flow_open_custom(page)
+                if not heads:
+                    self._flow_dump_controls(page)
+                    self.sink.log("   ⚠️ 流量页「自定义」面板未能打开 → 该店商圈列留空", level="warn")
+                    return False
+                _nav = self._nav_month_roo(page, date)
                 try:
-                    page.locator('[data-hm-custom="1"]').first.click(timeout=8000)
+                    _y, _m, _d = (int(x) for x in date.split("-"))
                 except Exception:
-                    pass
-            # ② 等面板打开(2026-10-10 真机: 首点偶发不生效 → 以「可见月标题」为准重试;
-            #    页面里有多层同名 .roo-datepicker-header, 隐藏年图层头(w=0, 如「2021-2032」)是干扰,
-            #    必须按可见性过滤; 可见后左面板头形如「2026十月」=中文数字月)
-            ins = page.locator("input[placeholder='开始时间'], input[placeholder='结束时间']")
-            _heads = []
-            for _try in range(5):
-                time.sleep(1.5)
-                _heads = page.evaluate(self._FLOW_HEADS_JS) or []
-                if _heads:
-                    break
-                n2 = page.evaluate("""() => {
-                    const norm = s => (s || '').replace(/\\s+/g, '').replace(/[~～]/g, '');
-                    const els = [...document.querySelectorAll('.selector-item')].filter(e => norm(e.innerText) === '自定义');
-                    document.querySelectorAll('[data-hm-custom]').forEach(e => e.removeAttribute('data-hm-custom'));
-                    if (!els.length) return 0;
-                    els[0].setAttribute('data-hm-custom', '1'); return els.length; }""")
-                if n2:
-                    try:
-                        page.locator('[data-hm-custom="1"]').first.click(timeout=8000)
-                    except Exception:
-                        pass
-            if not _heads:
-                # 2026-10-13 用户报"没有选择自定义时间, 还是默认用的昨天": 若「自定义」元素改版/找不到,
-                # 面板永远打不开 → 该店留空。加现场取证: 把日期区附近的候选控件(文案+类名)打出来,
-                # 下次一跑就能按证据适配选择器(远程没有真实 DOM 不许瞎猜)。
-                try:
-                    _c = page.evaluate("""() => {
-                      const out = [];
-                      for (const el of document.querySelectorAll(
-                          '.selector-item, [class*="selector"], [class*="datepicker"], [class*="dropdown"] span, [class*="date"]')) {
-                        const t = (el.textContent || '').trim();
-                        if (!t || t.length > 16) continue;
-                        if (!/昨|今|自定义|近|周|月|日|时间/.test(t)) continue;
-                        out.push(t + ' ⟨' + String(el.className || '').slice(0, 50) + '⟩');
-                        if (out.length >= 12) break;
-                      }
-                      return out; }""")
-                    if _c:
-                        self.sink.log(f"   🔎 日期控件候选: {_c[:10]}", level="warn")
-                except Exception:
-                    pass
-                self.sink.log("   ⚠️ 流量页「自定义」面板未能打开 → 该店商圈列留空", level="warn")
-                return False
-            # ③ 翻月到目标月: 只能点**可见面板里的单月 chevron**(chevron-left/right);
-            #    double-left/right 是年跳(2026-10-10 实测点它会跳错年), 不能用
-            _y, _m, _d = date.split("-")
-            _day = str(int(_d))
-            _want = (int(_y), int(_m))
-            for _step in range(36):
-                cur = self._flow_visible_month(page)
-                if cur is None or cur == _want:
-                    break
-                _box = page.evaluate("""(fwd) => {
-                    const want = fwd ? 'chevron-right' : 'chevron-left';
-                    const cands = [...document.querySelectorAll('i.roo-icon')]
-                      .filter(e => { const c = String(e.className);
-                                     return c.indexOf(want) >= 0 && c.indexOf('double') < 0; })
-                      .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
-                    if (!cands.length) return null;
-                    cands.sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
-                    const el = fwd ? cands[cands.length - 1] : cands[0];
-                    const r = el.getBoundingClientRect();
-                    return {x: r.x + r.width / 2, y: r.y + r.height / 2}; }""", _want > cur)
-                if not _box:
-                    break
-                page.mouse.click(_box["x"], _box["y"])
-                time.sleep(1.0)
-            # ④ 点两次目标日格子(range: 第1次起点, 第2次终点)。
-            #    ⚠️ old/disabled 必须看 **td 自身**的 class(A 元素 class 为空, 看 A 会点到邻月的灰格)
-            for _pass in range(3):
-                _marked = page.evaluate("""(o) => {
-                    const day = o.day;
-                    const panels = [...document.querySelectorAll('.roo-datepicker-data-panel.datepicker-days')]
-                      .filter(p => p.offsetParent !== null && p.getBoundingClientRect().width > 80);
-                    let cells = [];
-                    for (const p of panels) {
-                        cells = [...p.querySelectorAll('td')].filter(td => {
-                            const a = td.querySelector('a'); if (!a) return false;
-                            const t = (a.innerText || '').trim();
-                            const cls = (td.className || '').toString();
-                            return t === day && td.offsetParent !== null
-                                   && !cls.includes('disabled') && !cls.includes('old')
-                                   && !cls.includes('month'); });
-                        if (cells.length) break;
-                    }
-                    document.querySelectorAll('[data-hm-day]').forEach(e => e.removeAttribute('data-hm-day'));
-                    if (!cells.length) return 0;
-                    cells[0].setAttribute('data-hm-day', '1');
-                    return cells.length; }""", {"day": _day})
-                if not _marked:
-                    break
-                try:
-                    page.locator('[data-hm-day="1"]').first.click(timeout=6000)
-                except Exception:
-                    pass
-                time.sleep(1.6)
-            # ⑤ 硬证据验收: 输入框 value + 「已选时间：<date>」
-            vals = []
-            for i in range(min(ins.count(), 2)):
-                try:
-                    vals.append((ins.nth(i).input_value() or "").strip())
-                except Exception:
-                    vals.append("")
-            hit_input = len(vals) == 2 and all(v == date for v in vals)
-            txt = page.evaluate("() => (document.body ? document.body.innerText : '')") or ""
-            hit_text = any(f"已选时间：{d}" in txt for d in self._date_variants(date))
-            ok = hit_input or hit_text
-            self.sink.log(f"📅 流量页日期 → {date}"
-                          f"（{'已生效' if ok else '未确认'}"
-                          f"{'·输入框=' + str(vals) if vals else ''}）")
-            if not ok:
-                frag = [x.strip() for x in txt.replace("\n", "|").split("|")
-                        if x.strip() and any(ch.isdigit() for ch in x)][:12]
-                self.sink.log(f"   🔎 流量页日期取证(未确认): {frag}", level="warn")
-            return ok
+                    return False
+                _hit, _desc = self._click_same_cell_twice(page, _y, _m, _d)
+                vals = self._flow_read(page)
+                if self._flow_verified(page, date, vals):
+                    self.sink.log(f"📅 流量页日期 → {date}"
+                                  f"（已生效·日历点选·第{rnd}轮·{_desc}·输入框={vals}）")
+                    return True
+                self.sink.log(f"🖱 流量页日期尝试{rnd}: {_desc} → 读回 {vals}"
+                              f"（翻月{'到' if _nav else '未到'} {_y}-{_m:02d}"
+                              f"{'' if _hit else '·格子没点到'}）", level="warn")
+                self._clear_picker(page)                   # Esc 清场重来
+            # ③ 全部失败: 留空 + 取证(绝不臆造)
+            vals = self._flow_read(page)
+            self.sink.log(f"📅 流量页日期 → {date}（未确认·输入框={vals}）")
+            try:
+                txt = page.evaluate("() => (document.body ? document.body.innerText : '')") or ""
+            except Exception:
+                txt = ""
+            frag = [x.strip() for x in txt.replace("\n", "|").split("|")
+                    if x.strip() and any(ch.isdigit() for ch in x)][:12]
+            self.sink.log(f"   🔎 流量页日期取证(未确认): {frag}", level="warn")
+            return False
         except Exception as e:
             self.sink.log(f"⚠️ 流量页日期设置失败(该店商圈列将留空): {str(e)[:70]}", level="warn")
             return False
@@ -2217,13 +2394,97 @@ class MeituanAdapter:
         return None
 
     def _set_bill_inputs(self, page, date):
-        """对账页两个日期框: Ctrl+A 全选替换 + 回车 ×2 + **点空白失焦提交**(2026-10-10 实测:
-        仅回车表格不刷新, 失焦后才提交过滤)。置好后读回校验两框 == date。"""
-        for i in (0, 1):
+        """对账页两个日期框: ① 探测控件 → ② 直接键入(Ctrl+A 全选替换 + 回车×2 + 点空白失焦提交)
+        → ③ 读回验证; 不生效 → ④ **日历点选兜底**(任务 H 成对纪律: 同一格两击 / 中间不换目标 /
+        整体验证 / 失败 Esc 清场重来) → 再验证。返回是否拿到硬证据。
+
+        2026-10-14 真机: 本页键盘输入 17/17 不生效(读回 ['', '']) —— 与淘宝下载页"React 受控输入
+        不认程序写入"同类。所以**不能只靠键入**: 键入失败必须落到读回可验证的日历点选。
+
+        取证(2026-10-15 任务 J): 「自定义」展开后逐个 input 记 placeholder/class/readonly/读回值
+        —— 远程排障靠这几行, 不允许瞎猜选择器。
+        """
+        # ① 探测: 「自定义」展开后的日期控件快照(取证日志)
+        probe = self._bill_date_inputs(page)
+        self.sink.log("🔎 对账页日期控件: " + (
+            "; ".join(f"#{i}ph={p.get('ph')!r}cls={p.get('cls')!r}ro={int(bool(p.get('ro')))}"
+                      f"v={p.get('v')!r}" for i, p in enumerate(probe[:4]))
+            or "未找到(无日期型 input)"))
+        if len(probe) < 2:
+            return False
+        # ② 直接键入(现配方) → ③ 读回
+        if self._type_bill_dates(page, probe, date):
+            return True
+        self.sink.log(f"🖱 对账页键入未生效(读回={self._bill_read(page)}) → 改日历点选")
+        # ④ 日历点选兜底(成对协议; 每轮失败 Esc 清场, 绝不在脏状态里继续试探)
+        for rnd in range(1, 3):
+            self._clear_picker(page)
+            if not self._open_bill_calendar(page):
+                self.sink.log("   ⚠️ 对账页日历面板未能打开 → CE/CJ 留空", level="warn")
+                return False
+            _nav = self._nav_month_roo(page, date)
             try:
-                page.evaluate("""(i) => {
-                    const ins = [...document.querySelectorAll('input')].filter(x => x.getBoundingClientRect().width > 30);
-                    if (ins[i]) { ins[i].click(); ins[i].focus(); } }""", i)
+                _y, _m, _d = (int(x) for x in date.split("-"))
+            except Exception:
+                return False
+            _hit, _desc = self._click_same_cell_twice(page, _y, _m, _d)
+            vals = self._bill_read(page)
+            if len(vals) >= 2 and all(self._norm_day(v) == date for v in vals):
+                self.sink.log(f"📅 对账页日期 → {date}"
+                              f"（已生效·日历点选·第{rnd}轮·{_desc}·输入框={vals}）")
+                return True
+            self.sink.log(f"🖱 对账页日期尝试{rnd}: {_desc} → 读回 {vals}"
+                          f"（翻月{'到' if _nav else '未到'} {_y}-{_m:02d}"
+                          f"{'' if _hit else '·格子没点到'}）", level="warn")
+        # ⑤ 全部失败: 细日志(URL/表格行数 + 前 2 行摘要), 交调用方留空
+        try:
+            rows = self._bill_rows(page, "交易号") or []
+            self.sink.log(f"   🔎 对账页取证: url={str(page.url)[:90]} 数据行={len(rows)} "
+                          f"前2行={[r[:4] for r in rows[:2]]}", level="warn")
+        except Exception:
+            pass
+        return False
+
+    def _bill_date_inputs(self, page):
+        """对账页日期控件快照(placeholder/class/readonly/当前值) —— 按 placeholder 认优先,
+        其次按"值像日期"兜底(本页两框默认可能带值)。"""
+        try:
+            return page.evaluate("""() => {
+              const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+              const isd = s => /^\\d{4}-\\d{1,2}-\\d{1,2}$/.test((s || '').trim());
+              const out = [];
+              for (const e of document.querySelectorAll('input')) {
+                if (!vis(e)) continue;
+                const ph = (e.placeholder || '').trim();
+                const tag = /开始|起始|start/i.test(ph) ? 'start'
+                          : (/结束|终止|end/i.test(ph) ? 'end' : '');
+                if (!tag && !isd(e.value)) continue;
+                const r = e.getBoundingClientRect();
+                out.push({x: r.x + r.width / 2, y: r.y + r.height / 2, cx: r.x, cy: r.y,
+                          v: (e.value || '').trim(), ph: ph, tag: tag,
+                          cls: String(e.className || '').slice(0, 60),
+                          ro: !!e.readOnly, dis: !!e.disabled});
+              }
+              const pri = p => (p.tag === 'start' ? 0 : (p.tag === 'end' ? 1 : 2));
+              out.sort((a, b) => (pri(a) - pri(b)) || (a.cy - b.cy) || (a.cx - b.cx));
+              return out;
+            }""") or []
+        except Exception:
+            return []
+
+    def _bill_read(self, page):
+        return [str(x.get("v") or "") for x in self._bill_date_inputs(page)][:2]
+
+    def _type_bill_dates(self, page, probe, date):
+        """现配方: 逐框 点 → Ctrl+A → 键入 → 回车, 再点页头空白**失焦提交**(仅回车表格不刷新),
+        最后读回两框 == date。"""
+        for i in (0, 1):
+            cur = self._bill_date_inputs(page)
+            if len(cur) < 2:
+                return False
+            box = cur[0] if i == 0 else cur[-1]
+            try:
+                page.mouse.click(box["x"], box["y"])
                 time.sleep(0.4)
                 page.keyboard.press("ControlOrMeta+a")
                 time.sleep(0.15)
@@ -2241,12 +2502,43 @@ class MeituanAdapter:
             except Exception:
                 pass
         time.sleep(1.0)
-        try:
-            vals = page.evaluate("() => [...document.querySelectorAll('input')]"
-                                 ".filter(x => x.getBoundingClientRect().width > 30).map(i => (i.value || '').trim())")
-        except Exception:
-            return False
-        return sum(1 for v in (vals or []) if v == date) >= 2
+        vals = self._bill_read(page)
+        return len(vals) >= 2 and sum(1 for v in vals if self._norm_day(v) == date) >= 2
+
+    def _open_bill_calendar(self, page):
+        """点「自定义」或第一个日期框打开日历面板 → 是否出现**可见**月标题。"""
+        for _ in range(2):
+            try:
+                page.mouse.click(self._bill_date_inputs(page)[0]["x"],
+                                 self._bill_date_inputs(page)[0]["y"])
+            except Exception:
+                pass
+            time.sleep(1.0)
+            try:
+                if page.evaluate(self._FLOW_HEADS_JS):
+                    return True
+            except Exception:
+                pass
+            # 「自定义」快捷项(归一化匹配, 同流量页)
+            js = """() => {
+                const norm = s => (s || '').replace(/\\s+/g, '').replace(/[~～]/g, '');
+                const els = [...document.querySelectorAll('.selector-item, [class*=selector] > *, li, span')]
+                  .filter(e => norm(e.innerText) === '自定义');
+                if (!els.length) return 0;
+                document.querySelectorAll('[data-hm-custom]').forEach(e => e.removeAttribute('data-hm-custom'));
+                els[0].setAttribute('data-hm-custom', '1'); return els.length; }"""
+            try:
+                if page.evaluate(js):
+                    page.locator('[data-hm-custom="1"]').first.click(timeout=6000)
+            except Exception:
+                pass
+            time.sleep(1.2)
+            try:
+                if page.evaluate(self._FLOW_HEADS_JS):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _read_bill_ledger(self, store_id, date):
         """对账页(推广费财务对账)按日期过滤 → 当日 **CE(推广订单扣款绝对值合计)** +
@@ -2259,74 +2551,111 @@ class MeituanAdapter:
         2026-10-10 真机配方: 开页 → 「推广费流水记录」tab → 「自定义」 → 两个输入框
         Ctrl+A 全选替换 + 回车×2 → 点空白失焦 → 轮询校验(**所有数据行==目标日 或 「暂无数据」**
         才算过滤生效)。过滤未得证 → None —— 宁可不写, 不拿未过滤的残表冒充。
+
+        2026-10-15 任务 J: 日期设置改为「探测 → 键入 → 日历兜底」(见 _set_bill_inputs, 真机
+        10-14 键入 17/17 不生效); 整流程**重试 2 次**; 每个失败分支都打细日志
+        (输入框读回值 / URL / 表格行数 + 前 2 行摘要)。
         """
-        page = None
+        for attempt in (1, 2):
+            page = None
+            try:
+                page = self.ctx.new_page()
+                res = self._bill_once(page, store_id, date, attempt)
+                if res is not None:
+                    return res
+                self._bill_forensics(page, f"第{attempt}次")
+            except Exception as e:
+                self.sink.log(f"   ⚠️ 对账页读取失败(第{attempt}次): {str(e)[:70]} → CE/CJ 留空",
+                              level="warn")
+            finally:
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+            if attempt == 1:
+                self.sink.log("🔁 对账页整流程未得证 → 重试 1 次(CE/CJ)", level="warn")
+        return None
+
+    def _bill_forensics(self, page, tag=""):
+        """失败取证: 输入框读回值 + URL + 表格行数 + 前 2 行摘要 —— 远程排障一眼定位。"""
         try:
-            page = self.ctx.new_page()
-            page.goto(self.BILL_RECON_URL.format(store_id=store_id), wait_until="domcontentloaded", timeout=60000)
-            ready = False
-            for _ in range(20):
-                time.sleep(0.5)
-                try:
-                    if "余额流水记录" in (page.evaluate("() => document.body ? document.body.innerText : ''") or ""):
-                        ready = True
-                        break
-                except Exception:
-                    pass
-            if not ready:
-                self.sink.log("   ⚠️ 对账页未就绪 → CE/CJ 留空", level="warn")
-                return None
-            # 切「推广费流水记录」tab: 首点可能因页面未渲染好落空 → 校验表头(交易号)重试。
-            # 2026-10-10 实测: tab 没切过去时会误读「余额流水记录」的表 → 必须验证, 否则宁可不写
-            tab_ok = False
-            for _ in range(6):
-                self._click_by_text(page, "推广费流水记录")
-                time.sleep(1.0)
-                if self._bill_rows(page, "交易号") is not None:
-                    tab_ok = True
+            vals = self._bill_read(page)
+        except Exception:
+            vals = []
+        rows = None
+        try:
+            rows = self._bill_rows(page, "交易号")
+        except Exception:
+            pass
+        try:
+            url = str(page.url)[:100]
+        except Exception:
+            url = "?"
+        self.sink.log(f"   🔎 对账页取证({tag}): 输入框={vals} 数据行="
+                      f"{'未读到' if rows is None else len(rows)} 前2行="
+                      f"{[r[:4] for r in (rows or [])[:2]]} url={url}", level="warn")
+
+    def _bill_once(self, page, store_id, date, attempt=1):
+        """对账页**单次完整尝试** → parse_bill_ledger 结果 / None(失败, 交上层重试)。
+
+        返回的 dict 里 consume/recharge 可能都是 None —— 那是「暂无数据」的**有效**结果
+        (该日确实无流水), 与 None(读失败)语义不同: 前者不重试, 后者重试。
+        """
+        page.goto(self.BILL_RECON_URL.format(store_id=store_id), wait_until="domcontentloaded", timeout=60000)
+        ready = False
+        for _ in range(20):
+            time.sleep(0.5)
+            try:
+                if "余额流水记录" in (page.evaluate("() => document.body ? document.body.innerText : ''") or ""):
+                    ready = True
                     break
-            if not tab_ok:
-                self.sink.log("   ⚠️ 对账页「推广费流水记录」tab 未能就绪 → CE/CJ 留空", level="warn")
-                return None
-            if not self._click_by_text(page, "自定义"):
-                self.sink.log("   ⚠️ 对账页未找到「自定义」→ CE/CJ 留空", level="warn")
-                return None
+            except Exception:
+                pass
+        if not ready:
+            self.sink.log("   ⚠️ 对账页未就绪 → CE/CJ 留空", level="warn")
+            return None
+        # 切「推广费流水记录」tab: 首点可能因页面未渲染好落空 → 校验表头(交易号)重试。
+        # 2026-10-10 实测: tab 没切过去时会误读「余额流水记录」的表 → 必须验证, 否则宁可不写
+        tab_ok = False
+        for _ in range(6):
+            self._click_by_text(page, "推广费流水记录")
             time.sleep(1.0)
-            if not self._set_bill_inputs(page, date):
-                self.sink.log("   ⚠️ 对账页日期设置未生效 → CE/CJ 留空", level="warn")
-                return None
-            # 轮询等过滤生效(上限 ~10s):
-            #   · 数据行全==date → 立即接受;
-            #   · 「暂无数据」必须**持续 ≥2.5s** 才认 —— 查询期间表格会闪一下空态,
-            #     第一眼就信会把"有数据的日子"误判成"该日无充值"(2026-10-10 实测 10-05 踩到)
-            empty_since = None
-            for _ in range(20):
-                time.sleep(0.5)
-                body = self._bill_rows(page, "交易号")
-                if body and all(str(r[0]).startswith(str(date)) for r in body):
-                    return self.parse_bill_ledger(body, date)
-                try:
-                    t = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
-                except Exception:
-                    t = ""
-                if (not body) and ("暂无数据" in t):
-                    empty_since = empty_since or time.time()
-                    if time.time() - empty_since >= 2.5:
-                        return {"consume": None, "recharge": None, "balance": None,
-                                "n_consume": 0, "n_recharge": 0, "types": []}
-                else:
-                    empty_since = None
-            self.sink.log("   ⚠️ 对账页日期过滤未能验证(行既非目标日也非持续为空) → CE/CJ 留空", level="warn")
+            if self._bill_rows(page, "交易号") is not None:
+                tab_ok = True
+                break
+        if not tab_ok:
+            self.sink.log("   ⚠️ 对账页「推广费流水记录」tab 未能就绪 → CE/CJ 留空", level="warn")
             return None
-        except Exception as e:
-            self.sink.log(f"   ⚠️ 对账页读取失败: {str(e)[:70]} → CE/CJ 留空", level="warn")
+        if not self._click_by_text(page, "自定义"):
+            self.sink.log("   ⚠️ 对账页未找到「自定义」→ CE/CJ 留空", level="warn")
             return None
-        finally:
-            if page is not None:
-                try:
-                    page.close()
-                except Exception:
-                    pass
+        time.sleep(1.0)
+        if not self._set_bill_inputs(page, date):
+            self.sink.log("   ⚠️ 对账页日期设置未生效 → CE/CJ 留空", level="warn")
+            return None
+        # 轮询等过滤生效(上限 ~10s):
+        #   · 数据行全==date → 立即接受;
+        #   · 「暂无数据」必须**持续 ≥2.5s** 才认 —— 查询期间表格会闪一下空态,
+        #     第一眼就信会把"有数据的日子"误判成"该日无充值"(2026-10-10 实测 10-05 踩到)
+        empty_since = None
+        for _ in range(20):
+            time.sleep(0.5)
+            body = self._bill_rows(page, "交易号")
+            if body and all(str(r[0]).startswith(str(date)) for r in body):
+                return self.parse_bill_ledger(body, date)
+            try:
+                t = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            except Exception:
+                t = ""
+            if (not body) and ("暂无数据" in t):
+                empty_since = empty_since or time.time()
+                if time.time() - empty_since >= 2.5:
+                    return {"consume": None, "recharge": None, "balance": None,
+                            "n_consume": 0, "n_recharge": 0, "types": []}
+            else:
+                empty_since = None
+        return None
 
     def capture_promo_ledger(self, store_id, date):
         """抓该店(单门店视角)推广流水 → **CE(当日「推广订单扣款」绝对值合计)** /

@@ -5,9 +5,11 @@
 import glob
 import os
 import re
+import sys
 from datetime import datetime, timedelta
 
 import openpyxl
+from openpyxl.utils import column_index_from_string as CI
 from openpyxl.utils import get_column_letter as GL
 
 WEEK = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -524,6 +526,138 @@ def scan_formula_cols(ws):
     return fmap
 
 
+# ---------------- 模板结构(版本)识别 ----------------
+# 2026-10-14 任务 I: 10.13 版模板删掉了「平台活动补贴」列 → 旧版模板里**从主站区起**的列整体右移 1。
+# 内核 mapping 的列字母按新版写死, 拿旧版模板跑会整体错 1 列(现场复现: 7 个值错 5 个, 见
+# refs/repro_template_shift_result.txt)。所以写前先读表头锚点判版本:
+#   · legacy → 把 ≥DJ 的列字母 +1(写入与回读校验用**同一份**平移结果);
+#   · 判不出来 → 该 sheet **一格都不写**(绝不回落到"按新模板硬猜")。
+SHIFT_FROM = "DJ"            # 平移起点 = 新版「主站营业额」列; ≥ 此列的列在旧版里 +1
+SCAN_FLOOR = "DG"            # 取锚点时的列下界 = 汇总区起点(「总营业额」列)
+SCAN_MAX_COL_LAYOUT = 260    # 表头区扫描列上限(与 _clear_data_area 的宽度口径一致)
+
+# 平移探针: 锚点 → {版本: 该版本里的期望列}
+LAYOUT_PROBES = {
+    "主站营业额":   {"new": "DJ", "legacy": "DK"},
+    "京东外卖数据": {"new": "HH", "legacy": "HI"},
+    "美团管家":     {"new": "HN", "legacy": "HO"},
+}
+# legacy 交叉佐证: 旧版独有的列(新版已删)。查到必须指 legacy; 查不到不投票(不矛盾)。
+LAYOUT_PLATFORM_COL = {"平台活动补贴": "DJ"}
+# 边界锚: 平移**不**该波及的列(两版同位)。查到必须还在原位 —— 否则说明平移起点不是 DJ。
+LAYOUT_BOUNDARY = {"总订单量": "DI", "总营业收入": "DH"}
+
+_LOG_SINK = None
+
+
+def set_log_sink(sink):
+    """登记事件出口(编排层 run_task 里调一次): 结构告警要能进壳的日志面板。
+
+    为什么需要: fill.py 本身不带日志设施, 而"未识别结构已跳过写入"是**必须让用户看到**的告警。
+    没登记(单测/直连调用)→ _log 落 stderr, 绝不静默吞掉。
+    """
+    global _LOG_SINK
+    _LOG_SINK = sink
+
+
+def _log(msg, level="info"):
+    sink = _LOG_SINK
+    if sink is not None:
+        try:
+            sink.log(msg, level=level)
+            return
+        except Exception:
+            pass
+    try:
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _layout_anchors(ws):
+    """表头区(数据首行之上 × 列 1..260)里各锚点的出现列 → {锚点: [列索引...]}。
+
+    为什么要一个"数据首行之上"的**行带**而不是单行: 真模板里锚点分散在两行 ——
+    「京东外卖数据 / 美团管家」在第 1 行的分区标题行, 其余在第 5 行(天麓第 4 行)的列表头行。
+    为什么只认 ≥SCAN_FLOOR(DG) 的那一段: 表头区**左侧**(美团外卖基本面那一块, 第 5 行的
+    F/G/H/I)有同名标签(总营业收入/总订单量/平台活动补贴/主站营业额), 它们两版同位、与版本无关,
+    混进来只会搅乱判定(天麓整张表的锚点都在左侧 → 会给出"哪一版都不像"的噪声, 见
+    refs/probe_anchors_raw.txt)。汇总区起点 DG 以下的同名标签一律不参与版本判定。
+    """
+    try:
+        start = data_start_row(ws)
+    except Exception:
+        start = ROW_START
+    if start <= 1:
+        return {}
+    floor = CI(SCAN_FLOOR)
+    out = {}
+    for row in ws.iter_rows(min_row=1, max_row=start - 1, max_col=SCAN_MAX_COL_LAYOUT,
+                            values_only=True):
+        for ci, v in enumerate(row, 1):
+            if ci < floor or v is None:
+                continue
+            s = str(v).strip()
+            if s in LAYOUT_PROBES or s in LAYOUT_PLATFORM_COL or s in LAYOUT_BOUNDARY:
+                out.setdefault(s, []).append(ci)
+    return out
+
+
+def detect_layout(ws):
+    """该 sheet 的模板结构版本: "new"(10.13) / "legacy"(旧版) / "unknown"。
+
+    判定(保守, 宁可 unknown 也不猜):
+      ① 三个平移探针**至少 2 个查到**, 且查到的**全部一致**(都指 new 或都指 legacy) → 候选;
+         有探针查到却**不在**任何版本的期望列上(列位被改过) → 直接 unknown;
+      ② 「平台活动补贴」查到就必须指 legacy(查到而候选=new = 矛盾) → 否则 unknown;
+         查不到 = 不投票(单版模板里它本就可能不存在);
+      ③ 边界锚「总订单量/总营业收入」查到就必须还在 DH/DI(平移**不**波及) → 否则 unknown;
+         查不到只记一笔(不否决);
+      ④ 证据不足(查到的探针 <2)或候选不唯一 → unknown。
+    锚点一律**整格精确匹配**(str(cell.value).strip() == 锚点), 不做模糊/包含匹配。
+    """
+    occ = _layout_anchors(ws)
+    votes = {}
+    for name, exp in LAYOUT_PROBES.items():
+        got = [GL(c) for c in (occ.get(name) or [])]
+        if not got:
+            continue                                   # 没查到 → 弃权
+        if got == [exp["new"]]:
+            votes[name] = "new"
+        elif got == [exp["legacy"]]:
+            votes[name] = "legacy"
+        else:
+            votes[name] = "bad:" + "/".join(got)       # 查到了但不在期望列上
+    if any(v not in ("new", "legacy") for v in votes.values()):
+        return "unknown"
+    if len(votes) < 2 or len(set(votes.values())) != 1:
+        return "unknown"
+    cand = next(iter(votes.values()))
+    got_plat = [GL(c) for c in (occ.get("平台活动补贴") or [])]
+    if got_plat and (got_plat != [LAYOUT_PLATFORM_COL["平台活动补贴"]] or cand != "legacy"):
+        return "unknown"
+    for name, col in LAYOUT_BOUNDARY.items():
+        got = [GL(c) for c in (occ.get(name) or [])]
+        if got and got != [col]:
+            return "unknown"
+    return cand
+
+
+def translate_col(col, layout):
+    """write_set 的列字母 → 本表实际列字母。legacy 且列索引 ≥DJ 的 +1, 其余原样。
+
+    只对 ≥DJ 平移: 总营业收入(DH)/总订单量(DI) 及更左的列(含 C/D 天气列)两版同位。
+    """
+    if layout != "legacy":
+        return col
+    try:
+        i = CI(str(col))
+    except Exception:
+        return col
+    return GL(i + 1) if i >= CI(SHIFT_FROM) else col
+
+
 def shift_formula(formula, row):
     return re.sub(r"(?<![A-Za-z0-9_!$])([A-Z]{1,2})(\d{1,3})", lambda m: f"{m.group(1)}{row}", formula)
 
@@ -765,7 +899,27 @@ def _pick_sheet(wb, sheet_name=None):
 
 
 def _write_into(ws, date, write_set, mode="top", formula_protect=True, borders=True):
-    """把一组值写进**已打开**的某个 Sheet(不落盘)。逻辑与 fill_template 完全一致。"""
+    """把一组值写进**已打开**的某个 Sheet(不落盘)。逻辑与 fill_template 完全一致。
+
+    **结构预检收口点**(任务 I): 写前先判该表是 10.13 版还是旧版 ——
+      · `legacy` → write_set 里 ≥DJ 的列字母 +1(旧版多一列「平台活动补贴」);
+      · `unknown` → **一格都不写**(绝不回落"按新模板硬猜"), 并给用户一行 warn。
+    收口放在这里(而不是调用方)是为了"任何调用方都不可能漏翻": 全仓库只有本函数写模板
+    (调用方 fill_template / fill_many, 见 ccI-report.md 的 grep 清单)。
+    回读校验必须用返回的 `write_set_used`(平移后那份), 否则旧版上校验会拿新字母去核对。
+    """
+    layout = detect_layout(ws)
+    if layout == "unknown":
+        # 宁可不写, 也不猜列写错 —— 写错列比少写一天更难发现、更难挽回。
+        _log(f"⚠️ 模板结构未识别, 已跳过写入(不会猜列写错): {ws.title}", level="warn")
+        return {"layout": "unknown", "skipped_unknown_layout": True,
+                "row": None, "how": "skipped-unknown-layout",
+                "filled": 0, "skipped_formula": 0, "skipped_nodata": 0,
+                "fixed_formulas": [], "write_set_used": {}, "sheet": ws.title}
+    used = {translate_col(c, layout): v for c, v in (write_set or {}).items()}
+    if layout == "legacy" and used != dict(write_set or {}):
+        _log(f"📐 模板结构: 旧版(10.13 前) → 列位已按旧版平移 (sheet: {ws.title})")
+    write_set = used
     fmap = scan_formula_cols(ws) if formula_protect else {}
     row, how = resolve_row(ws, date, mode=mode)
     filled = skipped_formula = skipped_nodata = 0
@@ -788,7 +942,8 @@ def _write_into(ws, date, write_set, mode="top", formula_protect=True, borders=T
     if borders:
         apply_row_borders(ws, row)
     return {"row": row, "how": how, "filled": filled, "skipped_formula": skipped_formula,
-            "skipped_nodata": skipped_nodata, "fixed_formulas": fixed, "sheet": ws.title}
+            "skipped_nodata": skipped_nodata, "fixed_formulas": fixed, "sheet": ws.title,
+            "layout": layout, "write_set_used": used, "skipped_unknown_layout": False}
 
 
 def _find_row_by_date(ws, date, max_rows=60):
@@ -895,18 +1050,35 @@ def fill_template(template_path, date, write_set, mode="top",
         ws = _pick_sheet(wb, sheet_name)
         res = _write_into(ws, date, write_set, mode=mode,
                           formula_protect=formula_protect, borders=borders)
-        save_wb(wb, template_path)
+        # 结构未识别 = 一格没写 → **连盘都不落**(别去动用户的模板文件)
+        if not res.get("skipped_unknown_layout"):
+            save_wb(wb, template_path)
     finally:
         try:
             wb.close()
         except Exception:
             pass
-    # 回读验证(静态列) —— 校验写到**同一个 Sheet**, 别拿 Sheet2 校门店 Sheet
-    fmap = scan_formula_cols(openpyxl.load_workbook(template_path)[res["sheet"]])
-    bad = _reread_verify(template_path, [(res["sheet"], res["row"], write_set, fmap)]).get(res["sheet"], [])
+    # 回读验证(静态列) —— 校验写到**同一个 Sheet**, 别拿 Sheet2 校门店 Sheet;
+    # 必须拿 `write_set_used`(结构预检平移后那份): 旧版模板上按新字母回读会把"写对了"判成没写。
+    # 结构未识别(unknown)的 job **本就没写**, 不进回读校验。
+    if res.get("skipped_unknown_layout"):
+        bad = []
+    else:
+        _rw = openpyxl.load_workbook(template_path)
+        try:
+            fmap = scan_formula_cols(_rw[res["sheet"]])
+        finally:
+            try:
+                _rw.close()
+            except Exception:
+                pass
+        bad = _reread_verify(template_path,
+                             [(res["sheet"], res["row"], res["write_set_used"], fmap)]).get(res["sheet"], [])
     return {"row": res["row"], "how": res["how"], "filled": res["filled"],
             "skipped_formula": res["skipped_formula"], "skipped_nodata": res["skipped_nodata"],
-            "fixed_formulas": res["fixed_formulas"], "reread_bad": bad, "sheet": res["sheet"]}
+            "fixed_formulas": res["fixed_formulas"], "reread_bad": bad, "sheet": res["sheet"],
+            "layout": res["layout"], "skipped_unknown_layout": res["skipped_unknown_layout"],
+            "write_set_used": res["write_set_used"]}
 
 
 def fill_many(template_path, jobs, mode="top", formula_protect=True, borders=True,
@@ -961,22 +1133,26 @@ def fill_many(template_path, jobs, mode="top", formula_protect=True, borders=Tru
             # 行号按**日期**重新定位: top 模式下后写的行会把先写的顶下去, 写入时的行号已失效
             rows_now = {}
             for (sn, date, r), j in zip(out, jobs):
-                if sn not in rw.sheetnames:
-                    continue
+                if sn not in rw.sheetnames or r.get("skipped_unknown_layout"):
+                    continue                      # 结构未识别 → 没写, 无从回读
                 rows_now[(sn, date)] = _find_row_by_date(rw[sn], date) or r["row"]
         finally:
             try:
                 rw.close()
             except Exception:
                 pass
+        # write_set 必须用**结构预检平移后**那份(res["write_set_used"]): 旧版模板上按新字母
+        # 回读会把"写对了"判成没写; 结构未识别的 job 本就没写 → 不进回读。
         bad = _reread_verify(template_path, [
-            (sn, rows_now.get((sn, date), r["row"]), j[2], fmaps.get(sn, {}))
-            for (sn, date, r), j in zip(out, jobs)])
+            (sn, rows_now.get((sn, date), r["row"]), r["write_set_used"], fmaps.get(sn, {}))
+            for (sn, date, r), j in zip(out, jobs) if not r.get("skipped_unknown_layout")])
         for sn, _d, r in out:
-            r["reread_bad"] = bad.get(sn, [])
+            r["reread_bad"] = bad.get(sn, []) if not r.get("skipped_unknown_layout") else []
         for (sn, date, r) in out:
             if (sn, date) in rows_now:
                 r["row"] = rows_now[(sn, date)]
     for _sn, _d, r in out:
         r.setdefault("reread_bad", [])
+        r.setdefault("skipped_unknown_layout", False)
+        r.setdefault("layout", None)
     return out

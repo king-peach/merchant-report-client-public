@@ -75,18 +75,31 @@ def main():
     assert "billReconciliation.html#/account-flow" in A.BILL_RECON_URL and "wmPoiId=" in A.BILL_RECON_URL
     print("✅ 对账页解析: CE=扣款绝对值合计(9/19=-151.58→151.58, 多笔累加) / 充值累加 / 脏数据不崩")
 
-    # ── 对账页接线守卫(2026-10-10: 历史日期不再翻页找) ──
-    src_bill = (inspect.getsource(A._read_bill_ledger) + inspect.getsource(A._set_bill_inputs)
+    # ── 对账页接线守卫(2026-10-10: 历史日期不再翻页找; 2026-10-15 任务 J: 键入 + 日历兜底 + 重试2次) ──
+    src_bill = (inspect.getsource(A._read_bill_ledger) + inspect.getsource(A._bill_once)
+                + inspect.getsource(A._set_bill_inputs) + inspect.getsource(A._type_bill_dates)
                 + inspect.getsource(A.capture_promo_ledger))
     assert "BILL_RECON_URL" in src_bill, "对账页 URL 要接上"
     assert "推广费流水记录" in src_bill and "自定义" in src_bill, "要走对账页的推广费流水 tab + 自定义时间"
     assert "ControlOrMeta" in src_bill, "日期用键盘全选替换(受控输入不能只赋 value)"
     assert "交易号" in src_bill, "tab 就绪校验要盯「交易号」表头(余额 tab 末列是「操作」一行)"
     assert "失焦" in src_bill, "必须保留失焦提交(仅回车不刷新表格)"
+    # 2026-10-15 任务 J: 键入不生效(真机 17/17) → 必须能落到读回可验证的日历点选, 且整流程重试 2 次
+    assert "for attempt in (1, 2):" in src_bill, "对账页整流程必须重试 2 次"
+    assert "_click_same_cell_twice" in src_bill, \
+        "键入不生效时必须落日历点选(成对纪律: 同一格两击)"
+    assert "_open_bill_calendar" in src_bill, "日历兜底要先能打开面板"
+    assert "_clear_picker" in src_bill, "日历兜底每轮失败要 Esc 清场重来(不在脏状态里试探)"
+    assert "_nav_month" in src_bill, "日历兜底要能翻月到目标月"
+    assert "_bill_forensics" in inspect.getsource(A._read_bill_ledger), \
+        "失败分支必须打细日志(输入框读回值/URL/表格行数+前2行摘要)"
+    src_set = inspect.getsource(A._set_bill_inputs)
+    assert "_bill_date_inputs" in src_set, "日期设置要先探测控件"
+    assert "ro: !!e.readOnly" in inspect.getsource(A._bill_date_inputs), "探测要记 readonly(取证用)"
     assert "对账页" in inspect.getsource(A.capture_promo_ledger), "日志要写明来源=对账页(可 grep 复验)"
     assert "仅供参考" in inspect.getsource(A.capture_promo_ledger), \
         "旧账户页「推广消费」必须标注仅供参考(规格书坑清单 8: 不得再作 CE)"
-    print("✅ 对账页接线: URL / tab / 自定义 / 键盘替换 / 失焦提交 / 来源标注 守卫通过")
+    print("✅ 对账页接线: URL / tab / 自定义 / 键盘替换 / 失焦提交 / 日历兜底 / 重试2次 / 取证 守卫通过")
 
     print("✅ 推广流水接线单测全部通过")
 

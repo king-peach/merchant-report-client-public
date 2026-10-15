@@ -60,6 +60,22 @@ _SHOP_SEARCH_ROWS_JS = r"""() => {
 }"""
 
 
+def vas_ledger_dates(rows):
+    """消费记录表 → (最早日, 最晚日) —— 日志取证用: 判「表读到了但窗口不含目标日」。
+
+    ⚠️ 不能只 `[:10]` 截断: 真机有 '2026-1-5 09:00:00' 这种**月/日不补零**的写法,
+    截断后是 '2026-1-5 0' 匹配不上 → 覆盖证据会被漏读(那正是排查时最需要的证据)。
+    """
+    ds = []
+    for r in (rows or []):
+        if not isinstance(r, (list, tuple)) or not r:
+            continue
+        m = re.match(r"^(20\d{2})-(\d{1,2})-(\d{1,2})(?!\d)", str(r[0]).strip())
+        if m:
+            ds.append(f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}")
+    return (min(ds), max(ds)) if ds else (None, None)
+
+
 def parse_vas_ledger(rows, date):
     """增值服务「消费记录」表格 → 当日充值金额(元) + 余额。
 
@@ -2204,6 +2220,56 @@ class TaobaoAdapter:
             return ""
         return sid
 
+    def _bench_dropdown_options(self, f):
+        """当前**展开中**的下拉里的选项文案(取证用)。
+
+        2026-10-14 真机: 抓包里 `切基准 27 次超时` 全部是 `timeout=5000ms` 点击超时,
+        失败日志只有「下拉里没有『商圈同行前10%均值』」这句结论 —— 分不清是下拉没展开、
+        还是展开了但选项文案变了。所以失败时要把**实际可见的选项**打出来。
+        """
+        try:
+            return f.evaluate("""() => {
+              const vis = e => { const r = e.getBoundingClientRect();
+                                 return r.width > 0 && r.height > 0; };
+              const out = [];
+              const boxes = ['.ant-select-dropdown:not(.ant-select-dropdown-hidden)',
+                             '.ant-dropdown:not(.ant-dropdown-hidden)',
+                             '[class*=dropdown],[class*=select-menu]'];
+              for (const s of boxes) {
+                for (const d of document.querySelectorAll(s)) {
+                  if (!vis(d)) continue;
+                  for (const it of d.querySelectorAll('li,[class*=option],[role=option],span,div')) {
+                    const t = (it.textContent || '').trim();
+                    if (!t || t.length > 24 || out.includes(t)) continue;
+                    out.push(t);
+                    if (out.length >= 8) return out;
+                  }
+                }
+                if (out.length) return out;
+              }
+              return out; }""") or []
+        except Exception:
+            return []
+
+    def _bench_reset(self, f, why=""):
+        """切基准重试前把下拉**清场**: Esc + 点页面空白。
+
+        为什么必须加(2026-10-15 任务 J): 上一轮失败时下拉/遮罩还开着, 遮罩会把下一次
+        点击全部吃掉 → 重试照样超时(27 次超时的直接成因之一)。清场是重试有意义的前提。
+        """
+        for act in ("Escape",):
+            try:
+                f.keyboard.press(act)
+            except Exception:
+                pass
+        try:
+            f.mouse.click(5, 5)          # 框架内左上角空白: 关掉残留下拉(不落任何可点元素上)
+        except Exception:
+            pass
+        time.sleep(0.6)
+        if why:
+            self.sink.log(f"   🧹 切基准清场({why}) → 关掉残留下拉后重来")
+
     def _pick_bench(self, f, want="商圈同行前10%均值"):
         """单店流量页: 把漏斗基准切成「商圈同行前10%均值」。返回是否切成功。
 
@@ -2212,43 +2278,62 @@ class TaobaoAdapter:
 
         D6 取证(2026-10-14, 只加日志不改抓取主逻辑): 每次切换打印「当前基准 / 切换尝试序列 /
         成功或失败证据」—— 真机排查「TOP 列为什么空」时能一眼看出是"没切成"还是"页面没有该控件"。
+
+        2026-10-15 任务 J 加固(真机 27 次 `切基准 超时`, 全部 timeout=5000ms):
+          ① 整段**重试 2 轮**(第 2 轮前先清场, 见 _bench_reset);
+          ② 点击超时 5000 → 10000ms(真机 5s 不够, 但**不无限等**);
+          ③ 失败时打印**下拉实际选项文案**(_bench_dropdown_options) —— 有证据才能改选择器。
+        口径不变: 切不过去 → 仍然留空(不拿"商圈同行均值"的数冒充前10%)。
         """
         cur = (self._parse_funnel(f).get("cust") or "").strip()
         if want in cur:
             self.sink.log(f"📊 商圈口径 → {want}（当前已是, 基准列照读）")
             return True
         tried = []
-        for label in (cur, "商圈同行均值", "比上周同时段"):
-            if not label:
-                continue
-            try:
-                loc = f.locator(f'text="{label}"')
-                if not loc.count():
-                    tried.append(f"{label}(未找到入口)")
+        for rnd in range(1, 3):
+            if rnd > 1:
+                self.sink.log(f"🔁 切基准未成 → 清场后重试(第 {rnd}/2 次)")
+                self._bench_reset(f, "重试前")
+            cur = (self._parse_funnel(f).get("cust") or "").strip()
+            if want in cur:
+                self.sink.log(f"📊 商圈口径 → {want}（第 {rnd} 次尝试前已是, 基准列照读）")
+                return True
+            for label in (cur, "商圈同行均值", "比上周同时段"):
+                if not label:
                     continue
-                tried.append(label)
-                loc.first.click(timeout=5000)
-                time.sleep(1.5)
-                opt = f.locator(f'.ant-select-dropdown:not(.ant-select-dropdown-hidden) >> text="{want}"')
-                if not opt.count():
-                    opt = f.locator(f'text="{want}"')
-                if opt.count():
-                    opt.first.click(timeout=5000)
-                    time.sleep(2.5)
-                    gf = (self._parse_funnel(f).get("cust") or "").strip()
-                    if want in gf:
-                        self.sink.log(f"📊 商圈口径 → {want}（从「{label}」切成功; 尝试序列 {tried}）")
-                        return True
-                    tried.append(f"「{label}」→ 点后基准变成「{gf or '?'}」")
-                    continue
-                f.keyboard.press("Escape")
-                time.sleep(0.6)
-                tried.append(f"「{label}」→ 下拉里没有「{want}」")
-            except Exception as e:
-                tried.append(f"「{label}」异常 {str(e)[:40]}")
-                self.sink.log(f"⚠️ 切基准「{want}」失败({label}): {str(e)[:60]}", level="warn")
-        self.sink.log(f"⚠️ 商圈口径切换失败: 当前「{cur or '?'}」≠「{want}」→ TOP(前10%)列本次留空"
-                      f"（尝试序列: {'; '.join(tried) or '无可用入口'}）", level="warn")
+                try:
+                    loc = f.locator(f'text="{label}"')
+                    if not loc.count():
+                        tried.append(f"{label}(未找到入口)")
+                        continue
+                    tried.append(label)
+                    loc.first.click(timeout=10000)          # 5000 → 10000(真机 27 次全是 5s 超时)
+                    time.sleep(1.5)
+                    opt = f.locator(f'.ant-select-dropdown:not(.ant-select-dropdown-hidden) >> text="{want}"')
+                    if not opt.count():
+                        opt = f.locator(f'text="{want}"')
+                    if opt.count():
+                        opt.first.click(timeout=10000)
+                        time.sleep(2.5)
+                        gf = (self._parse_funnel(f).get("cust") or "").strip()
+                        if want in gf:
+                            self.sink.log(f"📊 商圈口径 → {want}"
+                                          f"（从「{label}」切成功; 第 {rnd} 次尝试; 尝试序列 {tried}）")
+                            return True
+                        tried.append(f"「{label}」→ 点后基准变成「{gf or '?'}」")
+                        continue
+                    # 下拉里没有目标项 → 把**实际可见选项**打出来(否则下次还是只能猜)
+                    opts = self._bench_dropdown_options(f)
+                    tried.append(f"「{label}」→ 下拉实际选项 {opts or '未读到(下拉可能没展开)'}")
+                    self._bench_reset(f, f"「{label}」没找到目标项")
+                except Exception as e:
+                    tried.append(f"「{label}」异常 {str(e)[:40]}")
+                    self.sink.log(f"⚠️ 切基准「{want}」失败({label}, 第 {rnd} 次): {str(e)[:60]}",
+                                  level="warn")
+                    self._bench_reset(f, f"「{label}」异常")
+        self.sink.log(f"⚠️ 商圈口径切换失败(已重试 2 轮): 当前「{cur or '?'}」≠「{want}」"
+                      f"→ TOP(前10%)列本次留空（尝试序列: {'; '.join(tried) or '无可用入口'}）",
+                      level="warn")
         return False
 
     def _set_store_date(self, f, date):
@@ -2411,7 +2496,13 @@ class TaobaoAdapter:
                         self.sink.log(f"   ↳ {name} [充值] 当日充值 {_v['GK']} 元"
                                       f"(账户余额 {_v.get('balance')})")
                     elif _v.get("table_found"):
-                        self.sink.log(f"   ↳ {name} [充值] 该日消费记录里没有充值行 → 留空")
+                        # 2026-10-15 任务 J: 必须连**表格日期覆盖证据**一起打(最早/最晚日期行)。
+                        # 真机 15/15 的这句原来只有结论没有证据, 分不清"窗口不含目标日"还是"当天真没充"
+                        # —— 前者要翻页/筛选, 后者才是真的留空。
+                        self.sink.log(f"   ↳ {name} [充值] 该日消费记录里没有充值行 → 留空"
+                                      f"(表格覆盖 {_v.get('date_min')}~{_v.get('date_max')}, "
+                                      f"{_v.get('rows')} 行; 目标日 {date}"
+                                      f"{' 在窗口内' if _v.get('window_ok') else ' 不在窗口内'})")
                     # 表格没读到的情况, _read_vas_ledger 内部已打 warn, 这里不重复
                 except Exception as e:
                     self.sink.log(f"   ⚠️ {name}: 充值读取异常 {str(e)[:60]} → 留空", level="warn")
@@ -2640,12 +2731,118 @@ class TaobaoAdapter:
             "hits": [k for k in ("充值", "分店资金", "余额", "总推广消费", "推广概览") if k in txt],
         }
 
+    def _vas_probe_controls(self, vp):
+        """探测消费记录区的日期筛选/翻页控件(文案+类名) → 日志。
+
+        为什么先探测再实现: 2026-10-15 真机 15/15「该日消费记录里没有充值行」(table_found=True)
+        —— 表读到了但默认窗口不含一个月前的那天。远程没有真实 DOM, 不许瞎猜选择器:
+        先把候选控件(输入框/下拉/「加载更多」/分页器)打出来, 用户跑一次就能按证据适配。
+        """
+        try:
+            ctl = vp.evaluate("""() => {
+              const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+              const out = {inputs: [], clicks: [], pager: []};
+              for (const e of document.querySelectorAll('input')) {
+                if (!vis(e)) continue;
+                const ph = (e.placeholder || '').trim(), cls = String(e.className || '').slice(0, 50);
+                if (!/日期|时间|date|start|end|开始|结束/i.test(ph + ' ' + cls)) continue;
+                out.inputs.push(ph + ' ⟨' + cls + '⟩');
+                if (out.inputs.length >= 6) break;
+              }
+              for (const e of document.querySelectorAll('a,button,span,li,div')) {
+                const t = (e.textContent || '').trim();
+                if (!t || t.length > 12) continue;
+                if (!/加载更多|更多|下一页|下页|next|查询|筛选|日期|近7|近30/.test(t)) continue;
+                if (!vis(e)) continue;
+                out.clicks.push(t + ' ⟨' + String(e.className || '').slice(0, 40) + '⟩');
+                if (out.clicks.length >= 8) break;
+              }
+              for (const e of document.querySelectorAll('[class*=pagination],[class*=pager],ul[class*=page]')) {
+                if (!vis(e)) continue;
+                out.pager.push((e.textContent || '').trim().slice(0, 40) + ' ⟨'
+                               + String(e.className || '').slice(0, 40) + '⟩');
+                if (out.pager.length >= 4) break;
+              }
+              return out; }""") or {}
+            if ctl.get("inputs") or ctl.get("clicks") or ctl.get("pager"):
+                self.sink.log(f"   🔎 消费记录页控件: 日期框={ctl.get('inputs')} "
+                              f"可点={ctl.get('clicks')} 分页={ctl.get('pager')}")
+            else:
+                self.sink.log("   🔎 消费记录页控件: 未发现日期筛选/翻页控件(窗口不可控)")
+        except Exception:
+            pass
+
+    def _vas_try_load_more(self, vp, want, max_rounds=8):
+        """默认窗口不含目标日时: 点「加载更多/下一页」直到覆盖目标日或到尽头。
+
+        返回 (是否覆盖目标日, 新行)。探测动作与每轮结果都记日志 —— 不许静默循环。
+        """
+        prev = -1
+        for i in range(max_rounds):
+            try:
+                n = vp.evaluate("""() => {
+                  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+                  const els = [...document.querySelectorAll('a,button,span,li,div')].filter(e => {
+                    const t = (e.textContent || '').trim();
+                    if (!/^(加载更多|查看更多|更多|下一页|下页)$/.test(t)) return false;
+                    if (!vis(e)) return false;
+                    const p = e.parentElement;
+                    return !(p && [...p.children].some(o => o !== e && (o.textContent || '').trim() === t));
+                  });
+                  if (!els.length) return 0;
+                  document.querySelectorAll('[data-hm-more]').forEach(e => e.removeAttribute('data-hm-more'));
+                  els[0].setAttribute('data-hm-more', '1');
+                  return els.length; }""")
+            except Exception:
+                n = 0
+            if not n:
+                if i == 0:
+                    self.sink.log("   ℹ️ 消费记录: 没找到「加载更多/下一页」控件(窗口不可翻)")
+                break
+            try:
+                vp.locator('[data-hm-more="1"]').first.click(timeout=8000)
+            except Exception as e:
+                self.sink.log(f"   ⚠️ 消费记录: 点「加载更多」失败: {str(e)[:50]}", level="warn")
+                break
+            time.sleep(1.2)
+            rows = self._vas_rows(vp)
+            lo, hi = vas_ledger_dates(rows)
+            self.sink.log(f"   ↻ 消费记录: 第{i + 1}次加载更多 → {len(rows)} 行(覆盖 {lo}~{hi})")
+            if lo is not None and str(want) >= str(lo):
+                return True, rows
+            if len(rows) == prev:
+                self.sink.log("   ℹ️ 消费记录: 已到尽头(行数不再增长)")
+                break
+            prev = len(rows)
+        return False, self._vas_rows(vp)
+
+    def _vas_rows(self, vp):
+        """消费记录表的全部数据行(跨 frame 取第一张有数据的表)。"""
+        for fr in vp.frames:
+            try:
+                tbls = fr.evaluate("""() => [...document.querySelectorAll('table')].map(tb =>
+                    [...tb.querySelectorAll('tbody tr')].map(tr =>
+                      [...tr.querySelectorAll('td')].map(td => (td.innerText || '').trim())))""")
+            except Exception:
+                continue
+            for tbl in (tbls or []):
+                if tbl:
+                    return tbl
+        return []
+
     def _read_vas_ledger(self, shop_id, date):
         """增值服务页 → 消费记录 → 当日充值金额(GK)。
 
         用户指路(2026-10-08): 推广充值在 /app/shop/<id>/vas 的「消费记录」里 —— 经营分析→推广
         那个页面上只有 消费/曝光/进店, **没有充值额**(探针 dump 全文核实过)。
         用**独立标签页**打开, 不动当前 stats frame(导航会把 frame 弄失效, 后续步骤还要用)。
+
+        2026-10-15 任务 J 加固(真机 15/15「该日消费记录里没有充值行」, table_found=True):
+        默认列表窗口**不含一个月前的目标日**, 按日过滤后必然为空。现在:
+          ① 「有表但无充值行」→ 必须打出**表格日期覆盖证据**(最早/最晚日期行);
+          ② 默认窗口不含目标日 → 点「加载更多/下一页」翻页直到覆盖或到尽头(每轮记日志);
+          ③ 页面有日期筛选控件 → 先探测并记日志(取证后才能实现适配, 不瞎猜选择器);
+          ④ 全部失败 → 留空 + 明确 warn(绝不臆造 0)。
         """
         out = {"GK": None, "balance": None, "hits": 0}
         if not shop_id:
@@ -2692,26 +2889,48 @@ class TaobaoAdapter:
                         continue
                 if _tbl_found:
                     break
-            for fr in vp.frames:
-                try:
-                    tbls = fr.evaluate("""() => [...document.querySelectorAll('table')].map(tb =>
-                        [...tb.querySelectorAll('tbody tr')].map(tr =>
-                          [...tr.querySelectorAll('td')].map(td => (td.innerText || '').trim())))""")
-                except Exception:
-                    continue
-                for tbl in (tbls or []):
-                    if not tbl:
-                        continue
-                    _tbl_found = True
-                    got = parse_vas_ledger(tbl, date)
-                    if got.get("hits"):
-                        return got
+            rows = self._vas_rows(vp)
+            if rows:
+                _tbl_found = True
+            for tbl in [rows] if rows else []:
+                got = parse_vas_ledger(tbl, date)
+                if got.get("hits"):
+                    return got
             # 分清两种"没有": 表格压根没读到(页面/iframe 没加载) vs 表格读到但没有充值行。
             # 2026-10-08 真机: 斗金(doujin)iframe 时好时坏 —— 加载成功时能读到
             # '现金充值 +400.00' 这种行; 没加载时这里必须**如实报**, 不能笼统写"没有充值行"(会误导排查)。
             out["table_found"] = _tbl_found
             if not _tbl_found:
                 self.sink.log("   ⚠️ 增值服务页的消费记录表格没读到(斗金iframe未加载) → 充值列留空", level="warn")
+                return out
+            # 表读到了但没有该日充值行 → 查清是"窗口不覆盖"还是"窗口覆盖了但确实没充值"
+            lo, hi = vas_ledger_dates(rows)
+            out["date_min"], out["date_max"] = lo, hi
+            out["rows"] = len(rows)
+            if lo is None:
+                self.sink.log(f"   ⚠️ 消费记录: 读到 {len(rows)} 行但解析不出任何日期"
+                              f" → 充值列留空(取证: {[r[:3] for r in rows[:2]]})", level="warn")
+                return out
+            if str(date) < str(lo):
+                # 默认窗口不含目标日 —— 可能是默认只列最近 N 天。先探控件, 再尝试翻页。
+                self.sink.log(f"   🔎 消费记录: 目标日 {date} **早于**表格窗口 {lo}~{hi}"
+                              f"({len(rows)} 行) → 尝试翻页/筛选覆盖")
+                self._vas_probe_controls(vp)
+                _cov, rows2 = self._vas_try_load_more(vp, date)
+                if _cov:
+                    got = parse_vas_ledger(rows2, date)
+                    lo2, hi2 = vas_ledger_dates(rows2)
+                    out["date_min"], out["date_max"], out["rows"] = lo2, hi2, len(rows2)
+                    if got.get("hits"):
+                        self.sink.log(f"   ↳ 消费记录: 翻页后覆盖 {lo2}~{hi2} → 命中该日充值")
+                        return got
+                    self.sink.log(f"   ⚠️ 消费记录: 已翻页覆盖 {lo2}~{hi2}, 该日仍无充值行 → 留空")
+                    return out
+                self.sink.log(f"   ⚠️ 消费记录: 翻页也没覆盖到 {date}(表格 {lo}~{hi}) → 充值列留空"
+                              f"(不用别日值顶替)", level="warn")
+                return out
+            out["window_ok"] = True
+            self.sink.log(f"   🔎 消费记录: 窗口 {lo}~{hi} 已覆盖 {date}, 该日确实没有充值行")
             return out
         except Exception as e:
             self.sink.log(f"   ⚠️ 增值服务页(充值)读取失败: {str(e)[:60]}", level="warn")

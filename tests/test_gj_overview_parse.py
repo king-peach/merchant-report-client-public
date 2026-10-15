@@ -94,8 +94,8 @@ def test_real_page_all_channels():
     print("✅ 真机页面文本: 6 渠道全部解析, 交叉校验通过")
     # 自营外卖 → 模板 HX/HY/HZ
     ws = gm.build_write_set(parsed)
-    assert ws["HX"] == 34.0 and ws["HY"] == 34.0 and ws["HZ"] == 1.0, {k: ws[k] for k in ("HX", "HY", "HZ")}
-    assert ws["HO"] == 277.0 and ws["HP"] == 167.30 and ws["HQ"] == 14.0
+    assert ws["HW"] == 34.0 and ws["HX"] == 34.0 and ws["HY"] == 1.0, {k: ws[k] for k in ("HW", "HX", "HY")}
+    assert ws["HN"] == 277.0 and ws["HO"] == 167.30 and ws["HP"] == 14.0
     print("✅ 自营外卖写入模板 HX/HY/HZ(34.00 / 34.00 / 1)")
 
 
@@ -167,7 +167,7 @@ def test_export_xlsx_keeps_extra_channel():
         wb.save(f.name)
         parsed = gm.parse_biz_xlsx(f.name)
     assert parsed["自营外卖"]["营业收入"] == 34.00, parsed
-    assert gm.build_write_set(parsed)["HY"] == 34.0
+    assert gm.build_write_set(parsed)["HX"] == 34.0
     print("✅ 导出 xlsx 兜底路径同样收到自营外卖")
 
 
