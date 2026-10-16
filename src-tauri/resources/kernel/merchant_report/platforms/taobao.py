@@ -22,6 +22,17 @@ STATS_HOME = "https://melody.shop.ele.me/"
 VAS_URL = "https://melody.shop.ele.me/app/shop/{shop_id}/vas#app.shop.vas"
 
 
+def _locality_probe(name):
+    """门店名 → 括注内定位词(品牌无关): 「品牌·系列(长沙高桥店)」→「长沙高桥店」。
+
+    为什么不用品牌字面量 strip(2026-10-16): 该 probe 曾写成 `name.strip("<品牌>…()")`,
+    同步脱敏(公开仓)必然会改写这条**可执行语句** → 两个构建来源行为分叉。
+    通用提取后, 同步器不再触碰任何可执行代码。
+    """
+    m = re.search(r"[（(]([^（）()]+)[）)]", str(name or ""))
+    return m.group(1) if m else ""
+
+
 def _poll_window():
     """「展示过程」开关**安全点**(需求 F): 长等待循环里给主线程一次执行窗口动作的机会。
 
@@ -2212,7 +2223,7 @@ class TaobaoAdapter:
         tgt = None
         for _ in range(3):
             self._open_switcher(page)
-            for probe in (name, name.strip("示例·柠檬茶()"), name[4:8]):
+            for probe in (name, _locality_probe(name), name[4:8]):
                 if not probe:
                     continue
                 loc = page.locator(f"{self.SHOP_SWITCHER} >> text={probe}")
@@ -2516,31 +2527,15 @@ class TaobaoAdapter:
                                           f"(取证: {'/'.join(pr.get('hits') or []) or '无关键词'})",
                                           level="warn")
                         self.sink.log(f"   ↳ {name} [推广] 消费{promo.get('GF')} 曝光{promo.get('GG')}"
-                                      f" 进店{promo.get('GH')} 充值{promo.get('GK')}")
+                                      f" 进店{promo.get('GH')}")
                     else:
                         self.sink.log(f"   ⚠️ {name}: 推广导航失败 → 推广列留空", level="warn")
                 except Exception as e:
                     self.sink.log(f"   ⚠️ {name}: 推广读取异常 {str(e)[:60]} → 推广列留空", level="warn")
-                # 充值(GK): 推广页**没有**充值额 → 去增值服务页「消费记录」读当日充值
-                # (2026-10-08 用户指路 + 探针 dump 表结构: 表头 时间|消费类型|消费金额|余额|操作;
-                #  充值行 = 类型含"充值" 且金额带 '+' 号; 该日没有充值行 → 留空, 不臆造 0)
-                try:
-                    _v = self._read_vas_ledger(sid, date)
-                    if _v.get("GK") is not None:
-                        promo["GK"] = _v["GK"]
-                        self.sink.log(f"   ↳ {name} [充值] 当日充值 {_v['GK']} 元"
-                                      f"(账户余额 {_v.get('balance')})")
-                    elif _v.get("table_found"):
-                        # 2026-10-15 任务 J: 必须连**表格日期覆盖证据**一起打(最早/最晚日期行)。
-                        # 真机 15/15 的这句原来只有结论没有证据, 分不清"窗口不含目标日"还是"当天真没充"
-                        # —— 前者要翻页/筛选, 后者才是真的留空。
-                        self.sink.log(f"   ↳ {name} [充值] 该日消费记录里没有充值行 → 留空"
-                                      f"(表格覆盖 {_v.get('date_min')}~{_v.get('date_max')}, "
-                                      f"{_v.get('rows')} 行; 目标日 {date}"
-                                      f"{' 在窗口内' if _v.get('window_ok') else ' 不在窗口内'})")
-                    # 表格没读到的情况, _read_vas_ledger 内部已打 warn, 这里不重复
-                except Exception as e:
-                    self.sink.log(f"   ⚠️ {name}: 充值读取异常 {str(e)[:60]} → 留空", level="warn")
+                # 充值(GK): 2026-10-16 起**不再查询**(用户指示: 淘宝闪购不查推广充值)。
+                # 旧流程=每店另开「增值服务页」读消费记录, 真机 15/15 取不到(默认窗口只有最近几天,
+                # 历史日必空), 纯耗时 → GK 保持留空(模板不写)。实现(parse_vas_ledger/_read_vas_ledger
+                # 等)保留为待机代码(含页面结构证据), 不要再接线到逐店流程。
                 out[name] = {"外卖_全部顾客": {"shop": per or {}, "top10": top10},
                              "爆品团_全部顾客": {"shop": {}, "top10": zb_top},
                              "segments": seg, "promo": promo,
@@ -2866,7 +2861,11 @@ class TaobaoAdapter:
         return []
 
     def _read_vas_ledger(self, shop_id, date):
-        """增值服务页 → 消费记录 → 当日充值金额(GK)。
+        """增值服务页 → 消费记录 → 当日充值金额(GK)。⚠️ 2026-10-16 起**待机**(不再被逐店流程调用)。
+
+        停用原因(用户指示): 淘宝闪购不查推广充值——每店另开此页拖慢整体时间, 且真机 15/15
+        「该日没有充值行」(默认窗口只有最近几天, 历史日必空)。保留实现与单测(页面结构证据在此),
+        如平台将来开放历史窗口再评估是否重新接线。
 
         用户指路(2026-10-08): 推广充值在 /app/shop/<id>/vas 的「消费记录」里 —— 经营分析→推广
         那个页面上只有 消费/曝光/进店, **没有充值额**(探针 dump 全文核实过)。

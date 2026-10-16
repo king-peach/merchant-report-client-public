@@ -6,6 +6,7 @@
     ['2026-10-07',          '推广消费\\n推广消费',   '-246.49', '721.97',  '详情']
     ['2026-10-05 12:22:13', '现金充值\\n支付宝充值',  '+400.00', '1390.13', '_']
 口径: 只认「类型含充值」且金额带 '+' 的行; 该日无充值 → 留空(不臆造 0); 同日多笔累加。
+⚠️ 2026-10-16: 逐店流程不再调用本页查询(用户指示: 淘宝闪购不查推广充值); 本文件保留纯函数/待机实现的单测。
 """
 import inspect
 import pathlib
@@ -95,12 +96,12 @@ def _vas_ledger_cases():
 
     # ⑦ 调用侧日志必须带覆盖证据(真机 15/15 那句原来只有结论没有证据)
     cps = inspect.getsource(T.TaobaoAdapter.capture_per_store)
-    assert "表格覆盖" in cps and "window_ok" in cps, "调用侧日志要带表格日期覆盖证据"
+    assert "self._read_vas_ledger" not in cps and "[充值]" not in cps, "逐店流程禁止再接线充值查询(2026-10-16)"
     assert "vas_ledger_dates" in inspect.getsource(T.TaobaoAdapter._read_vas_ledger)
     src = inspect.getsource(T.TaobaoAdapter._read_vas_ledger)
-    assert "_vas_try_load_more" in src and "_vas_probe_controls" in src, "翻页 + 控件探测必须接线"
+    assert "_vas_try_load_more" in src and "_vas_probe_controls" in src, "待机实现内翻页 + 控件探测保留"
     assert "max_rounds" in inspect.getsource(T.TaobaoAdapter._vas_try_load_more), "翻页要有轮次上限"
-    print("⑦ 调用侧日志带覆盖证据 + 探测/翻页接线(有上限) ✓")
+    print("⑦ 待机实现证据保留 + 逐店流程禁止接线 ✓")
 
     # ⑧ vas_ledger_dates 纯函数边界(真机有 '2026-1-5 09:00:00' 这种不补零写法 → 必须认出来)
     d = T.vas_ledger_dates
@@ -215,21 +216,21 @@ def main():
     assert p([None, [], ['x'], ['2026-10-05', '充值', 'abc']], "2026-10-05")["GK"] is None
     print("④ 空表/脏行不崩 ✓")
 
-    # ⑤ 源码守卫: 充值来自 vas 页 + 用独立标签页(不破坏 stats frame) + 调用点在逐店流程里
+    # ⑤ 源码守卫: 待机实现保留 + 逐店流程**禁止**再接线(2026-10-16 起不查充值)
     src = inspect.getsource(T.TaobaoAdapter._read_vas_ledger)
-    assert "VAS_URL" in src and "消费记录" in src, "必须走 vas 页的消费记录"
-    assert "ctx.new_page()" in src and "vp.close()" in src, "必须用独立标签页并关掉"
+    assert "VAS_URL" in src and "消费记录" in src, "待机实现仍走 vas 页的消费记录"
+    assert "ctx.new_page()" in src and "vp.close()" in src, "待机实现仍用独立标签页并关掉"
     assert "parse_vas_ledger" in src, "要复用纯函数解析"
     cps = inspect.getsource(T.TaobaoAdapter.capture_per_store)
-    assert "_read_vas_ledger(sid, date)" in cps, "逐店里要读充值"
-    assert "[充值]" in cps, "要有充值日志(便于真机核对)"
+    assert "self._read_vas_ledger" not in cps, "2026-10-16 起逐店流程禁止再接线充值查询"
+    assert "[充值]" not in cps, "充值日志不应再出现"
     assert T.VAS_URL.endswith("/vas#app.shop.vas"), T.VAS_URL
-    print("⑤ 源码守卫: vas 页 + 独立标签页 + 逐店调用 ✓")
+    print("⑤ 源码守卫: 待机实现保留 + 逐店流程**禁止**接线(不查充值) ✓")
 
     # ── 2026-10-15 任务 J: 日期覆盖(根因三实锤: 表读到了、窗口不含目标日) ──
     _vas_ledger_cases()
 
-    print("⑥ 源码守卫: 充值失败分支带表格覆盖证据 + 翻页/筛选探测 ✓")
+    print("⑥ 源码守卫: 待机实现带表格覆盖证据 + 翻页/筛选探测 ✓")
     print("\n✅ 淘宝充值(GK) 全绿")
 
 
